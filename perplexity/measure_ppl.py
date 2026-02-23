@@ -350,7 +350,7 @@ def parse_args():
     # Quantization
     p.add_argument("--gpu-expert-bits", type=int, default=4, choices=[4, 8], help="GPU Marlin expert bits (default: 4)")
     p.add_argument("--cpu-expert-bits", type=int, default=4, choices=[4, 8], help="CPU expert bits (default: 4)")
-    p.add_argument("--attention-quant", default="int8", choices=["bf16", "int8"], help="Attention quantization (default: int8)")
+    p.add_argument("--attention-quant", default="bf16", choices=["bf16", "int8"], help="Attention quantization (default: bf16)")
     p.add_argument("--lm-head-quant", default="int8", choices=["bf16", "int8"], help="LM head quantization (default: int8)")
 
     # Paths

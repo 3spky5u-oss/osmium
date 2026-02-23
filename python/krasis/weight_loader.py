@@ -49,9 +49,11 @@ def int8_linear(
     scale: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """INT8 matmul with on-the-fly dequantization.
+    """W8A8 INT8 matmul with on-the-fly activation quantization.
 
-    x @ (weight_int8 * scale).T  =  (x @ weight_int8.T) * scale
+    Both weights and activations are INT8, matmul accumulates in INT32 via
+    torch._int_mm for maximum precision. Works well for MLP/shared_expert/lm_head
+    but NOT suitable for attention projections (use attention="bf16" instead).
 
     Args:
         x: [..., in_features] BF16 input
