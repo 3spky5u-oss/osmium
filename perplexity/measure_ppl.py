@@ -56,11 +56,20 @@ DATASETS = {
         "cache_file": "wikitext-2-raw-v1-test.txt",
     },
     "wikitext-103": {
-        "description": "WikiText-103 (larger, more stable)",
-        "tokens_approx": "~3.7M",
+        "description": "WikiText-103 (same test split as wikitext-2)",
+        "tokens_approx": "~290K",
         "hf_path": "wikitext",
         "hf_name": "wikitext-103-raw-v1",
         "cache_file": "wikitext-103-raw-v1-test.txt",
+    },
+    "c4": {
+        "description": "C4 validation (standard LLM benchmark, 364K docs)",
+        "tokens_approx": "~200M",
+        "hf_path": "allenai/c4",
+        "hf_name": "en",
+        "hf_split": "validation",
+        "streaming": True,
+        "cache_file": "c4-en-validation.txt",
     },
 }
 
@@ -74,7 +83,7 @@ def load_dataset_text(dataset_name: str) -> str:
         dataset_name: Key from DATASETS registry (e.g. "wikitext-2")
 
     Returns:
-        Full text of the dataset test split.
+        Full text of the dataset test/validation split.
     """
     if dataset_name not in DATASETS:
         raise ValueError(
@@ -89,7 +98,8 @@ def load_dataset_text(dataset_name: str) -> str:
         logger.info("Loading cached %s from %s", dataset_name, cache_path)
         return cache_path.read_text(encoding="utf-8")
 
-    logger.info("Downloading %s (%s) test split...", dataset_name, info["hf_name"])
+    split = info.get("hf_split", "test")
+    logger.info("Downloading %s (%s) %s split...", dataset_name, info["hf_name"], split)
     try:
         from datasets import load_dataset as hf_load_dataset
     except ImportError:
@@ -99,13 +109,25 @@ def load_dataset_text(dataset_name: str) -> str:
         )
         sys.exit(1)
 
-    ds = hf_load_dataset(info["hf_path"], info["hf_name"], split="test")
-    # Concatenate all lines with newlines (standard for WikiText PPL)
-    text = "\n".join(ds["text"])
+    if info.get("streaming"):
+        # Stream large datasets — concatenate documents with double newlines
+        ds = hf_load_dataset(info["hf_path"], info["hf_name"], split=split, streaming=True)
+        chunks = []
+        total_chars = 0
+        for i, example in enumerate(ds):
+            chunks.append(example["text"])
+            total_chars += len(example["text"])
+            if (i + 1) % 10000 == 0:
+                print(f"\r  Streaming {dataset_name}: {i + 1} docs, {total_chars / 1e6:.1f}M chars", end="", flush=True)
+        print(f"\r  Streaming {dataset_name}: {i + 1} docs, {total_chars / 1e6:.1f}M chars — done")
+        text = "\n\n".join(chunks)
+    else:
+        ds = hf_load_dataset(info["hf_path"], info["hf_name"], split=split)
+        text = "\n".join(ds["text"])
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(text, encoding="utf-8")
-    logger.info("Cached %s test to %s (%d chars)", dataset_name, cache_path, len(text))
+    logger.info("Cached %s to %s (%d chars)", dataset_name, cache_path, len(text))
     return text
 
 
@@ -350,7 +372,7 @@ def parse_args():
     # Quantization
     p.add_argument("--gpu-expert-bits", type=int, default=4, choices=[4, 8], help="GPU Marlin expert bits (default: 4)")
     p.add_argument("--cpu-expert-bits", type=int, default=4, choices=[4, 8], help="CPU expert bits (default: 4)")
-    p.add_argument("--attention-quant", default="bf16", choices=["bf16", "int8"], help="Attention quantization (default: bf16)")
+    p.add_argument("--attention-quant", default="bf16", choices=["bf16"], help="Attention quantization (INT8 disabled — causes garbage)")
     p.add_argument("--lm-head-quant", default="int8", choices=["bf16", "int8"], help="LM head quantization (default: int8)")
 
     # Paths
@@ -394,6 +416,13 @@ def run_perplexity(
     print(f"\n  Loading {ds_info['description']}...")
     text = load_dataset_text(dataset_name)
     print(f"  Dataset: {len(text):,} chars")
+
+    # Pre-truncate text before tokenizing to avoid tokenizing entire huge corpus.
+    # Use ~5 chars/token as conservative estimate (overshoots slightly, then trim).
+    if max_tokens and len(text) > max_tokens * 6:
+        char_limit = max_tokens * 6
+        print(f"  Pre-truncating text to ~{char_limit / 1e6:.1f}M chars (for {max_tokens:,} token target)")
+        text = text[:char_limit]
 
     # Tokenize (raw text, no chat template)
     print("  Tokenizing...")
