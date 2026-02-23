@@ -46,7 +46,7 @@ class SuiteCombo:
     num_gpus: int
     gpu_expert_bits: int = 4
     cpu_expert_bits: int = 4
-    attention_quant: str = "int8"
+    attention_quant: str = "bf16"
     shared_expert_quant: str = "int8"
     dense_mlp_quant: str = "int8"
     lm_head_quant: str = "int8"
@@ -186,7 +186,7 @@ class SuiteRunner:
                     num_gpus=cfg["num_gpus"],
                     gpu_expert_bits=cfg.get("gpu_expert_bits", 4),
                     cpu_expert_bits=cfg.get("cpu_expert_bits", 4),
-                    attention_quant=cfg.get("attention_quant", "int8"),
+                    attention_quant=cfg.get("attention_quant", "bf16"),
                     shared_expert_quant=cfg.get("shared_expert_quant", "int8"),
                     dense_mlp_quant=cfg.get("dense_mlp_quant", "int8"),
                     lm_head_quant=cfg.get("lm_head_quant", "int8"),

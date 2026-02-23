@@ -276,7 +276,7 @@ def compute_launcher_budget(
     kv_dtype: str = "fp8_e4m3",
     gpu_expert_bits: int = 4,
     cpu_expert_bits: int = 4,
-    attention_quant: str = "int8",
+    attention_quant: str = "bf16",
     shared_expert_quant: str = "int8",
     dense_mlp_quant: str = "int8",
     lm_head_quant: str = "int8",

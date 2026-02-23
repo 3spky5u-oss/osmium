@@ -376,7 +376,7 @@ class LauncherConfig:
         self.kv_dtype: str = "fp8_e4m3"
         self.gpu_expert_bits: int = 4
         self.cpu_expert_bits: int = 4
-        self.attention_quant: str = "int8"
+        self.attention_quant: str = "bf16"
         self.shared_expert_quant: str = "int8"
         self.dense_mlp_quant: str = "int8"
         self.lm_head_quant: str = "int8"
