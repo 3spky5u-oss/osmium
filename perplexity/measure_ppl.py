@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""Perplexity measurement for Krasis models on WikiText-2.
+"""Perplexity measurement for Krasis models.
 
 Measures through the PRODUCTION forward path (GPU Marlin prefill or CPU-only)
 to validate that quantization doesn't degrade model quality.
 
+Supported datasets: wikitext-2, wikitext-103
+
 Usage:
-    # GPU prefill path (production):
+    # GPU prefill path (production, default wikitext-2):
     python -m perplexity.measure_ppl --model-path ~/.krasis/DeepSeek-V2-Lite --num-gpus 1
+
+    # WikiText-103 (larger, more stable):
+    python -m perplexity.measure_ppl --model-path ~/.krasis/DeepSeek-V2-Lite --dataset wikitext-103
 
     # CPU-only baseline (no GPU prefill):
     python -m perplexity.measure_ppl --model-path ~/.krasis/DeepSeek-V2-Lite --cpu-only
@@ -39,33 +44,85 @@ from krasis.kv_cache import SequenceKVState
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Dataset handling
+# Dataset registry
 # ---------------------------------------------------------------------------
 
-DATASET_CACHE = _script_dir / "datasets" / "wikitext-2-raw-v1-test.txt"
+DATASETS = {
+    "wikitext-2": {
+        "description": "WikiText-2 (standard LLM benchmark)",
+        "tokens_approx": "~290K",
+        "hf_path": "wikitext",
+        "hf_name": "wikitext-2-raw-v1",
+        "cache_file": "wikitext-2-raw-v1-test.txt",
+    },
+    "wikitext-103": {
+        "description": "WikiText-103 (larger, more stable)",
+        "tokens_approx": "~3.7M",
+        "hf_path": "wikitext",
+        "hf_name": "wikitext-103-raw-v1",
+        "cache_file": "wikitext-103-raw-v1-test.txt",
+    },
+}
+
+_datasets_dir = _script_dir / "datasets"
 
 
-def load_wikitext2_test() -> str:
-    """Load WikiText-2-raw-v1 test split. Downloads and caches on first use."""
-    if DATASET_CACHE.exists():
-        logger.info("Loading cached WikiText-2 from %s", DATASET_CACHE)
-        return DATASET_CACHE.read_text(encoding="utf-8")
+def load_dataset_text(dataset_name: str) -> str:
+    """Load a dataset by name. Downloads and caches on first use.
 
-    logger.info("Downloading WikiText-2-raw-v1 test split...")
+    Args:
+        dataset_name: Key from DATASETS registry (e.g. "wikitext-2")
+
+    Returns:
+        Full text of the dataset test split.
+    """
+    if dataset_name not in DATASETS:
+        raise ValueError(
+            f"Unknown dataset '{dataset_name}'. "
+            f"Available: {', '.join(DATASETS.keys())}"
+        )
+
+    info = DATASETS[dataset_name]
+    cache_path = _datasets_dir / info["cache_file"]
+
+    if cache_path.exists():
+        logger.info("Loading cached %s from %s", dataset_name, cache_path)
+        return cache_path.read_text(encoding="utf-8")
+
+    logger.info("Downloading %s (%s) test split...", dataset_name, info["hf_name"])
     try:
-        from datasets import load_dataset
+        from datasets import load_dataset as hf_load_dataset
     except ImportError:
-        print("ERROR: 'datasets' library required. Install with: pip install datasets", file=sys.stderr)
+        print(
+            "ERROR: 'datasets' library required. Install with: pip install datasets",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
-    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+    ds = hf_load_dataset(info["hf_path"], info["hf_name"], split="test")
     # Concatenate all lines with newlines (standard for WikiText PPL)
     text = "\n".join(ds["text"])
 
-    DATASET_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    DATASET_CACHE.write_text(text, encoding="utf-8")
-    logger.info("Cached WikiText-2 test to %s (%d chars)", DATASET_CACHE, len(text))
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(text, encoding="utf-8")
+    logger.info("Cached %s test to %s (%d chars)", dataset_name, cache_path, len(text))
     return text
+
+
+def list_datasets() -> list[dict]:
+    """Return dataset info for menu display.
+
+    Returns:
+        List of dicts with keys: name, description, tokens_approx
+    """
+    return [
+        {
+            "name": name,
+            "description": info["description"],
+            "tokens_approx": info["tokens_approx"],
+        }
+        for name, info in DATASETS.items()
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -223,12 +280,13 @@ def save_results(results: dict, config: dict, output_dir: Path):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     model_name = Path(config["model_path"]).name
+    dataset_name = config.get("dataset", "wikitext-2")
     mode = "cpu" if config.get("cpu_only") else "gpu"
     gpu_bits = config.get("gpu_expert_bits", 4)
     cpu_bits = config.get("cpu_expert_bits", 4)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    basename = f"{model_name}_{mode}_g{gpu_bits}_c{cpu_bits}_{timestamp}"
+    basename = f"{model_name}_{dataset_name}_{mode}_g{gpu_bits}_c{cpu_bits}_{timestamp}"
 
     # JSON
     combined = {"config": config, "results": results}
@@ -242,6 +300,7 @@ def save_results(results: dict, config: dict, output_dir: Path):
         f"{'=' * 50}",
         f"Date:          {datetime.now().isoformat()}",
         f"Model:         {config['model_path']}",
+        f"Dataset:       {dataset_name}",
         f"Mode:          {'CPU-only' if config.get('cpu_only') else 'GPU prefill (Marlin)'}",
         f"GPUs:          {config.get('num_gpus', 'auto')}",
         f"GPU bits:      {gpu_bits}",
@@ -269,14 +328,19 @@ def save_results(results: dict, config: dict, output_dir: Path):
 # ---------------------------------------------------------------------------
 
 def parse_args():
+    ds_names = ", ".join(DATASETS.keys())
     p = argparse.ArgumentParser(
-        description="Measure WikiText-2 perplexity through Krasis production path",
+        description="Measure perplexity through Krasis production path",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
     # Model
     p.add_argument("--model-path", required=True, help="Path to HF model directory")
     p.add_argument("--num-gpus", type=int, default=None, help="Number of GPUs (auto-detect if omitted)")
+
+    # Dataset
+    p.add_argument("--dataset", default="wikitext-2", choices=list(DATASETS.keys()),
+                    help=f"Dataset to evaluate on (default: wikitext-2). Available: {ds_names}")
 
     # Eval params
     p.add_argument("--window-size", type=int, default=2048, help="Context window per forward pass (default: 2048)")
@@ -298,6 +362,88 @@ def parse_args():
     return p.parse_args()
 
 
+def run_perplexity(
+    model: KrasisModel,
+    dataset_name: str = "wikitext-2",
+    window_size: int = 2048,
+    stride: int | None = None,
+    max_tokens: int | None = None,
+    config: dict | None = None,
+) -> dict:
+    """End-to-end perplexity evaluation: load text, tokenize, evaluate, save.
+
+    This is the reusable entry point called by both standalone CLI and the
+    server.py launcher.
+
+    Args:
+        model: Loaded KrasisModel
+        dataset_name: Key from DATASETS registry
+        window_size: Context window per forward pass
+        stride: Step size between windows (default: window_size // 2)
+        max_tokens: Truncate dataset to N tokens
+        config: Optional config dict for save_results (adds model_path etc.)
+
+    Returns:
+        Results dict with ppl, bpc, log_path, etc.
+    """
+    if stride is None:
+        stride = window_size // 2
+
+    ds_info = DATASETS[dataset_name]
+
+    print(f"\n  Loading {ds_info['description']}...")
+    text = load_dataset_text(dataset_name)
+    print(f"  Dataset: {len(text):,} chars")
+
+    # Tokenize (raw text, no chat template)
+    print("  Tokenizing...")
+    tokens = model.tokenizer.encode(text, add_special_tokens=False)
+    print(f"  Tokens: {len(tokens):,}")
+    if max_tokens:
+        tokens = tokens[:max_tokens]
+        print(f"  Truncated to: {len(tokens):,}")
+    print()
+
+    # Evaluate
+    print("  Evaluating perplexity...")
+    results = evaluate_perplexity(
+        model=model,
+        tokens=tokens,
+        window_size=window_size,
+        stride=stride,
+    )
+    results["dataset"] = dataset_name
+
+    # Save
+    save_config = dict(config) if config else {}
+    save_config.setdefault("model_path", model.cfg.model_path)
+    save_config["dataset"] = dataset_name
+    save_config["window_size"] = window_size
+    save_config["stride"] = stride
+    save_config["max_tokens"] = max_tokens
+
+    results_dir = _script_dir / "results"
+    json_path, log_path = save_results(results, save_config, results_dir)
+    results["json_path"] = str(json_path)
+    results["log_path"] = str(log_path)
+
+    # Print summary
+    tok_per_s = results["num_tokens_scored"] / results["elapsed_s"] if results["elapsed_s"] > 0 else 0
+    print()
+    bar = "\u2550" * 56
+    print(bar)
+    print(f"  PERPLEXITY COMPLETE \u2014 {dataset_name}")
+    print(bar)
+    print(f"  Perplexity:    {results['perplexity']:.2f}")
+    print(f"  BPC:           {results['bits_per_char']:.2f}")
+    print(f"  Tokens scored: {results['num_tokens_scored']:,}")
+    print(f"  Elapsed:       {results['elapsed_s']:.1f}s ({tok_per_s:.0f} tok/s)")
+    print(f"  Log:           {log_path}")
+    print(bar)
+
+    return results
+
+
 def main():
     args = parse_args()
 
@@ -312,21 +458,16 @@ def main():
     print(f"Krasis Perplexity Measurement")
     print(f"{'=' * 50}")
     print(f"Model:       {args.model_path}")
+    print(f"Dataset:     {args.dataset}")
     print(f"Mode:        {'CPU-only' if args.cpu_only else 'GPU prefill (Marlin)'}")
     print(f"GPU bits:    {args.gpu_expert_bits}")
     print(f"CPU bits:    {args.cpu_expert_bits}")
     print(f"Window:      {args.window_size}, stride={stride}")
     if args.max_tokens:
         print(f"Max tokens:  {args.max_tokens}")
-    print()
-
-    # ── Load dataset ──
-    print("Loading WikiText-2 dataset...")
-    text = load_wikitext2_test()
-    print(f"  Dataset: {len(text)} chars")
 
     # ── Load model ──
-    print("Loading model...")
+    print("\nLoading model...")
     quant_cfg = QuantConfig(
         attention=args.attention_quant,
         shared_expert="int8",
@@ -348,37 +489,6 @@ def main():
     )
     model.load()
 
-    # ── Tokenize (raw text, no chat template) ──
-    print("Tokenizing...")
-    tokens = model.tokenizer.encode(text, add_special_tokens=False)
-    print(f"  Tokens: {len(tokens)}")
-    if args.max_tokens:
-        tokens = tokens[:args.max_tokens]
-        print(f"  Truncated to: {len(tokens)}")
-    print()
-
-    # ── Evaluate ──
-    print("Evaluating perplexity...")
-    results = evaluate_perplexity(
-        model=model,
-        tokens=tokens,
-        window_size=args.window_size,
-        stride=stride,
-    )
-
-    # ── Print results ──
-    print()
-    print(f"Results")
-    print(f"{'-' * 50}")
-    print(f"  Perplexity:    {results['perplexity']:.4f}")
-    print(f"  BPC:           {results['bits_per_char']:.4f}")
-    print(f"  Mean loss:     {results['mean_loss']:.6f}")
-    print(f"  Tokens scored: {results['num_tokens_scored']} / {results['num_tokens_total']}")
-    print(f"  Windows:       {results['num_windows']}")
-    print(f"  Elapsed:       {results['elapsed_s']:.1f}s")
-    print(f"  Throughput:    {results['num_tokens_scored'] / results['elapsed_s']:.0f} tok/s")
-
-    # ── Save ──
     config = {
         "model_path": args.model_path,
         "num_gpus": args.num_gpus,
@@ -388,18 +498,19 @@ def main():
         "attention_quant": args.attention_quant,
         "lm_head_quant": args.lm_head_quant,
         "layer_group_size": args.layer_group_size,
-        "window_size": args.window_size,
-        "stride": stride,
-        "max_tokens": args.max_tokens,
         "krasis_threads": args.krasis_threads,
         "kv_cache_mb": args.kv_cache_mb,
     }
 
-    results_dir = _script_dir / "results"
-    json_path, log_path = save_results(results, config, results_dir)
-    print()
-    print(f"  Saved: {json_path}")
-    print(f"         {log_path}")
+    # ── Run perplexity ──
+    run_perplexity(
+        model=model,
+        dataset_name=args.dataset,
+        window_size=args.window_size,
+        stride=stride,
+        max_tokens=args.max_tokens,
+        config=config,
+    )
 
 
 if __name__ == "__main__":

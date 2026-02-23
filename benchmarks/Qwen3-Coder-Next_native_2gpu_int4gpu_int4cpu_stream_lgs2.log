@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-02-22 10:12:09
+Krasis Benchmark — 2026-02-23 01:39:56
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -10,7 +10,7 @@ Hardware:
   RAM:            995 GB total, 80.0 GB used by process
   GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 3674 MB allocated
   GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), 0 MB allocated
-  GPU 2:          NVIDIA RTX 2000 Ada Generation (16380 MB), N/A
+  GPU 2:          NVIDIA RTX 2000 Ada Generation (16380 MB), 0 MB allocated
 
 Quantization:
   GPU experts:    INT4 (Marlin)
@@ -23,32 +23,40 @@ Quantization:
 
 Strategy:
   Layer group size: 2 (layer_grouped(2) + stream_attn)
-  Prefill threshold: 300
+  Prefill threshold: 500
   Mode:           pure_cpu decode, layer_grouped(2) + stream_attn prefill
 
-Prefill (10000 tokens, 3 runs):
-  Run 1:  822.7 tok/s, TTFT=12.16s
-  Run 2:  884.4 tok/s, TTFT=11.31s
-  Run 3:  882.0 tok/s, TTFT=11.34s
-  Average: 863.0 tok/s, TTFT=11.60s
+Prefill (~61599 tokens, 3 runs, different prompts):
+  Run 1:  692.3 tok/s, TTFT=89.86s (62210 tokens)
+  Run 2:  692.3 tok/s, TTFT=89.21s (61755 tokens)
+  Run 3:  696.5 tok/s, TTFT=87.34s (60831 tokens)
+  Average: 693.7 tok/s, TTFT=88.80s
 
-Decode (64 tokens, 3 runs):
-  Run 1:  7.83 tok/s (127.6ms/tok)
-  Run 2:  7.80 tok/s (128.2ms/tok)
-  Run 3:  7.79 tok/s (128.3ms/tok)
-  Average: 7.81 tok/s (128.0ms/tok)
+Decode (64 tokens, 3 runs, different prompts):
+  Run 1:  6.55 tok/s (152.6ms/tok)
+  Run 2:  7.25 tok/s (138.0ms/tok)
+  Run 3:  7.13 tok/s (140.3ms/tok)
+  Average: 6.98 tok/s (143.6ms/tok)
 
 Verification:
   Prefill prompt: user
-Distributed consensus algorithms form the backbone of modern fault-tolerant systems. The Paxos algorithm, proposed by Leslie Lamport, achieves consensus among a group of processes even when some ... [52428 chars total]
+Summarise the following in one paragraph: THE COUNT OF MONTE CRISTO
+
+by Alexandre Dumas [père]
+
+
+
+
+Contents
+
+
+ VOLUME ONE
+Chapter 1. Marseilles—The Arrival
+Chapter 2. Father and Son
+Chapter 3. Th... [244212 chars total]
   Decode prompt:  Write a poem about recursion in programming at least 100 words long.
   Generated output (64 tokens):
-    **The Recursive Ladder**
+    Public key cryptography (also called **asymmetric cryptography**) is a cryptographic system that uses **pairs of keys**: a **public key** (shared openly) and a **private key** (kept secret). Unlike symmetric cryptography (where the same key encrypts and decrypts), in public key systems:
     
-    A function calls itself—not magic, but art,  
-    A mirror held up to the logic of the heart.  
-    It peels back the layers like an onion’s dense skin,  
-    Each call a new voice whispering, “Let’s begin.”  
-    
-    *Base case first!*—the
+    - **Encryption**:
 ================================================================

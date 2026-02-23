@@ -450,6 +450,8 @@ def main():
                         help="Run benchmark and exit (don't start server)")
     parser.add_argument("--stress-test", action="store_true",
                         help="Run stress test (diverse prompts) and exit")
+    parser.add_argument("--perplexity", action="store_true",
+                        help="Run perplexity evaluation and exit")
     parser.add_argument("--hcs", action="store_true",
                         help="Enable HCS expert cache — pin hot experts on GPU for decode")
     parser.add_argument("--temperature", type=float, default=0.6)
@@ -511,7 +513,7 @@ def main():
         layer_group_size=args.layer_group_size,
         gguf_path=args.gguf_path,
         force_load=args.force_load,
-        gpu_prefill_threshold=1 if args.hcs else 300,  # GPU decode with HCS, CPU decode default
+        gpu_prefill_threshold=1 if args.hcs else 500,  # GPU decode with HCS, CPU decode default
         kv_cache_mb=args.kv_cache_mb,
         stream_attention=not args.no_stream_attention,
     )
@@ -789,6 +791,70 @@ def main():
         results = st.run()
         failed = sum(1 for r in results if r["status"].startswith("FAIL"))
         sys.exit(1 if failed > 0 else 0)
+
+    # Run perplexity evaluation if requested
+    if args.perplexity:
+        _ppl_dir = os.path.join(os.path.dirname(__file__), "..", "..", "perplexity")
+        sys.path.insert(0, os.path.dirname(_ppl_dir))
+        from perplexity.measure_ppl import list_datasets, run_perplexity
+
+        _status("Perplexity Evaluation")
+        datasets = list_datasets()
+        print("\nChoose dataset:")
+        for i, ds in enumerate(datasets, 1):
+            print(f"  {i}. {ds['name']:20s} ({ds['tokens_approx']} tokens)")
+        print(f"  {len(datasets) + 1}. All datasets")
+
+        choice = input(f"\nSelection [1]: ").strip() or "1"
+        try:
+            choice_idx = int(choice)
+        except ValueError:
+            print(f"Invalid selection: {choice}")
+            sys.exit(1)
+
+        if choice_idx == len(datasets) + 1:
+            # Run all datasets
+            selected = [ds["name"] for ds in datasets]
+        elif 1 <= choice_idx <= len(datasets):
+            selected = [datasets[choice_idx - 1]["name"]]
+        else:
+            print(f"Invalid selection: {choice_idx}")
+            sys.exit(1)
+
+        config = {
+            "model_path": args.model_path,
+            "gpu_expert_bits": args.gpu_expert_bits,
+            "cpu_expert_bits": args.cpu_expert_bits,
+            "attention_quant": args.attention_quant,
+            "lm_head_quant": args.lm_head_quant,
+            "layer_group_size": args.layer_group_size,
+            "krasis_threads": args.krasis_threads,
+            "kv_cache_mb": args.kv_cache_mb,
+        }
+
+        all_results = []
+        for ds_name in selected:
+            result = run_perplexity(model=_model, dataset_name=ds_name, config=config)
+            all_results.append(result)
+
+        # Print summary table if multiple datasets
+        if len(all_results) > 1:
+            print()
+            bar = "\u2550" * 56
+            print(bar)
+            print("  PERPLEXITY SUMMARY")
+            print(bar)
+            print(f"  {'Dataset':20s} {'PPL':>10s} {'BPC':>8s} {'Tokens':>12s} {'Time':>8s}")
+            print(f"  {'-' * 20} {'-' * 10} {'-' * 8} {'-' * 12} {'-' * 8}")
+            for r in all_results:
+                tok_s = r["num_tokens_scored"] / r["elapsed_s"] if r["elapsed_s"] > 0 else 0
+                print(
+                    f"  {r['dataset']:20s} {r['perplexity']:10.2f} {r['bits_per_char']:8.2f} "
+                    f"{r['num_tokens_scored']:>12,} {r['elapsed_s']:7.1f}s"
+                )
+            print(bar)
+
+        sys.exit(0)
 
     _status(f"Server ready on {args.host}:{args.port}")
     logger.info("Model loaded, starting server on %s:%d", args.host, args.port)
