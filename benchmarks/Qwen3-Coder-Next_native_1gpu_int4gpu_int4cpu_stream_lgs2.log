@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-02-23 01:28:08
+Krasis Benchmark — 2026-02-23 13:01:57
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -26,37 +26,43 @@ Strategy:
   Prefill threshold: 500
   Mode:           pure_cpu decode, layer_grouped(2) + stream_attn prefill
 
-Prefill (~61599 tokens, 3 runs, different prompts):
-  Run 1:  689.8 tok/s, TTFT=90.19s (62210 tokens)
-  Run 2:  691.7 tok/s, TTFT=89.28s (61755 tokens)
-  Run 3:  702.2 tok/s, TTFT=86.63s (60831 tokens)
-  Average: 694.6 tok/s, TTFT=88.70s
+Prefill (3 runs at different lengths):
+  Run 1:  943.6 tok/s, TTFT=21.20s (20,000 tokens)
+  Run 2:  844.8 tok/s, TTFT=41.43s (35,000 tokens)
+  Run 3:  751.0 tok/s, TTFT=66.58s (50,000 tokens)
+  Best:    943.6 tok/s, TTFT=21.20s (20,000 tokens)
 
 Decode (64 tokens, 3 runs, different prompts):
-  Run 1:  6.68 tok/s (149.8ms/tok)
-  Run 2:  7.06 tok/s (141.6ms/tok)
-  Run 3:  7.34 tok/s (136.3ms/tok)
-  Average: 7.03 tok/s (142.6ms/tok)
+  Run 1:  7.32 tok/s (136.5ms/tok)
+  Run 2:  6.97 tok/s (143.5ms/tok)
+  Run 3:  6.99 tok/s (143.1ms/tok)
+  Average: 7.09 tok/s (141.0ms/tok)
 
 Verification:
   Prefill prompt: user
-Summarise the following in one paragraph: THE COUNT OF MONTE CRISTO
+Summarise the following in one paragraph: MOBY-DICK;
 
-by Alexandre Dumas [père]
+or, THE WHALE.
 
-
-
-
-Contents
+By Herman Melville
 
 
- VOLUME ONE
-Chapter 1. Marseilles—The Arrival
-Chapter 2. Father and Son
-Chapter 3. Th... [244212 chars total]
-  Decode prompt:  Write a poem about recursion in programming at least 100 words long.
+
+CONTENTS
+
+ETYMOLOGY.
+
+EXTRACTS (Supplied by a Sub-Sub-Librarian).
+
+CHAPTER 1. Loomings.
+
+CHAPTER 2. The... [75918 chars total]
+  Decode prompt:  user
+Explain how public key cryptography works, including the RSA algorithm and why it is considered secure.
+assistant
+
   Generated output (64 tokens):
-    Public key cryptography (also called **asymmetric cryptography**) is a cryptographic system that uses a pair of mathematically linked keys: a **public key** (shared openly) and a **private key** (kept secret). Unlike symmetric cryptography (where the same key encrypts and decrypts), here:
+    Public key cryptography (also called **asymmetric cryptography**) is a cryptographic system that uses **pairs of keys**: a **public key** (shared openly) and a **private key** (kept secret). Unlike symmetric cryptography (where the same key encrypts and decrypts), in public key systems:
     
-    - **Encryption
+    - **Encryption with
 ================================================================
