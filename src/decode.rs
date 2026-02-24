@@ -1436,6 +1436,35 @@ fn dispatch_matmul_free(
     }
 }
 
+/// Prefetch a TransposedWeight's packed data and scales into L3 cache using NTA hints.
+/// Call this before a compute-bound phase so the weight data is warm when the matmul starts.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn prefetch_weight_nta(w: &TransposedWeight) {
+    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_NTA};
+    const STRIDE: usize = 512; // 8 cache lines per prefetch
+    let packed_bytes = w.packed.len() * 4;
+    let scales_bytes = w.scales.len() * 2;
+    unsafe {
+        let p = w.packed.as_ptr() as *const i8;
+        let mut off = 0;
+        while off < packed_bytes {
+            _mm_prefetch(p.add(off), _MM_HINT_NTA);
+            off += STRIDE;
+        }
+        let s = w.scales.as_ptr() as *const i8;
+        off = 0;
+        while off < scales_bytes {
+            _mm_prefetch(s.add(off), _MM_HINT_NTA);
+            off += STRIDE;
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn prefetch_weight_nta(_w: &TransposedWeight) {}
+
 /// BF16 → f32 conversion.
 #[inline]
 fn bf16_to_f32(x: u16) -> f32 {
@@ -1655,6 +1684,8 @@ struct DecodeGraph {
     la_beta_buf: Vec<f32>,
     la_recur_out: Vec<f32>,
     la_gated_out: Vec<f32>,
+    la_mixed_qkv: Vec<f32>,  // scratch for decode_la_conv (avoids heap alloc per call)
+    la_conv_out: Vec<f32>,   // scratch for decode_la_conv
 
     // GQA scratch
     gqa_q_buf: Vec<f32>,
@@ -1759,6 +1790,7 @@ impl CpuDecodeStore {
             la_v_buf: Vec::new(), la_z_buf: Vec::new(),
             la_g_buf: Vec::new(), la_beta_buf: Vec::new(),
             la_recur_out: Vec::new(), la_gated_out: Vec::new(),
+            la_mixed_qkv: Vec::new(), la_conv_out: Vec::new(),
             gqa_q_buf: Vec::new(), gqa_k_buf: Vec::new(), gqa_v_buf: Vec::new(),
             gqa_scores: Vec::new(), gqa_attn_out: Vec::new(),
             mlp_gate_up: Vec::new(), mlp_hidden_buf: Vec::new(),
@@ -1967,11 +1999,12 @@ impl CpuDecodeStore {
         let mut max_heads = 0usize;
         let mut max_heads_hd = 0usize;
         let mut max_intermediate = 0usize;
+        let mut max_conv_dim = 0usize;
         let mut max_k = 0usize; // for quantization scratch
 
         for layer in &g.layers {
             match &layer.attn {
-                DecodeAttnConfig::LinearAttention { nk, nv, dk, dv, hr, kernel_dim: _, conv_dim: _,
+                DecodeAttnConfig::LinearAttention { nk, nv, dk, dv, hr, kernel_dim: _, conv_dim,
                     in_proj_qkvz_wid, in_proj_ba_wid, out_proj_wid, .. } => {
                     let group_dim = 2 * dk + 2 * dv * hr;
                     max_qkvz = max_qkvz.max(nk * group_dim);
@@ -1979,6 +2012,7 @@ impl CpuDecodeStore {
                     max_nv_dk = max_nv_dk.max(nv * dk);
                     max_nv_dv = max_nv_dv.max(nv * dv);
                     max_nv = max_nv.max(*nv);
+                    max_conv_dim = max_conv_dim.max(*conv_dim);
                     max_k = max_k.max(self.weights[*in_proj_qkvz_wid].cols);
                     max_k = max_k.max(self.weights[*in_proj_ba_wid].cols);
                     max_k = max_k.max(self.weights[*out_proj_wid].cols);
@@ -2029,6 +2063,8 @@ impl CpuDecodeStore {
         g.la_beta_buf = vec![0.0; max_nv.max(1)];
         g.la_recur_out = vec![0.0; max_nv_dv.max(1)];
         g.la_gated_out = vec![0.0; max_nv_dv.max(1)];
+        g.la_mixed_qkv = vec![0.0; max_conv_dim.max(1)];
+        g.la_conv_out = vec![0.0; max_conv_dim.max(1)];
         g.gqa_q_buf = vec![0.0; max_q_proj.max(1)];
         g.gqa_k_buf = vec![0.0; max_kv_proj.max(1)];
         g.gqa_v_buf = vec![0.0; max_kv_proj.max(1)];
@@ -2179,6 +2215,7 @@ impl CpuDecodeStore {
                         &mut graph.la_q_buf, &mut graph.la_k_buf,
                         &mut graph.la_v_buf, &mut graph.la_z_buf,
                         &mut graph.la_g_buf, &mut graph.la_beta_buf,
+                        &mut graph.la_mixed_qkv, &mut graph.la_conv_out,
                         nk, nv, dk, dv, hr, kd, cd);
                     if timing { graph.t_la_conv += t0.elapsed().as_secs_f64(); }
 
@@ -2201,21 +2238,12 @@ impl CpuDecodeStore {
                     }
                     if timing { graph.t_la_recur += t0.elapsed().as_secs_f64(); }
 
-                    // Gated RMSNorm + SiLU
+                    // Gated RMSNorm + SiLU (AVX2)
                     let t0 = if timing { Instant::now() } else { t_step_start };
-                    for h in 0..nv {
-                        let base = h * dv;
-                        let mut sum_sq = 0.0f32;
-                        for j in 0..dv {
-                            sum_sq += graph.la_recur_out[base + j] * graph.la_recur_out[base + j];
-                        }
-                        let rms = (sum_sq / dv as f32 + eps).sqrt().recip();
-                        for j in 0..dv {
-                            let normed = graph.la_recur_out[base + j] * rms * norm_weight[base + j];
-                            let zval = graph.la_z_buf[base + j];
-                            let silu_z = zval / (1.0 + (-zval).exp());
-                            graph.la_gated_out[base + j] = silu_z * normed;
-                        }
+                    unsafe {
+                        gated_rmsnorm_silu_avx2(
+                            &graph.la_recur_out, &graph.la_z_buf, norm_weight,
+                            &mut graph.la_gated_out, nv, dv, eps);
                     }
                     if timing { graph.t_la_gate_norm += t0.elapsed().as_secs_f64(); }
 
@@ -2638,6 +2666,7 @@ fn decode_la_conv(
     q_out: &mut [f32], k_out: &mut [f32],
     v_out: &mut [f32], z_out: &mut [f32],
     g_out: &mut [f32], beta_out: &mut [f32],
+    mixed_qkv: &mut [f32], conv_out: &mut [f32],
     nk: usize, nv: usize, dk: usize, dv: usize, hr: usize,
     kernel_dim: usize, conv_dim: usize,
 ) {
@@ -2645,8 +2674,6 @@ fn decode_la_conv(
     let key_dim = nk * dk;
 
     // Un-interleave qkvz → mixed_qkv + z_out
-    // mixed_qkv layout: [q_flat(nk*dk), k_flat(nk*dk), v_flat(nv*dv)]
-    let mut mixed_qkv = vec![0.0f32; conv_dim];
     for h in 0..nk {
         let src = h * group_dim;
         mixed_qkv[h * dk..(h + 1) * dk].copy_from_slice(&qkvz[src..src + dk]);
@@ -2663,65 +2690,244 @@ fn decode_la_conv(
         }
     }
 
-    // Un-interleave ba → b_raw, a_param
-    let mut b_raw = vec![0.0f32; nv];
-    let mut a_param = vec![0.0f32; nv];
-    for h in 0..nk {
-        let src = h * 2 * hr;
-        for r in 0..hr {
-            b_raw[h * hr + r] = ba[src + r];
-            a_param[h * hr + r] = ba[src + hr + r];
+    // Conv state update + depthwise conv1d (dot product only, defer SiLU)
+    // Optimized for kernel_dim=4: explicit unroll avoids serial dependencies
+    if kernel_dim == 4 {
+        for ch in 0..conv_dim {
+            let base = ch * 4;
+            let s1 = conv_state[base + 1];
+            let s2 = conv_state[base + 2];
+            let s3 = conv_state[base + 3];
+            let s4 = mixed_qkv[ch];
+            conv_state[base] = s1;
+            conv_state[base + 1] = s2;
+            conv_state[base + 2] = s3;
+            conv_state[base + 3] = s4;
+            conv_out[ch] = s1 * conv_weight[base]
+                + s2 * conv_weight[base + 1]
+                + s3 * conv_weight[base + 2]
+                + s4 * conv_weight[base + 3];
+        }
+    } else {
+        for ch in 0..conv_dim {
+            let base = ch * kernel_dim;
+            for t in 0..kernel_dim - 1 {
+                conv_state[base + t] = conv_state[base + t + 1];
+            }
+            conv_state[base + kernel_dim - 1] = mixed_qkv[ch];
+            let mut dot = 0.0f32;
+            for t in 0..kernel_dim {
+                dot += conv_state[base + t] * conv_weight[base + t];
+            }
+            conv_out[ch] = dot;
         }
     }
+    // Apply SiLU in bulk using AVX2
+    unsafe { fast_silu_avx2(conv_out, conv_dim); }
 
-    // Conv state update + depthwise conv (dot product only, defer SiLU)
-    let mut conv_out = vec![0.0f32; conv_dim];
-    for ch in 0..conv_dim {
-        let base = ch * kernel_dim;
-        for t in 0..kernel_dim - 1 {
-            conv_state[base + t] = conv_state[base + t + 1];
-        }
-        conv_state[base + kernel_dim - 1] = mixed_qkv[ch];
-        let mut dot = 0.0f32;
-        for t in 0..kernel_dim {
-            dot += conv_state[base + t] * conv_weight[base + t];
-        }
-        conv_out[ch] = dot;
-    }
-    // Apply SiLU in bulk using AVX2 (replaces conv_dim scalar exp() calls)
-    unsafe { fast_silu_avx2(&mut conv_out, conv_dim); }
-
-    // Expand + L2 normalize q
-    for vh in 0..nv {
-        let kh = vh / hr;
-        let src_base = kh * dk;
-        let dst_base = vh * dk;
-        let mut sum_sq = 0.0f32;
-        for i in 0..dk { sum_sq += conv_out[src_base + i] * conv_out[src_base + i]; }
-        let inv_norm = if sum_sq > 0.0 { 1.0 / sum_sq.sqrt() } else { 0.0 };
-        for i in 0..dk { q_out[dst_base + i] = conv_out[src_base + i] * inv_norm * scale; }
-    }
-
-    // Expand + L2 normalize k
-    for vh in 0..nv {
-        let kh = vh / hr;
-        let src_base = key_dim + kh * dk;
-        let dst_base = vh * dk;
-        let mut sum_sq = 0.0f32;
-        for i in 0..dk { sum_sq += conv_out[src_base + i] * conv_out[src_base + i]; }
-        let inv_norm = if sum_sq > 0.0 { 1.0 / sum_sq.sqrt() } else { 0.0 };
-        for i in 0..dk { k_out[dst_base + i] = conv_out[src_base + i] * inv_norm; }
+    // Expand + L2 normalize q/k using AVX2
+    unsafe {
+        l2_normalize_expand_avx2(conv_out, q_out, 0, dk, nv, hr, scale);
+        l2_normalize_expand_avx2(conv_out, k_out, key_dim, dk, nv, hr, 1.0);
     }
 
     // v: no expansion, no normalization
     v_out[..nv * dv].copy_from_slice(&conv_out[2 * key_dim..2 * key_dim + nv * dv]);
 
-    // Gate parameters
+    // Gate parameters: un-interleave ba inline and compute gates
+    for h in 0..nk {
+        let src = h * 2 * hr;
+        for r in 0..hr {
+            let vh = h * hr + r;
+            let b_raw = ba[src + r];
+            let a_p = ba[src + hr + r];
+            beta_out[vh] = 1.0 / (1.0 + (-b_raw).exp());
+            let ap_dt = a_p + dt_bias[vh];
+            let softplus = if ap_dt > 20.0 { ap_dt } else { (1.0 + ap_dt.exp()).ln() };
+            g_out[vh] = -(a_log[vh].exp()) * softplus;
+        }
+    }
+}
+
+/// AVX2 L2 normalize + expand: for each value head, read from key head's src,
+/// normalize, and write scaled result to dst.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn l2_normalize_expand_avx2(
+    src: &[f32], dst: &mut [f32],
+    src_offset: usize, dk: usize, nv: usize, hr: usize,
+    scale: f32,
+) {
+    use std::arch::x86_64::*;
+    let dk8 = dk / 8;
+    let scale_v = _mm256_set1_ps(scale);
+
+    for vh in 0..nv {
+        let kh = vh / hr;
+        let s_base = src_offset + kh * dk;
+        let d_base = vh * dk;
+
+        // Sum of squares
+        let mut sum_acc = _mm256_setzero_ps();
+        for i in 0..dk8 {
+            let v = _mm256_loadu_ps(src.as_ptr().add(s_base + i * 8));
+            sum_acc = _mm256_fmadd_ps(v, v, sum_acc);
+        }
+        // Horizontal sum
+        let hi = _mm256_extractf128_ps(sum_acc, 1);
+        let lo = _mm256_castps256_ps128(sum_acc);
+        let sum128 = _mm_add_ps(lo, hi);
+        let shuf = _mm_movehdup_ps(sum128);
+        let s1 = _mm_add_ps(sum128, shuf);
+        let s2 = _mm_add_ps(s1, _mm_movehl_ps(shuf, s1));
+        let sum_sq = _mm_cvtss_f32(s2);
+        // Scalar remainder
+        let mut sum_sq = sum_sq;
+        for i in (dk8 * 8)..dk {
+            let v = src[s_base + i];
+            sum_sq += v * v;
+        }
+
+        let inv_norm = if sum_sq > 0.0 { 1.0 / sum_sq.sqrt() } else { 0.0 };
+        let inv_v = _mm256_mul_ps(_mm256_set1_ps(inv_norm), scale_v);
+
+        for i in 0..dk8 {
+            let v = _mm256_loadu_ps(src.as_ptr().add(s_base + i * 8));
+            let scaled = _mm256_mul_ps(v, inv_v);
+            _mm256_storeu_ps(dst.as_mut_ptr().add(d_base + i * 8), scaled);
+        }
+        for i in (dk8 * 8)..dk {
+            dst[d_base + i] = src[s_base + i] * inv_norm * scale;
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn l2_normalize_expand_avx2(
+    src: &[f32], dst: &mut [f32],
+    src_offset: usize, dk: usize, nv: usize, hr: usize,
+    scale: f32,
+) {
+    for vh in 0..nv {
+        let kh = vh / hr;
+        let s_base = src_offset + kh * dk;
+        let d_base = vh * dk;
+        let mut sum_sq = 0.0f32;
+        for i in 0..dk { sum_sq += src[s_base + i] * src[s_base + i]; }
+        let inv_norm = if sum_sq > 0.0 { 1.0 / sum_sq.sqrt() } else { 0.0 };
+        for i in 0..dk { dst[d_base + i] = src[s_base + i] * inv_norm * scale; }
+    }
+}
+
+/// AVX2 Gated RMSNorm + SiLU: out[i] = SiLU(z[i]) * RMSNorm(recur[i]) * weight[i]
+/// Processes per-head blocks of dv elements. Eliminates scalar exp() calls.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gated_rmsnorm_silu_avx2(
+    recur_out: &[f32], z_buf: &[f32], norm_weight: &[f32],
+    gated_out: &mut [f32], nv: usize, dv: usize, eps: f32,
+) {
+    use std::arch::x86_64::*;
+
+    #[inline(always)]
+    unsafe fn fast_exp_avx2_inline(x: __m256) -> __m256 {
+        let log2e = _mm256_set1_ps(1.4426950408889634);
+        let t = _mm256_mul_ps(x, log2e);
+        let n = _mm256_floor_ps(t);
+        let ni = _mm256_cvtps_epi32(n);
+        let f = _mm256_sub_ps(t, n);
+        let c5 = _mm256_set1_ps(0.0013333558);
+        let c4 = _mm256_set1_ps(0.009618129);
+        let c3 = _mm256_set1_ps(0.0555041);
+        let c2 = _mm256_set1_ps(0.2402265);
+        let c1 = _mm256_set1_ps(0.6931472);
+        let one = _mm256_set1_ps(1.0);
+        let poly = _mm256_fmadd_ps(c5, f, c4);
+        let poly = _mm256_fmadd_ps(poly, f, c3);
+        let poly = _mm256_fmadd_ps(poly, f, c2);
+        let poly = _mm256_fmadd_ps(poly, f, c1);
+        let poly = _mm256_fmadd_ps(poly, f, one);
+        let pow2n = _mm256_castsi256_ps(_mm256_slli_epi32(
+            _mm256_add_epi32(ni, _mm256_set1_epi32(127)), 23));
+        _mm256_mul_ps(poly, pow2n)
+    }
+
+    let dv8 = dv / 8;
+
     for h in 0..nv {
-        beta_out[h] = 1.0 / (1.0 + (-b_raw[h]).exp());
-        let ap_dt = a_param[h] + dt_bias[h];
-        let softplus = if ap_dt > 20.0 { ap_dt } else { (1.0 + ap_dt.exp()).ln() };
-        g_out[h] = -(a_log[h].exp()) * softplus;
+        let base = h * dv;
+
+        // RMSNorm: sum of squares
+        let mut sum_acc = _mm256_setzero_ps();
+        for i in 0..dv8 {
+            let v = _mm256_loadu_ps(recur_out.as_ptr().add(base + i * 8));
+            sum_acc = _mm256_fmadd_ps(v, v, sum_acc);
+        }
+        let hi = _mm256_extractf128_ps(sum_acc, 1);
+        let lo = _mm256_castps256_ps128(sum_acc);
+        let sum128 = _mm_add_ps(lo, hi);
+        let shuf = _mm_movehdup_ps(sum128);
+        let s1 = _mm_add_ps(sum128, shuf);
+        let s2 = _mm_add_ps(s1, _mm_movehl_ps(shuf, s1));
+        let mut sum_sq = _mm_cvtss_f32(s2);
+        for i in (dv8 * 8)..dv { sum_sq += recur_out[base + i] * recur_out[base + i]; }
+
+        let rms = (sum_sq / dv as f32 + eps).sqrt().recip();
+        let rms_v = _mm256_set1_ps(rms);
+
+        // Fused: gated_out = SiLU(z) * (recur * rms * weight)
+        let clamp_hi = _mm256_set1_ps(20.0);
+        let clamp_lo = _mm256_set1_ps(-20.0);
+        let one = _mm256_set1_ps(1.0);
+        let two = _mm256_set1_ps(2.0);
+
+        for i in 0..dv8 {
+            let off = base + i * 8;
+            let r = _mm256_loadu_ps(recur_out.as_ptr().add(off));
+            let w = _mm256_loadu_ps(norm_weight.as_ptr().add(off));
+            let z = _mm256_loadu_ps(z_buf.as_ptr().add(off));
+
+            let normed = _mm256_mul_ps(_mm256_mul_ps(r, rms_v), w);
+
+            // SiLU(z) = z * sigmoid(z)
+            let neg_z = _mm256_sub_ps(_mm256_setzero_ps(), z);
+            let clamped = _mm256_max_ps(_mm256_min_ps(neg_z, clamp_hi), clamp_lo);
+            let exp_neg_z = fast_exp_avx2_inline(clamped);
+            let denom = _mm256_add_ps(one, exp_neg_z);
+            let rcp = _mm256_rcp_ps(denom);
+            let sigmoid = _mm256_mul_ps(rcp, _mm256_fnmadd_ps(denom, rcp, two));
+            let silu_z = _mm256_mul_ps(z, sigmoid);
+
+            let result = _mm256_mul_ps(silu_z, normed);
+            _mm256_storeu_ps(gated_out.as_mut_ptr().add(off), result);
+        }
+        // Scalar remainder
+        for i in (dv8 * 8)..dv {
+            let j = base + i;
+            let normed = recur_out[j] * rms * norm_weight[j];
+            let zval = z_buf[j];
+            let silu_z = zval / (1.0 + (-zval).exp());
+            gated_out[j] = silu_z * normed;
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn gated_rmsnorm_silu_avx2(
+    recur_out: &[f32], z_buf: &[f32], norm_weight: &[f32],
+    gated_out: &mut [f32], nv: usize, dv: usize, eps: f32,
+) {
+    for h in 0..nv {
+        let base = h * dv;
+        let mut sum_sq = 0.0f32;
+        for j in 0..dv { sum_sq += recur_out[base + j] * recur_out[base + j]; }
+        let rms = (sum_sq / dv as f32 + eps).sqrt().recip();
+        for j in 0..dv {
+            let normed = recur_out[base + j] * rms * norm_weight[base + j];
+            let zval = z_buf[base + j];
+            let silu_z = zval / (1.0 + (-zval).exp());
+            gated_out[base + j] = silu_z * normed;
+        }
     }
 }
 
@@ -3224,6 +3430,8 @@ pub fn bench_decode_synthetic(
         la_beta_buf: Vec::new(),
         la_recur_out: Vec::new(),
         la_gated_out: Vec::new(),
+        la_mixed_qkv: Vec::new(),
+        la_conv_out: Vec::new(),
         gqa_q_buf: Vec::new(),
         gqa_k_buf: Vec::new(),
         gqa_v_buf: Vec::new(),
