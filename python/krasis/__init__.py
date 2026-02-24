@@ -1,7 +1,7 @@
 """Krasis — hybrid LLM MoE runtime."""
 
 try:
-    from krasis.krasis import KrasisEngine, WeightStore, CpuDecodeStore, system_check
+    from krasis.krasis import KrasisEngine, WeightStore, CpuDecodeStore, system_check, bench_decode_synthetic
 except ImportError:
     # Native module not built yet
     pass

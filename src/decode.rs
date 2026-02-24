@@ -2887,3 +2887,766 @@ unsafe fn gqa_attention_compute_avx2(
         }
     }
 }
+
+// ── Synthetic decode benchmark ──
+
+/// Fast deterministic PRNG for filling benchmark buffers with varied data.
+struct Xorshift64(u64);
+
+impl Xorshift64 {
+    fn new(seed: u64) -> Self { Self(if seed == 0 { 0xDEADBEEF } else { seed }) }
+    #[inline]
+    fn next_u64(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    #[inline]
+    fn next_u32(&mut self) -> u32 { self.next_u64() as u32 }
+    /// Random f32 in [-scale, scale]
+    #[inline]
+    fn next_f32(&mut self, scale: f32) -> f32 {
+        let bits = self.next_u64();
+        // Map to [-1, 1] then scale
+        (bits as i64 as f64 / i64::MAX as f64) as f32 * scale
+    }
+}
+
+/// Fill u32 slice with random data (every element, no CoW zero pages).
+fn fill_random_u32(v: &mut [u32], rng: &mut Xorshift64) {
+    for val in v.iter_mut() {
+        *val = rng.next_u32();
+    }
+}
+
+/// Fill u16 slice with random BF16-range scale values (~0.001 to ~0.1).
+fn fill_random_scales_u16(v: &mut [u16], rng: &mut Xorshift64) {
+    for val in v.iter_mut() {
+        // Generate random f32 in [0.005, 0.05], convert to BF16 (upper 16 bits)
+        let f = 0.005 + (rng.next_u32() as f32 / u32::MAX as f32) * 0.045;
+        *val = (f.to_bits() >> 16) as u16;
+    }
+}
+
+/// Fill f32 slice with random values in [-scale, scale].
+fn fill_random_f32(v: &mut [f32], rng: &mut Xorshift64, scale: f32) {
+    for val in v.iter_mut() {
+        *val = rng.next_f32(scale);
+    }
+}
+
+/// Hint the OS to use transparent huge pages for a large allocation.
+#[cfg(target_os = "linux")]
+fn hint_hugepages<T>(v: &mut [T]) {
+    if v.is_empty() { return; }
+    let ptr = v.as_mut_ptr() as *mut libc::c_void;
+    let len = v.len() * std::mem::size_of::<T>();
+    unsafe { libc::madvise(ptr, len, libc::MADV_HUGEPAGE); }
+}
+
+fn fake_transposed_weight(rows: usize, cols: usize, group_size: usize, num_bits: u8, rng: &mut Xorshift64) -> TransposedWeight {
+    let mut packed = if num_bits == 4 {
+        let pk = cols / 8;
+        vec![0u32; pk * rows]
+    } else {
+        let byte_count = cols * rows;
+        let u32_count = (byte_count + 3) / 4;
+        vec![0u32; u32_count]
+    };
+    fill_random_u32(&mut packed, rng);
+    let num_groups = cols / group_size;
+    let mut scales = vec![0u16; num_groups * rows];
+    fill_random_scales_u16(&mut scales, rng);
+    TransposedWeight { packed, scales, rows, cols, group_size, num_bits }
+}
+
+/// Synthetic decode benchmark — measures decode_step speed without loading a real model.
+///
+/// Reads config.json to get model dimensions, allocates fake weights matching the
+/// exact layout and sizes, then runs decode_step in a loop. Memory access patterns
+/// are identical to real inference (same buffer sizes, same DRAM access).
+///
+/// Args:
+///   config_path: Path to model's config.json
+///   num_steps: Number of decode steps to run
+///   warmup: Number of warmup steps before timing
+///   timing: Enable per-component timing (KRASIS_CPU_DECODE_TIMING)
+///   num_bits: Weight quantization (4 or 8)
+#[pyfunction]
+#[pyo3(signature = (config_path, num_steps=100, warmup=5, timing=false, num_bits=4, max_experts=0, num_threads=48))]
+pub fn bench_decode_synthetic(
+    config_path: &str,
+    num_steps: usize,
+    warmup: usize,
+    timing: bool,
+    num_bits: u8,
+    max_experts: usize,
+    num_threads: usize,
+) -> PyResult<()> {
+    use std::time::Instant;
+    use crate::weights::{ModelConfig, UnifiedExpertWeights};
+
+    // Configure rayon thread pool (must match real model's thread count)
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global();
+    eprintln!("=== Synthetic Decode Benchmark (rayon: {} threads) ===", num_threads);
+
+    // ── 1. Parse config.json ──
+    let config_str = std::fs::read_to_string(config_path)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Failed to read {}: {}", config_path, e)))?;
+    let raw: serde_json::Value = serde_json::from_str(&config_str)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid JSON: {}", e)))?;
+
+    // Use text_config if present (VL wrapper)
+    let cfg = if let Some(tc) = raw.get("text_config") { tc } else { &raw };
+
+    let hidden_size = cfg["hidden_size"].as_u64().unwrap() as usize;
+    let num_layers = cfg["num_hidden_layers"].as_u64().unwrap() as usize;
+    let vocab_size = cfg["vocab_size"].as_u64().unwrap() as usize;
+    let eps = cfg.get("rms_norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-6) as f32;
+    let full_attn_interval = cfg.get("full_attention_interval").and_then(|v| v.as_u64()).unwrap_or(4) as usize;
+
+    // Linear attention params
+    let nk = cfg.get("linear_num_key_heads").and_then(|v| v.as_u64()).unwrap_or(16) as usize;
+    let nv = cfg.get("linear_num_value_heads").and_then(|v| v.as_u64()).unwrap_or(32) as usize;
+    let dk = cfg.get("linear_key_head_dim").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
+    let dv = cfg.get("linear_value_head_dim").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
+    let kernel_dim = cfg.get("linear_conv_kernel_dim").and_then(|v| v.as_u64()).unwrap_or(4) as usize;
+    let hr = nv / nk;
+
+    // GQA params
+    let gqa_num_heads = cfg.get("num_attention_heads").and_then(|v| v.as_u64()).unwrap_or(16) as usize;
+    let gqa_num_kv_heads = cfg.get("num_key_value_heads").and_then(|v| v.as_u64()).unwrap_or(2) as usize;
+    let gqa_head_dim = cfg.get("head_dim").and_then(|v| v.as_u64()).unwrap_or(256) as usize;
+
+    // MoE params
+    let num_experts = cfg.get("num_experts").and_then(|v| v.as_u64()).unwrap_or(512) as usize;
+    let topk = cfg.get("num_experts_per_tok").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    let moe_intermediate = cfg.get("moe_intermediate_size").and_then(|v| v.as_u64()).unwrap_or(512) as usize;
+    let shared_intermediate = cfg.get("shared_expert_intermediate_size").and_then(|v| v.as_u64()).unwrap_or(moe_intermediate as u64) as usize;
+    let norm_topk_prob = cfg.get("norm_topk_prob").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    // Detect gated attention
+    let partial_rotary = cfg.get("partial_rotary_factor").and_then(|v| v.as_f64()).unwrap_or(1.0);
+    let gqa_gated = partial_rotary < 1.0; // QCN uses 0.25 → gated
+
+    // Norm bias one (Qwen3Next uses (1+w)*x)
+    let model_type = cfg.get("model_type").and_then(|v| v.as_str()).unwrap_or("");
+    let norm_bias_one = model_type.contains("qwen3_next");
+
+    let group_size = 128usize;
+    let scale = 1.0 / (dk as f32).sqrt();
+
+    // Derived LA dimensions
+    let key_dim = nk * dk;
+    let value_dim = nv * dv;
+    let conv_dim = key_dim * 2 + value_dim;
+    let group_dim = 2 * dk + 2 * dv * hr;
+    let qkvz_dim = nk * group_dim;
+    let ba_dim = nk * 2 * hr;
+
+    // max_experts=0 means use full count from config
+    let alloc_experts = if max_experts > 0 && max_experts < num_experts {
+        max_experts
+    } else {
+        num_experts
+    };
+
+    eprintln!("Model: hidden={}, layers={}, vocab={}", hidden_size, num_layers, vocab_size);
+    eprintln!("LA: nk={}, nv={}, dk={}, dv={}, hr={}, conv_dim={}, qkvz_dim={}", nk, nv, dk, dv, hr, conv_dim, qkvz_dim);
+    eprintln!("GQA: heads={}, kv_heads={}, head_dim={}, gated={}", gqa_num_heads, gqa_num_kv_heads, gqa_head_dim, gqa_gated);
+    eprintln!("MoE: experts={}, topk={}, intermediate={}, shared={} (alloc={})", num_experts, topk, moe_intermediate, shared_intermediate, alloc_experts);
+    eprintln!("Quantization: INT{}, group_size={}", num_bits, group_size);
+
+    // ── 2. Allocate ALL weights in contiguous mmap (matches real model's mmap'd layout) ──
+    let gen_start = Instant::now();
+
+    // Pre-calculate total packed u32 and scales u16 for ALL weights (non-expert + expert)
+    let packed_count_for = |rows: usize, cols: usize| -> usize {
+        if num_bits == 4 { (cols / 8) * rows } else { (cols * rows + 3) / 4 }
+    };
+    let scales_count_for = |rows: usize, cols: usize| -> usize {
+        (cols / group_size) * rows
+    };
+    let mut total_packed_u32 = 0usize;
+    let mut total_scales_u16 = 0usize;
+
+    // lm_head
+    total_packed_u32 += packed_count_for(vocab_size, hidden_size);
+    total_scales_u16 += scales_count_for(vocab_size, hidden_size);
+    // Per-layer projection weights
+    for layer_idx in 0..num_layers {
+        let is_gqa = full_attn_interval > 0 && (layer_idx + 1) % full_attn_interval == 0;
+        if is_gqa {
+            let q_out = if gqa_gated { gqa_num_heads * gqa_head_dim * 2 } else { gqa_num_heads * gqa_head_dim };
+            let kv_out = gqa_num_kv_heads * gqa_head_dim;
+            for &(r, c) in &[(q_out, hidden_size), (kv_out, hidden_size), (kv_out, hidden_size),
+                             (hidden_size, gqa_num_heads * gqa_head_dim)] {
+                total_packed_u32 += packed_count_for(r, c);
+                total_scales_u16 += scales_count_for(r, c);
+            }
+        } else {
+            for &(r, c) in &[(qkvz_dim, hidden_size), (ba_dim, hidden_size), (hidden_size, nv * dv)] {
+                total_packed_u32 += packed_count_for(r, c);
+                total_scales_u16 += scales_count_for(r, c);
+            }
+        }
+        for &(r, c) in &[(2 * shared_intermediate, hidden_size), (hidden_size, shared_intermediate), (1, hidden_size)] {
+            total_packed_u32 += packed_count_for(r, c);
+            total_scales_u16 += scales_count_for(r, c);
+        }
+    }
+    // Expert weights
+    let w13_packed_per = packed_count_for(2 * moe_intermediate, hidden_size);
+    let w13_scales_per = scales_count_for(2 * moe_intermediate, hidden_size);
+    let w2_packed_per = packed_count_for(hidden_size, moe_intermediate);
+    let w2_scales_per = scales_count_for(hidden_size, moe_intermediate);
+    total_packed_u32 += num_layers * alloc_experts * (w13_packed_per + w2_packed_per);
+    total_scales_u16 += num_layers * alloc_experts * (w13_scales_per + w2_scales_per);
+
+    // Allocate two contiguous mmap regions (like real model's mmap'd safetensors)
+    let packed_mmap_bytes = total_packed_u32 * 4;
+    let scales_mmap_bytes = total_scales_u16 * 2;
+    eprintln!("Allocating contiguous mmap: {:.1} GB packed + {:.1} MB scales",
+        packed_mmap_bytes as f64 / 1e9, scales_mmap_bytes as f64 / 1e6);
+
+    let packed_base = unsafe {
+        libc::mmap(std::ptr::null_mut(), packed_mmap_bytes,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_POPULATE,
+            -1, 0)
+    };
+    if packed_base == libc::MAP_FAILED {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err("mmap failed for packed weights"));
+    }
+    let scales_base = unsafe {
+        libc::mmap(std::ptr::null_mut(), scales_mmap_bytes,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_POPULATE,
+            -1, 0)
+    };
+    if scales_base == libc::MAP_FAILED {
+        unsafe { libc::munmap(packed_base, packed_mmap_bytes); }
+        return Err(pyo3::exceptions::PyRuntimeError::new_err("mmap failed for scales"));
+    }
+    unsafe {
+        libc::madvise(packed_base, packed_mmap_bytes, libc::MADV_HUGEPAGE);
+        libc::madvise(scales_base, scales_mmap_bytes, libc::MADV_HUGEPAGE);
+    }
+
+    // Fill entire mmap regions with random data before slicing
+    let mut rng = Xorshift64::new(0x12345678ABCDEF01);
+    eprintln!("Pre-generating random weight data...");
+    let packed_slice = unsafe { std::slice::from_raw_parts_mut(packed_base as *mut u32, total_packed_u32) };
+    fill_random_u32(packed_slice, &mut rng);
+    let scales_slice = unsafe { std::slice::from_raw_parts_mut(scales_base as *mut u16, total_scales_u16) };
+    fill_random_scales_u16(scales_slice, &mut rng);
+
+    // Offset trackers into the mmap regions
+    let mut p_off = 0usize; // packed offset in u32 units
+    let mut s_off = 0usize; // scales offset in u16 units
+
+    let mut store = CpuDecodeStore::new(group_size, true, norm_bias_one);
+
+    // Helper: create TransposedWeight from mmap slice (zero-copy).
+    // SAFETY: All returned Vecs MUST be defused (forgotten) before munmap.
+    let mut mmap_weight = |rows: usize, cols: usize| -> usize {
+        let pk = if num_bits == 4 { (cols / 8) * rows } else { (cols * rows + 3) / 4 };
+        let sc = (cols / group_size) * rows;
+        let packed = unsafe { Vec::from_raw_parts((packed_base as *mut u32).add(p_off), pk, pk) };
+        p_off += pk;
+        let scales = unsafe { Vec::from_raw_parts((scales_base as *mut u16).add(s_off), sc, sc) };
+        s_off += sc;
+        let id = store.weights.len();
+        store.weights.push(TransposedWeight { packed, scales, rows, cols, group_size, num_bits });
+        id
+    };
+
+    // Norm weights (2 per layer + 1 final) — small random perturbations around 1.0
+    let mut norm_ids = Vec::new();
+    for _ in 0..(num_layers * 2 + 1) {
+        let id = store.norm_weights.len();
+        // Norm weights: small values around 0 for (1+w)*x style, or around 1 for w*x style
+        let mut nw = vec![0.0f32; hidden_size];
+        if norm_bias_one {
+            fill_random_f32(&mut nw, &mut rng, 0.02); // small perturbations around 0
+        } else {
+            for v in nw.iter_mut() { *v = 1.0 + rng.next_f32(0.02); }
+        }
+        store.norm_weights.push(nw);
+        norm_ids.push(id);
+    }
+    let final_norm_id = norm_ids[num_layers * 2];
+
+    // lm_head weight
+    let lm_head_wid = mmap_weight(vocab_size, hidden_size);
+
+    // Count layer types
+    let mut n_la = 0usize;
+    let mut n_gqa = 0usize;
+
+    // ── 3. Configure decode graph ──
+    // Scoring func: 0 = softmax (QCN uses softmax)
+    store.decode_graph = Some(Box::new(DecodeGraph {
+        hidden_size,
+        eps,
+        final_norm_id,
+        lm_head_wid,
+        vocab_size,
+        routed_scaling_factor: 1.0,
+        scoring_func: 0,
+        topk,
+        norm_topk_prob,
+        parallel: true,
+        layers: Vec::with_capacity(num_layers),
+        embedding_ptr: 0, // set below
+        rope_cos_ptr: 0,
+        rope_sin_ptr: 0,
+        rope_half_dim: 0,
+        max_rope_seq: 0,
+        seq_len: 0,
+        kv_max_seq: 0,
+        kv_k_ptrs: vec![0; num_layers],
+        kv_v_ptrs: vec![0; num_layers],
+        conv_state_ptrs: vec![0; num_layers],
+        recur_state_ptrs: vec![0; num_layers],
+        hidden: vec![0.0; hidden_size],
+        residual: vec![0.0; hidden_size],
+        la_qkvz_buf: Vec::new(),
+        la_ba_buf: Vec::new(),
+        la_q_buf: Vec::new(),
+        la_k_buf: Vec::new(),
+        la_v_buf: Vec::new(),
+        la_z_buf: Vec::new(),
+        la_g_buf: Vec::new(),
+        la_beta_buf: Vec::new(),
+        la_recur_out: Vec::new(),
+        la_gated_out: Vec::new(),
+        gqa_q_buf: Vec::new(),
+        gqa_k_buf: Vec::new(),
+        gqa_v_buf: Vec::new(),
+        gqa_scores: Vec::new(),
+        gqa_attn_out: Vec::new(),
+        mlp_gate_up: Vec::new(),
+        mlp_hidden_buf: Vec::new(),
+        moe_store: None,
+        moe_scratch: None,
+        moe_scratch_pool: Vec::new(),
+        moe_output: vec![0.0; hidden_size],
+        moe_act_bf16: vec![0u16; hidden_size],
+        shared_out: vec![0.0; hidden_size],
+        moe_topk_ids: vec![0i32; topk.max(1)],
+        moe_topk_weights: vec![0.0f32; topk.max(1)],
+        moe_parallel: true,
+        route_logits: Vec::new(),
+        route_scores: Vec::new(),
+        route_corrected: Vec::new(),
+        act_int16: Vec::new(),
+        act_scales: Vec::new(),
+        group_size,
+        timing_enabled: timing,
+        timing_step_count: 0,
+        timing_report_interval: 20,
+        t_norm: 0.0, t_la_proj: 0.0, t_la_conv: 0.0, t_la_recur: 0.0,
+        t_la_gate_norm: 0.0, t_la_out_proj: 0.0,
+        t_gqa_proj: 0.0, t_gqa_rope: 0.0, t_gqa_attn: 0.0, t_gqa_o_proj: 0.0,
+        t_moe_route: 0.0, t_moe_experts: 0.0, t_moe_shared: 0.0,
+        t_dense_mlp: 0.0, t_lm_head: 0.0, t_total: 0.0,
+    }));
+
+    // ── 4. Add layers ──
+    for layer_idx in 0..num_layers {
+        let input_norm_id = norm_ids[layer_idx * 2];
+        let post_attn_norm_id = norm_ids[layer_idx * 2 + 1];
+        let is_gqa = full_attn_interval > 0 && (layer_idx + 1) % full_attn_interval == 0;
+
+        if is_gqa {
+            // GQA layer
+            let q_out = if gqa_gated { gqa_num_heads * gqa_head_dim * 2 } else { gqa_num_heads * gqa_head_dim };
+            let kv_out = gqa_num_kv_heads * gqa_head_dim;
+            let q_proj_wid = mmap_weight(q_out, hidden_size);
+            let k_proj_wid = mmap_weight(kv_out, hidden_size);
+            let v_proj_wid = mmap_weight(kv_out, hidden_size);
+            let o_proj_wid = mmap_weight(hidden_size, gqa_num_heads * gqa_head_dim);
+            let sm_scale = 1.0 / (gqa_head_dim as f32).sqrt();
+
+            // Random norm weights around 1.0
+            let mut qn = vec![0.0f32; gqa_num_heads * gqa_head_dim];
+            for v in qn.iter_mut() { *v = 1.0 + rng.next_f32(0.02); }
+            let mut kn = vec![0.0f32; gqa_num_kv_heads * gqa_head_dim];
+            for v in kn.iter_mut() { *v = 1.0 + rng.next_f32(0.02); }
+
+            let g = store.decode_graph.as_mut().unwrap();
+            g.layers.push(DecodeLayer {
+                input_norm_id,
+                post_attn_norm_id,
+                attn: DecodeAttnConfig::GQA {
+                    q_proj_wid,
+                    k_proj_wid,
+                    v_proj_wid,
+                    o_proj_wid,
+                    q_norm: Some(qn),
+                    k_norm: Some(kn),
+                    gated: gqa_gated,
+                    num_heads: gqa_num_heads,
+                    num_kv_heads: gqa_num_kv_heads,
+                    head_dim: gqa_head_dim,
+                    sm_scale,
+                },
+                mlp: DecodeMlpConfig::None, // set below
+            });
+            n_gqa += 1;
+        } else {
+            // Linear attention layer
+            let in_proj_qkvz_wid = mmap_weight(qkvz_dim, hidden_size);
+            let in_proj_ba_wid = mmap_weight(ba_dim, hidden_size);
+            let out_proj_wid = mmap_weight(hidden_size, nv * dv);
+
+            // Random conv/attention parameters
+            let mut cw = vec![0.0f32; conv_dim * kernel_dim];
+            fill_random_f32(&mut cw, &mut rng, 0.05);
+            let mut al = vec![0.0f32; nv];
+            for v in al.iter_mut() { *v = -8.0 + rng.next_f32(0.5); }
+            let mut db = vec![0.0f32; nv];
+            for v in db.iter_mut() { *v = 0.1 + rng.next_f32(0.02); }
+            let mut nw = vec![0.0f32; nv * dv];
+            for v in nw.iter_mut() { *v = 1.0 + rng.next_f32(0.02); }
+
+            let g = store.decode_graph.as_mut().unwrap();
+            g.layers.push(DecodeLayer {
+                input_norm_id,
+                post_attn_norm_id,
+                attn: DecodeAttnConfig::LinearAttention {
+                    in_proj_qkvz_wid,
+                    in_proj_ba_wid,
+                    out_proj_wid,
+                    conv_weight: cw,
+                    a_log: al,
+                    dt_bias: db,
+                    norm_weight: nw,
+                    nk, nv, dk, dv, hr, kernel_dim, conv_dim, scale,
+                },
+                mlp: DecodeMlpConfig::None, // set below
+            });
+            n_la += 1;
+        }
+
+        // MoE on every layer (decoder_sparse_step=1 for QCN)
+        let route_id = store.route_weights.len();
+        // Route weight covers alloc_experts (not num_experts) so selected IDs stay in bounds
+        let mut route_data = vec![0.0f32; alloc_experts * hidden_size];
+        fill_random_f32(&mut route_data, &mut rng, 0.02);
+        store.route_weights.push(RouteWeight {
+            data: route_data,
+            bias: None,
+            e_score_corr: None,
+            num_experts: alloc_experts,
+            hidden_dim: hidden_size,
+        });
+
+        let sgu_wid = mmap_weight(2 * shared_intermediate, hidden_size);
+        let sd_wid = mmap_weight(hidden_size, shared_intermediate);
+        let sg_wid = mmap_weight(1, hidden_size);
+
+        let g = store.decode_graph.as_mut().unwrap();
+        g.layers[layer_idx].mlp = DecodeMlpConfig::MoE {
+            route_id,
+            moe_layer_idx: layer_idx,
+            shared_gate_up_wid: Some(sgu_wid),
+            shared_down_wid: Some(sd_wid),
+            shared_gate_wid: Some(sg_wid),
+        };
+    }
+
+    // Release mmap_weight closure so p_off/s_off are available for expert allocation
+    drop(mmap_weight);
+
+    eprintln!("Layers: {} LA + {} GQA = {} total", n_la, n_gqa, num_layers);
+
+    // ── 5. Create fake MoE weight store ──
+    eprintln!("Allocating {} expert weights ({} experts x {} layers)...",
+        alloc_experts * num_layers, alloc_experts, num_layers);
+    let alloc_start = Instant::now();
+
+    let mut moe_store = WeightStore::new();
+    moe_store.config = ModelConfig {
+        hidden_size,
+        moe_intermediate_size: moe_intermediate,
+        n_routed_experts: alloc_experts,
+        num_experts_per_tok: topk,
+        num_hidden_layers: num_layers,
+        first_k_dense_replace: 0,
+        n_shared_experts: 1,
+        routed_scaling_factor: 1.0,
+        swiglu_limit: 0.0,
+        activation_alpha: 0.0,
+    };
+    moe_store.group_size = group_size;
+    moe_store.cpu_num_bits = num_bits;
+
+    // Build expert Vecs directly from mmap regions (zero-copy, contiguous layout)
+    // SAFETY: All expert Vecs MUST be defused before munmap.
+    for _layer in 0..num_layers {
+        let mut layer_experts = Vec::with_capacity(alloc_experts);
+        for _e in 0..alloc_experts {
+            let w13_packed = unsafe { Vec::from_raw_parts((packed_base as *mut u32).add(p_off), w13_packed_per, w13_packed_per) };
+            p_off += w13_packed_per;
+            let w13_scales = unsafe { Vec::from_raw_parts((scales_base as *mut u16).add(s_off), w13_scales_per, w13_scales_per) };
+            s_off += w13_scales_per;
+            let w2_packed = unsafe { Vec::from_raw_parts((packed_base as *mut u32).add(p_off), w2_packed_per, w2_packed_per) };
+            p_off += w2_packed_per;
+            let w2_scales = unsafe { Vec::from_raw_parts((scales_base as *mut u16).add(s_off), w2_scales_per, w2_scales_per) };
+            s_off += w2_scales_per;
+            layer_experts.push(UnifiedExpertWeights {
+                w13_packed, w13_scales, w2_packed, w2_scales,
+                hidden_size,
+                intermediate_size: moe_intermediate,
+                group_size,
+                num_bits,
+                w2_bits: num_bits,
+                gate_bias: None,
+                up_bias: None,
+                down_bias: None,
+            });
+        }
+        moe_store.experts_cpu.push(layer_experts);
+    }
+    assert_eq!(p_off, total_packed_u32, "mmap packed offset mismatch");
+    assert_eq!(s_off, total_scales_u16, "mmap scales offset mismatch");
+
+    let expert_bytes: usize = moe_store.experts_cpu.iter()
+        .flat_map(|layer| layer.iter())
+        .map(|e| e.w13_packed.len() * 4 + e.w13_scales.len() * 2 + e.w2_packed.len() * 4 + e.w2_scales.len() * 2)
+        .sum();
+    eprintln!("Expert weights allocated: {:.1} GB in {:.1}s",
+        expert_bytes as f64 / 1e9, alloc_start.elapsed().as_secs_f64());
+
+    // Set MoE store on graph directly (bypass PyO3 interface)
+    {
+        let g = store.decode_graph.as_mut().unwrap();
+        g.moe_scratch = Some(ExpertScratch::new(hidden_size, moe_intermediate, group_size));
+        g.moe_scratch_pool = (0..topk).map(|_| ExpertScratch::new(hidden_size, moe_intermediate, group_size)).collect();
+        g.moe_store = Some(Arc::new(moe_store));
+    }
+
+    // ── 6. Finalize decode graph (allocate scratch buffers) ──
+    store.finalize_decode()?;
+
+    // ── 7. Allocate and pre-fill state buffers with random data ──
+    // Embedding table — random values like real learned embeddings
+    let mut embedding = vec![0.0f32; vocab_size * hidden_size];
+    fill_random_f32(&mut embedding, &mut rng, 0.1);
+    let embedding_ptr = embedding.as_ptr() as usize;
+
+    // Conv state: [conv_dim * kernel_dim] per LA layer
+    let mut conv_states: Vec<Vec<f32>> = Vec::new();
+    // Recurrent state: [nv * dk * dv] per LA layer
+    let mut recur_states: Vec<Vec<f32>> = Vec::new();
+    // KV cache: for GQA layers
+    let kv_max_seq = 256usize; // small for bench
+    let kv_stride = gqa_num_kv_heads * gqa_head_dim;
+    let mut kv_k_caches: Vec<Vec<f32>> = Vec::new();
+    let mut kv_v_caches: Vec<Vec<f32>> = Vec::new();
+    // RoPE tables — realistic cos/sin values
+    let rope_half_dim = gqa_head_dim / 2;
+    let mut rope_cos = vec![0.0f32; kv_max_seq * rope_half_dim];
+    let mut rope_sin = vec![0.0f32; kv_max_seq * rope_half_dim];
+    for pos in 0..kv_max_seq {
+        for d in 0..rope_half_dim {
+            let freq = 1.0 / (10000.0f32.powf(2.0 * d as f32 / gqa_head_dim as f32));
+            let angle = pos as f32 * freq;
+            rope_cos[pos * rope_half_dim + d] = angle.cos();
+            rope_sin[pos * rope_half_dim + d] = angle.sin();
+        }
+    }
+
+    for layer_idx in 0..num_layers {
+        let is_gqa = full_attn_interval > 0 && (layer_idx + 1) % full_attn_interval == 0;
+        if is_gqa {
+            conv_states.push(Vec::new());
+            recur_states.push(Vec::new());
+            let mut kk = vec![0.0f32; kv_max_seq * kv_stride];
+            fill_random_f32(&mut kk, &mut rng, 0.1);
+            let mut kv = vec![0.0f32; kv_max_seq * kv_stride];
+            fill_random_f32(&mut kv, &mut rng, 0.1);
+            kv_k_caches.push(kk);
+            kv_v_caches.push(kv);
+        } else {
+            let mut cs = vec![0.0f32; conv_dim * kernel_dim];
+            fill_random_f32(&mut cs, &mut rng, 0.1);
+            let mut rs = vec![0.0f32; nv * dk * dv];
+            fill_random_f32(&mut rs, &mut rng, 0.01);
+            conv_states.push(cs);
+            recur_states.push(rs);
+            kv_k_caches.push(Vec::new());
+            kv_v_caches.push(Vec::new());
+        }
+    }
+
+    // Pre-fill hidden state with realistic values (as if after embedding lookup)
+    {
+        let g = store.decode_graph.as_mut().unwrap();
+        fill_random_f32(&mut g.hidden, &mut rng, 0.5);
+        fill_random_f32(&mut g.residual, &mut rng, 0.5);
+    }
+
+    // Set pointers on graph
+    {
+        let g = store.decode_graph.as_mut().unwrap();
+        g.embedding_ptr = embedding_ptr;
+        g.rope_cos_ptr = rope_cos.as_ptr() as usize;
+        g.rope_sin_ptr = rope_sin.as_ptr() as usize;
+        g.rope_half_dim = rope_half_dim;
+        g.max_rope_seq = kv_max_seq;
+        g.seq_len = 10; // simulate position 10
+        g.kv_max_seq = kv_max_seq;
+
+        for layer_idx in 0..num_layers {
+            let is_gqa = full_attn_interval > 0 && (layer_idx + 1) % full_attn_interval == 0;
+            if is_gqa {
+                g.kv_k_ptrs[layer_idx] = kv_k_caches[layer_idx].as_ptr() as usize;
+                g.kv_v_ptrs[layer_idx] = kv_v_caches[layer_idx].as_ptr() as usize;
+            } else {
+                g.conv_state_ptrs[layer_idx] = conv_states[layer_idx].as_ptr() as usize;
+                g.recur_state_ptrs[layer_idx] = recur_states[layer_idx].as_ptr() as usize;
+            }
+        }
+
+        // Resize GQA scores buffer
+        let max_heads = gqa_num_heads;
+        g.gqa_scores = vec![0.0f32; max_heads * kv_max_seq];
+    }
+
+    // Output buffer for logits
+    let mut logits = vec![0.0f32; vocab_size];
+    let output_ptr = logits.as_mut_ptr() as usize;
+
+    // Non-MoE weight bytes
+    let non_moe_bytes: usize = store.weights.iter()
+        .map(|w| w.packed.len() * 4 + w.scales.len() * 2)
+        .sum();
+    eprintln!("Non-MoE weights: {:.1} MB", non_moe_bytes as f64 / 1e6);
+    eprintln!("Total weight memory: {:.1} GB", (expert_bytes + non_moe_bytes) as f64 / 1e9);
+    eprintln!("Data pre-generation: {:.1}s", gen_start.elapsed().as_secs_f64());
+
+    // ── 8. Run benchmark ──
+    eprintln!("\nRunning {} warmup + {} timed steps...", warmup, num_steps);
+
+    // Warmup
+    for i in 0..warmup {
+        let position = 10 + i;
+        if position >= kv_max_seq { break; }
+        store.decode_step(0, position, output_ptr)?;
+    }
+
+    // Reset timing accumulators
+    if timing {
+        let g = store.decode_graph.as_mut().unwrap();
+        g.timing_step_count = 0;
+        g.t_norm = 0.0; g.t_la_proj = 0.0; g.t_la_conv = 0.0; g.t_la_recur = 0.0;
+        g.t_la_gate_norm = 0.0; g.t_la_out_proj = 0.0;
+        g.t_gqa_proj = 0.0; g.t_gqa_rope = 0.0; g.t_gqa_attn = 0.0; g.t_gqa_o_proj = 0.0;
+        g.t_moe_route = 0.0; g.t_moe_experts = 0.0; g.t_moe_shared = 0.0;
+        g.t_dense_mlp = 0.0; g.t_lm_head = 0.0; g.t_total = 0.0;
+    }
+
+    // Timed run
+    let t_start = Instant::now();
+    for i in 0..num_steps {
+        let position = (10 + warmup + i) % (kv_max_seq - 1);
+        store.decode_step(0, position, output_ptr)?;
+    }
+    let elapsed = t_start.elapsed().as_secs_f64();
+
+    // ── 9. Report ──
+    let ms_per_tok = elapsed / num_steps as f64 * 1000.0;
+    let tok_per_sec = num_steps as f64 / elapsed;
+
+    eprintln!("\n=== RESULTS ({} steps) ===", num_steps);
+    eprintln!("Total: {:.2}s", elapsed);
+    eprintln!("Per token: {:.1} ms", ms_per_tok);
+    eprintln!("Speed: {:.2} tok/s", tok_per_sec);
+
+    if timing {
+        let g = store.decode_graph.as_ref().unwrap();
+        let n = g.timing_step_count as f64;
+        if n > 0.0 {
+            let total = g.t_total / n * 1000.0;
+            eprintln!("\nPer-component average (ms):");
+            eprintln!("  norm:         {:6.1}", g.t_norm / n * 1000.0);
+            eprintln!("  la_proj:      {:6.1}", g.t_la_proj / n * 1000.0);
+            eprintln!("  la_conv:      {:6.1}", g.t_la_conv / n * 1000.0);
+            eprintln!("  la_recur:     {:6.1}", g.t_la_recur / n * 1000.0);
+            eprintln!("  la_gate_norm: {:6.1}", g.t_la_gate_norm / n * 1000.0);
+            eprintln!("  la_out_proj:  {:6.1}", g.t_la_out_proj / n * 1000.0);
+            eprintln!("  gqa_proj:     {:6.1}", g.t_gqa_proj / n * 1000.0);
+            eprintln!("  gqa_rope:     {:6.1}", g.t_gqa_rope / n * 1000.0);
+            eprintln!("  gqa_attn:     {:6.1}", g.t_gqa_attn / n * 1000.0);
+            eprintln!("  gqa_o_proj:   {:6.1}", g.t_gqa_o_proj / n * 1000.0);
+            eprintln!("  moe_route:    {:6.1}", g.t_moe_route / n * 1000.0);
+            eprintln!("  moe_experts:  {:6.1}", g.t_moe_experts / n * 1000.0);
+            eprintln!("  moe_shared:   {:6.1}", g.t_moe_shared / n * 1000.0);
+            eprintln!("  dense_mlp:    {:6.1}", g.t_dense_mlp / n * 1000.0);
+            eprintln!("  lm_head:      {:6.1}", g.t_lm_head / n * 1000.0);
+            let accounted = g.t_norm + g.t_la_proj + g.t_la_conv + g.t_la_recur
+                + g.t_la_gate_norm + g.t_la_out_proj + g.t_gqa_proj + g.t_gqa_rope
+                + g.t_gqa_attn + g.t_gqa_o_proj + g.t_moe_route + g.t_moe_experts
+                + g.t_moe_shared + g.t_dense_mlp + g.t_lm_head;
+            let overhead = g.t_total - accounted;
+            eprintln!("  overhead:     {:6.1}", overhead / n * 1000.0);
+            eprintln!("  TOTAL:        {:6.1}", total);
+        }
+    }
+
+    // ── 10. Defuse mmap-backed Vecs before munmap ──
+    // All TransposedWeight and UnifiedExpertWeights Vecs point into the mmap regions.
+    // We must prevent their Drop from calling dealloc on mmap'd memory.
+
+    // Defuse non-expert weight Vecs
+    for w in store.weights.iter_mut() {
+        std::mem::forget(std::mem::take(&mut w.packed));
+        std::mem::forget(std::mem::take(&mut w.scales));
+    }
+
+    // Defuse expert weight Vecs (inside Arc<WeightStore>)
+    if let Some(ref mut g) = store.decode_graph {
+        if let Some(arc) = g.moe_store.take() {
+            match Arc::try_unwrap(arc) {
+                Ok(mut ws) => {
+                    for layer in ws.experts_cpu.iter_mut() {
+                        for expert in layer.iter_mut() {
+                            std::mem::forget(std::mem::take(&mut expert.w13_packed));
+                            std::mem::forget(std::mem::take(&mut expert.w13_scales));
+                            std::mem::forget(std::mem::take(&mut expert.w2_packed));
+                            std::mem::forget(std::mem::take(&mut expert.w2_scales));
+                        }
+                    }
+                }
+                Err(_arc) => {
+                    eprintln!("WARNING: Arc has multiple owners, leaking mmap to avoid UB");
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // Keep non-mmap buffers alive until after defuse
+    drop(logits);
+    drop(embedding);
+    drop(conv_states);
+    drop(recur_states);
+    drop(kv_k_caches);
+    drop(kv_v_caches);
+    drop(rope_cos);
+    drop(rope_sin);
+
+    // Now safe to unmap — all Vecs pointing into these regions have been defused
+    unsafe {
+        libc::munmap(packed_base, packed_mmap_bytes);
+        libc::munmap(scales_base, scales_mmap_bytes);
+    }
+
+    Ok(())
+}
