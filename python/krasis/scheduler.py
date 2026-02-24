@@ -95,6 +95,7 @@ class Scheduler:
         prompt_tokens = request.prompt_tokens
         device = torch.device(model.ranks[0].device)
 
+        from krasis.cpu_decode import sample_cpu
         from krasis.kv_cache import SequenceKVState
         from krasis.sampler import sample
 
@@ -114,7 +115,7 @@ class Scheduler:
                         layer.attention.reset_state()
 
             with torch.inference_mode():
-                # ── Prefill ──
+                # ── Prefill (GPU) ──
                 prompt_tensor = torch.tensor(prompt_tokens, dtype=torch.long, device=device)
                 positions = torch.arange(len(prompt_tokens), dtype=torch.int32, device=device)
 
@@ -145,38 +146,39 @@ class Scheduler:
                     loop.call_soon_threadsafe(queue.put_nowait, None)
                     return
 
-                # ── Decode loop ──
-                decode_start = time.perf_counter()
+            # ── Decode (CPU) — weights already initialized at load time ──
+            cpu_decoder = model._cpu_decoder
+            cpu_decoder.prepare(seq_states, request.max_new_tokens)
 
-                for step in range(request.max_new_tokens - 1):
-                    pos = len(prompt_tokens) + step
-                    token_tensor = torch.tensor([next_token], dtype=torch.long, device=device)
-                    pos_tensor = torch.tensor([pos], dtype=torch.int32, device=device)
+            decode_start = time.perf_counter()
 
-                    logits = model.forward(token_tensor, pos_tensor, seq_states)
-                    next_token = sample(
-                        logits, request.temperature, request.top_k, request.top_p
-                    ).item()
-                    generated_count += 1
+            for step in range(request.max_new_tokens - 1):
+                pos = len(prompt_tokens) + step
 
-                    text = tokenizer.decode_incremental(next_token)
-                    finish = "stop" if next_token in stop_ids else None
-                    if generated_count >= request.max_new_tokens and finish is None:
-                        finish = "length"
+                logits = cpu_decoder.step(next_token, pos)
+                next_token = sample_cpu(
+                    logits, request.temperature, request.top_k, request.top_p
+                )
+                generated_count += 1
 
-                    output = GenerationOutput(next_token, text, finish)
-                    loop.call_soon_threadsafe(queue.put_nowait, output)
+                text = tokenizer.decode_incremental(next_token)
+                finish = "stop" if next_token in stop_ids else None
+                if generated_count >= request.max_new_tokens and finish is None:
+                    finish = "length"
 
-                    if finish:
-                        break
+                output = GenerationOutput(next_token, text, finish)
+                loop.call_soon_threadsafe(queue.put_nowait, output)
 
-                decode_time = time.perf_counter() - decode_start
-                if generated_count > 1:
-                    decode_tps = (generated_count - 1) / decode_time if decode_time > 0 else 0
-                    logger.info(
-                        "Decode: %d tokens in %.2fs (%.1f tok/s)",
-                        generated_count - 1, decode_time, decode_tps,
-                    )
+                if finish:
+                    break
+
+            decode_time = time.perf_counter() - decode_start
+            if generated_count > 1:
+                decode_tps = (generated_count - 1) / decode_time if decode_time > 0 else 0
+                logger.info(
+                    "Decode: %d tokens in %.2fs (%.1f tok/s)",
+                    generated_count - 1, decode_time, decode_tps,
+                )
 
         finally:
             for s in seq_states:

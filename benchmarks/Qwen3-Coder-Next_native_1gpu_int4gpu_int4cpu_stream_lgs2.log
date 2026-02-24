@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-02-23 13:01:57
+Krasis Benchmark — 2026-02-23 23:05:36
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -7,15 +7,15 @@ PP Partition:     [48] (1 GPUs)
 
 Hardware:
   CPU:            AMD EPYC 7742 64-Core Processor (64 cores)
-  RAM:            995 GB total, 79.8 GB used by process
-  GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 3674 MB allocated
-  GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), 0 MB allocated
-  GPU 2:          NVIDIA RTX 2000 Ada Generation (16380 MB), 0 MB allocated
+  RAM:            995 GB total, 82.9 GB used by process
+  GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 3790 MB allocated
+  GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), N/A
+  GPU 2:          NVIDIA RTX 2000 Ada Generation (16380 MB), N/A
 
 Quantization:
   GPU experts:    INT4 (Marlin)
   CPU experts:    INT4
-  Attention:      INT8
+  Attention:      BF16
   Shared expert:  INT8
   Dense MLP:      INT8
   LM head:        INT8
@@ -27,16 +27,16 @@ Strategy:
   Mode:           pure_cpu decode, layer_grouped(2) + stream_attn prefill
 
 Prefill (3 runs at different lengths):
-  Run 1:  943.6 tok/s, TTFT=21.20s (20,000 tokens)
-  Run 2:  844.8 tok/s, TTFT=41.43s (35,000 tokens)
-  Run 3:  751.0 tok/s, TTFT=66.58s (50,000 tokens)
-  Best:    943.6 tok/s, TTFT=21.20s (20,000 tokens)
+  Run 1:  1059.0 tok/s, TTFT=18.89s (20,000 tokens)
+  Run 2:  950.0 tok/s, TTFT=36.84s (35,000 tokens)
+  Run 3:  839.5 tok/s, TTFT=59.56s (50,000 tokens)
+  Best:    1059.0 tok/s, TTFT=18.89s (20,000 tokens)
 
 Decode (64 tokens, 3 runs, different prompts):
-  Run 1:  7.32 tok/s (136.5ms/tok)
-  Run 2:  6.97 tok/s (143.5ms/tok)
-  Run 3:  6.99 tok/s (143.1ms/tok)
-  Average: 7.09 tok/s (141.0ms/tok)
+  Run 1:  4.13 tok/s (242.3ms/tok)
+  Run 2:  3.97 tok/s (252.1ms/tok)
+  Run 3:  4.11 tok/s (243.1ms/tok)
+  Average: 4.07 tok/s (245.8ms/tok)
 
 Verification:
   Prefill prompt: user
@@ -62,7 +62,7 @@ Explain how public key cryptography works, including the RSA algorithm and why i
 assistant
 
   Generated output (64 tokens):
-    Public key cryptography (also called **asymmetric cryptography**) is a cryptographic system that uses **pairs of keys**: a **public key** (shared openly) and a **private key** (kept secret). Unlike symmetric cryptography (where the same key encrypts and decrypts), in public key systems:
+    Public key cryptography (also called asymmetric cryptography) is a cryptographic system that uses **pairs of keys**—a **public key** and a **private key**—that are mathematically related but not interchangeable. Unlike symmetric cryptography (where the same secret key is used for encryption and decryption), in public key cryptography:
     
-    - **Encryption with
+    
 ================================================================

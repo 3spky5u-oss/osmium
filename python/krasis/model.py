@@ -593,6 +593,13 @@ class KrasisModel:
         # Load tokenizer
         self.tokenizer = Tokenizer(self.cfg.model_path)
 
+        # Phase 5: Initialize CPU decode weights (one-time, immutable)
+        print(f"\n\033[1m\033[36m▸ Initializing CPU decode weights\033[0m", flush=True)
+        from krasis.cpu_decode import CpuDecoder
+        cpu_decoder = CpuDecoder(self)
+        cpu_decoder.init_weights()
+        self._cpu_decoder = cpu_decoder
+
         self._loaded = True
         total = time.perf_counter() - start
         logger.info("Model fully loaded in %.1fs", total)
@@ -3387,10 +3394,12 @@ class KrasisModel:
             if next_token in stop_token_ids:
                 return generated
 
-            # ── Decode ──
-            # Pre-allocate reusable tensors to avoid per-step CUDA allocations
-            _decode_token_buf = torch.empty(1, dtype=torch.long, device=device)
-            _decode_pos_buf = torch.empty(1, dtype=torch.int32, device=device)
+            # ── Decode (CPU) — weights already initialized at load time ──
+            from krasis.cpu_decode import sample_cpu
+
+            cpu_decoder = self._cpu_decoder
+            cpu_decoder.prepare(seq_states_per_rank, max_new_tokens)
+
             _t_decode_start = time.perf_counter()
 
             for step in range(max_new_tokens - 1):
@@ -3399,31 +3408,23 @@ class KrasisModel:
                     print(f"[DBG] decode step={step} token={next_token}", file=sys.stderr, flush=True)
 
                 if TIMING.decode:
-                    torch.cuda.synchronize()
                     _t_step_start = time.perf_counter()
 
                 pos = len(prompt_tokens) + step
-                _decode_token_buf[0] = next_token
-                _decode_pos_buf[0] = pos
+
+                logits = cpu_decoder.step(next_token, pos)
 
                 if TIMING.decode:
-                    _t_prep = time.perf_counter()
-
-                logits = self.forward(_decode_token_buf, _decode_pos_buf, seq_states_per_rank)
-
-                if TIMING.decode:
-                    torch.cuda.synchronize()
                     _t_forward = time.perf_counter()
 
-                next_token = sample(logits, temperature, top_k, top_p).item()
+                next_token = sample_cpu(logits, temperature, top_k, top_p)
 
                 if TIMING.decode:
                     _t_sample = time.perf_counter()
                     logger.info(
-                        "DECODE-STEP %d: prep=%.1fms forward=%.1fms sample=%.1fms total=%.1fms",
+                        "CPU-DECODE-STEP %d: forward=%.1fms sample=%.1fms total=%.1fms",
                         step,
-                        (_t_prep - _t_step_start) * 1000,
-                        (_t_forward - _t_prep) * 1000,
+                        (_t_forward - _t_step_start) * 1000,
                         (_t_sample - _t_forward) * 1000,
                         (_t_sample - _t_step_start) * 1000,
                     )
