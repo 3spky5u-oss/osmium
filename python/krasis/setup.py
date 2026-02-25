@@ -163,11 +163,21 @@ def _get_required_cuda_version():
         return (12, 6)  # safe default
 
 
+def _need_python_dev():
+    """Check if Python development headers are installed (needed for FlashInfer JIT)."""
+    import sysconfig
+    inc = sysconfig.get_path("include")
+    if inc and os.path.isfile(os.path.join(inc, "Python.h")):
+        return False
+    return True
+
+
 def _install_system_deps():
-    """Install system packages: CUDA toolkit (nvcc) and ninja build tool."""
-    print(f"\n{BOLD}Step 1: System Packages (nvcc, ninja){NC}")
+    """Install system packages: CUDA toolkit (nvcc), ninja, and python-dev headers."""
+    print(f"\n{BOLD}Step 1: System Packages (nvcc, ninja, python-dev){NC}")
 
     need_ninja = not shutil.which("ninja") and not shutil.which("ninja-build")
+    need_pydev = _need_python_dev()
 
     # Check nvcc: either missing or too old for this GPU
     nvcc_ver = _get_nvcc_version()
@@ -178,8 +188,8 @@ def _install_system_deps():
         nvcc_too_old = True
         need_nvcc = True
 
-    if not need_nvcc and not need_ninja:
-        print(f"  {GREEN}nvcc {nvcc_ver[0]}.{nvcc_ver[1]} and ninja already installed.{NC}")
+    if not need_nvcc and not need_ninja and not need_pydev:
+        print(f"  {GREEN}nvcc {nvcc_ver[0]}.{nvcc_ver[1]}, ninja, and python-dev already installed.{NC}")
         return True
 
     missing = []
@@ -190,6 +200,8 @@ def _install_system_deps():
             missing.append("nvcc")
     if need_ninja:
         missing.append("ninja")
+    if need_pydev:
+        missing.append("python-dev headers (Python.h)")
     print(f"  {YELLOW}{'Need upgrade' if nvcc_too_old else 'Missing'}: {', '.join(missing)}{NC}")
     print(f"  Installing (will ask for your password)...\n")
 
@@ -197,17 +209,27 @@ def _install_system_deps():
     is_wsl = _is_wsl()
     sudo = [] if os.geteuid() == 0 else ["sudo"]
 
-    # Install ninja first (simple apt/dnf package)
+    # Install ninja and python-dev headers (simple apt/dnf packages)
+    apt_pkgs = []
+    dnf_pkgs = []
     if need_ninja:
+        apt_pkgs.append("ninja-build")
+        dnf_pkgs.append("ninja-build")
+    if need_pydev:
+        py_ver_dot = f"{sys.version_info.major}.{sys.version_info.minor}"
+        apt_pkgs.append(f"python{py_ver_dot}-dev")
+        dnf_pkgs.append(f"python{sys.version_info.major}-devel")
+
+    if apt_pkgs or dnf_pkgs:
         if distro == "debian":
             _run(sudo + ["apt-get", "update", "-qq"], check=False)
-            ret = _run(sudo + ["apt-get", "install", "-y", "ninja-build"], check=False)
+            ret = _run(sudo + ["apt-get", "install", "-y"] + apt_pkgs, check=False)
         elif distro == "rhel":
-            ret = _run(sudo + ["dnf", "install", "-y", "ninja-build"], check=False)
+            ret = _run(sudo + ["dnf", "install", "-y"] + dnf_pkgs, check=False)
         else:
             ret = type("R", (), {"returncode": 1})()
         if ret.returncode != 0:
-            print(f"  {RED}Failed to install ninja.{NC}")
+            print(f"  {RED}Failed to install {', '.join(apt_pkgs or dnf_pkgs)}.{NC}")
 
     # Install CUDA toolkit from NVIDIA repo (not the ancient distro package)
     if need_nvcc and distro == "debian":
@@ -351,6 +373,9 @@ def _install_system_deps():
     if need_ninja and not shutil.which("ninja") and not shutil.which("ninja-build"):
         print(f"  {YELLOW}ninja still not found on PATH.{NC}")
         ok = False
+    if need_pydev and _need_python_dev():
+        print(f"  {YELLOW}Python.h still not found. Install python3-dev manually.{NC}")
+        ok = False
     if ok:
         print(f"  {GREEN}System packages installed successfully.{NC}")
     return ok
@@ -439,10 +464,12 @@ def main():
         print(f"{YELLOW}Krasis GPU support requires Linux (or WSL).{NC}")
         return
 
-    # Check for NVIDIA GPU
+    # Check for NVIDIA GPU — Krasis requires GPU for prefill
     if not _has_nvidia_gpu():
-        print(f"{YELLOW}No NVIDIA GPU detected. Krasis will run in CPU-only mode.{NC}")
-        return
+        print(f"{RED}No NVIDIA GPU detected. Krasis requires at least one NVIDIA GPU.{NC}")
+        print(f"  If you have an NVIDIA GPU, install the driver first:")
+        print(f"    sudo apt install nvidia-driver-560  # or newer")
+        sys.exit(1)
 
     print(f"NVIDIA GPU detected.")
 

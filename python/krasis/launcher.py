@@ -1550,7 +1550,8 @@ def _check_gpu_deps():
     import shutil
 
     if not shutil.which("nvidia-smi"):
-        return  # no NVIDIA GPU — nothing to check
+        print(f"{RED}No NVIDIA GPU detected. Krasis requires at least one NVIDIA GPU for prefill.{NC}")
+        sys.exit(1)
 
     # Find nvcc: try multiple common locations so it works even if
     # the user's PATH doesn't include the CUDA toolkit yet.
@@ -1627,10 +1628,33 @@ def _check_gpu_deps():
         except ImportError:
             problems.append(pkg)
 
+    # Check Triton has GPU support (not CPU fallback)
+    try:
+        import triton
+        if not hasattr(triton, 'runtime') or not hasattr(triton.runtime, 'driver'):
+            problems.append("triton (no GPU backend)")
+        else:
+            # Try to get a CUDA driver — this fails if Triton fell back to CPU
+            try:
+                driver = triton.runtime.driver.active
+                if driver is None or 'cpu' in str(type(driver)).lower():
+                    problems.append("triton (GPU backend unavailable — check CUDA)")
+            except Exception:
+                pass  # older triton versions may not have this
+    except ImportError:
+        problems.append("triton")
+
+    # Check Python.h headers (needed for FlashInfer JIT compilation)
+    import sysconfig
+    inc = sysconfig.get_path("include")
+    if not inc or not os.path.isfile(os.path.join(inc, "Python.h")):
+        problems.append(f"python{sys.version_info.major}.{sys.version_info.minor}-dev (Python.h headers)")
+
     if problems:
-        print(f"{YELLOW}Missing: {', '.join(problems)}{NC}")
+        print(f"{RED}Missing GPU dependencies: {', '.join(problems)}{NC}")
         print(f"Run: {BOLD}krasis-setup{NC}")
         print()
+        sys.exit(1)
 
 
 def main():
