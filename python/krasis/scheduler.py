@@ -152,25 +152,50 @@ class Scheduler:
 
             decode_start = time.perf_counter()
 
-            for step in range(request.max_new_tokens - 1):
-                pos = len(prompt_tokens) + step
+            # Use Rust generate_loop when available (eliminates per-token Python overhead)
+            if cpu_decoder._use_rust_decode:
+                import os
+                tokenizer_path = os.path.join(cfg.model_path, "tokenizer.json")
+                logger.info("Using Rust generate_loop (tokenizer: %s)", tokenizer_path)
 
-                logits = cpu_decoder.step(next_token, pos)
-                next_token = sample_cpu(
-                    logits, request.temperature, request.top_k, request.top_p
+                def _token_callback(token_id, text, finish_reason):
+                    nonlocal generated_count
+                    generated_count += 1
+                    out = GenerationOutput(token_id, text, finish_reason)
+                    loop.call_soon_threadsafe(queue.put_nowait, out)
+
+                cpu_decoder._store.generate_loop(
+                    first_token=next_token,
+                    start_position=len(prompt_tokens),
+                    max_tokens=request.max_new_tokens - 1,
+                    temperature=request.temperature,
+                    top_k=request.top_k,
+                    top_p=request.top_p,
+                    stop_ids=list(stop_ids),
+                    tokenizer_path=tokenizer_path,
+                    callback=_token_callback,
                 )
-                generated_count += 1
+            else:
+                # Python fallback decode loop
+                for step in range(request.max_new_tokens - 1):
+                    pos = len(prompt_tokens) + step
 
-                text = tokenizer.decode_incremental(next_token)
-                finish = "stop" if next_token in stop_ids else None
-                if generated_count >= request.max_new_tokens and finish is None:
-                    finish = "length"
+                    logits = cpu_decoder.step(next_token, pos)
+                    next_token = sample_cpu(
+                        logits, request.temperature, request.top_k, request.top_p
+                    )
+                    generated_count += 1
 
-                output = GenerationOutput(next_token, text, finish)
-                loop.call_soon_threadsafe(queue.put_nowait, output)
+                    text = tokenizer.decode_incremental(next_token)
+                    finish = "stop" if next_token in stop_ids else None
+                    if generated_count >= request.max_new_tokens and finish is None:
+                        finish = "length"
 
-                if finish:
-                    break
+                    output = GenerationOutput(next_token, text, finish)
+                    loop.call_soon_threadsafe(queue.put_nowait, output)
+
+                    if finish:
+                        break
 
             decode_time = time.perf_counter() - decode_start
             if generated_count > 1:

@@ -1607,6 +1607,7 @@ enum DecodeAttnConfig {
         num_kv_heads: usize,
         head_dim: usize,
         sm_scale: f32,
+        fused_qkv_wid: Option<usize>,  // fused Q+K+V weight for single dispatch
     },
 }
 
@@ -1691,6 +1692,7 @@ struct DecodeGraph {
     gqa_q_buf: Vec<f32>,
     gqa_k_buf: Vec<f32>,
     gqa_v_buf: Vec<f32>,
+    gqa_qkv_buf: Vec<f32>,  // fused Q+K+V output buffer
     gqa_scores: Vec<f32>,
     gqa_attn_out: Vec<f32>,
 
@@ -1792,6 +1794,7 @@ impl CpuDecodeStore {
             la_recur_out: Vec::new(), la_gated_out: Vec::new(),
             la_mixed_qkv: Vec::new(), la_conv_out: Vec::new(),
             gqa_q_buf: Vec::new(), gqa_k_buf: Vec::new(), gqa_v_buf: Vec::new(),
+            gqa_qkv_buf: Vec::new(),
             gqa_scores: Vec::new(), gqa_attn_out: Vec::new(),
             mlp_gate_up: Vec::new(), mlp_hidden_buf: Vec::new(),
             moe_store: None, moe_scratch: None, moe_scratch_pool: Vec::new(),
@@ -1900,6 +1903,7 @@ impl CpuDecodeStore {
             attn: DecodeAttnConfig::GQA {
                 q_proj_wid, k_proj_wid, v_proj_wid, o_proj_wid,
                 q_norm, k_norm, gated, num_heads, num_kv_heads, head_dim, sm_scale,
+                fused_qkv_wid: None,
             },
             mlp: DecodeMlpConfig::None,
         });
@@ -1921,9 +1925,7 @@ impl CpuDecodeStore {
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure_decode first"))?;
         g.layers[layer_idx].mlp = DecodeMlpConfig::MoE {
             route_id, moe_layer_idx,
-            shared_gate_up_wid: shared_gate_up_wid,
-            shared_down_wid: shared_down_wid,
-            shared_gate_wid: shared_gate_wid,
+            shared_gate_up_wid, shared_down_wid, shared_gate_wid,
         };
         Ok(())
     }
@@ -2018,15 +2020,19 @@ impl CpuDecodeStore {
                     max_k = max_k.max(self.weights[*out_proj_wid].cols);
                 }
                 DecodeAttnConfig::GQA { num_heads, num_kv_heads, head_dim, gated,
-                    q_proj_wid, k_proj_wid, v_proj_wid, o_proj_wid, .. } => {
+                    q_proj_wid, k_proj_wid, v_proj_wid, o_proj_wid, fused_qkv_wid, .. } => {
                     let q_size = if *gated { num_heads * head_dim * 2 } else { num_heads * head_dim };
                     max_q_proj = max_q_proj.max(q_size);
                     max_kv_proj = max_kv_proj.max(num_kv_heads * head_dim);
                     max_heads = max_heads.max(*num_heads);
                     max_heads_hd = max_heads_hd.max(num_heads * head_dim);
-                    max_k = max_k.max(self.weights[*q_proj_wid].cols);
-                    max_k = max_k.max(self.weights[*k_proj_wid].cols);
-                    max_k = max_k.max(self.weights[*v_proj_wid].cols);
+                    if let Some(fid) = fused_qkv_wid {
+                        max_k = max_k.max(self.weights[*fid].cols);
+                    } else {
+                        max_k = max_k.max(self.weights[*q_proj_wid].cols);
+                        max_k = max_k.max(self.weights[*k_proj_wid].cols);
+                        max_k = max_k.max(self.weights[*v_proj_wid].cols);
+                    }
                     max_k = max_k.max(self.weights[*o_proj_wid].cols);
                 }
             }
@@ -2068,6 +2074,7 @@ impl CpuDecodeStore {
         g.gqa_q_buf = vec![0.0; max_q_proj.max(1)];
         g.gqa_k_buf = vec![0.0; max_kv_proj.max(1)];
         g.gqa_v_buf = vec![0.0; max_kv_proj.max(1)];
+        g.gqa_qkv_buf = vec![0.0; (max_q_proj + 2 * max_kv_proj).max(1)];
         // scores buffer sized for max_heads * max_kv_seq — will be set after set_decode_state
         g.gqa_scores = Vec::new(); // deferred
         g.gqa_attn_out = vec![0.0; max_heads_hd.max(1)];
@@ -2266,29 +2273,49 @@ impl CpuDecodeStore {
                 DecodeAttnConfig::GQA {
                     q_proj_wid, k_proj_wid, v_proj_wid, o_proj_wid,
                     q_norm, k_norm, gated, num_heads, num_kv_heads, head_dim, sm_scale,
+                    fused_qkv_wid,
                 } => {
                     let nh = *num_heads; let nkv = *num_kv_heads;
                     let hd = *head_dim;
 
                     // Q/K/V projections
                     let t0 = if timing { Instant::now() } else { t_step_start };
-                    let k_in = weights[*q_proj_wid].cols;
-                    quantize_activation_int16_f32(
-                        &graph.hidden[..k_in], graph.group_size,
-                        &mut graph.act_int16[..k_in],
-                        &mut graph.act_scales[..k_in / graph.group_size]);
                     let q_rows = weights[*q_proj_wid].rows;
                     let k_rows = weights[*k_proj_wid].rows;
                     let v_rows = weights[*v_proj_wid].rows;
-                    dispatch_matmul_free(&weights[*q_proj_wid],
-                        &graph.act_int16[..k_in], &graph.act_scales[..k_in / graph.group_size],
-                        &mut graph.gqa_q_buf[..q_rows], parallel);
-                    dispatch_matmul_free(&weights[*k_proj_wid],
-                        &graph.act_int16[..k_in], &graph.act_scales[..k_in / graph.group_size],
-                        &mut graph.gqa_k_buf[..k_rows], parallel);
-                    dispatch_matmul_free(&weights[*v_proj_wid],
-                        &graph.act_int16[..k_in], &graph.act_scales[..k_in / graph.group_size],
-                        &mut graph.gqa_v_buf[..v_rows], parallel);
+                    if let Some(fid) = fused_qkv_wid {
+                        // Fused Q+K+V: one dispatch, output split afterward
+                        let fw = &weights[*fid];
+                        let k_in = fw.cols;
+                        let total_rows = fw.rows;
+                        quantize_activation_int16_f32(
+                            &graph.hidden[..k_in], graph.group_size,
+                            &mut graph.act_int16[..k_in],
+                            &mut graph.act_scales[..k_in / graph.group_size]);
+                        dispatch_matmul_free(fw,
+                            &graph.act_int16[..k_in], &graph.act_scales[..k_in / graph.group_size],
+                            &mut graph.gqa_qkv_buf[..total_rows], parallel);
+                        // Split fused output into Q, K, V
+                        graph.gqa_q_buf[..q_rows].copy_from_slice(&graph.gqa_qkv_buf[..q_rows]);
+                        graph.gqa_k_buf[..k_rows].copy_from_slice(&graph.gqa_qkv_buf[q_rows..q_rows+k_rows]);
+                        graph.gqa_v_buf[..v_rows].copy_from_slice(&graph.gqa_qkv_buf[q_rows+k_rows..q_rows+k_rows+v_rows]);
+                    } else {
+                        // Separate Q, K, V dispatches
+                        let k_in = weights[*q_proj_wid].cols;
+                        quantize_activation_int16_f32(
+                            &graph.hidden[..k_in], graph.group_size,
+                            &mut graph.act_int16[..k_in],
+                            &mut graph.act_scales[..k_in / graph.group_size]);
+                        dispatch_matmul_free(&weights[*q_proj_wid],
+                            &graph.act_int16[..k_in], &graph.act_scales[..k_in / graph.group_size],
+                            &mut graph.gqa_q_buf[..q_rows], parallel);
+                        dispatch_matmul_free(&weights[*k_proj_wid],
+                            &graph.act_int16[..k_in], &graph.act_scales[..k_in / graph.group_size],
+                            &mut graph.gqa_k_buf[..k_rows], parallel);
+                        dispatch_matmul_free(&weights[*v_proj_wid],
+                            &graph.act_int16[..k_in], &graph.act_scales[..k_in / graph.group_size],
+                            &mut graph.gqa_v_buf[..v_rows], parallel);
+                    }
                     if timing { graph.t_gqa_proj += t0.elapsed().as_secs_f64(); }
 
                     // Gated attention rearrange + QK norm + RoPE
@@ -2452,9 +2479,12 @@ impl CpuDecodeStore {
                         &mut graph.moe_topk_ids, &mut graph.moe_topk_weights);
                     if timing { graph.t_moe_route += t0.elapsed().as_secs_f64(); }
 
-                    // Routed experts
+                    // Routed + shared experts overlapped via rayon::join.
+                    // Shared expert runs on current thread while routed experts use pool.
                     let t0 = if timing { Instant::now() } else { t_step_start };
-                    if let Some(ref moe_store) = graph.moe_store {
+                    let has_shared = sgu_wid.is_some() && sd_wid.is_some();
+                    let moe_store_arc = graph.moe_store.clone();
+                    if let Some(moe_store) = moe_store_arc {
                         for j in 0..hs {
                             graph.moe_act_bf16[j] = f32_to_bf16(graph.hidden[j]);
                         }
@@ -2468,85 +2498,91 @@ impl CpuDecodeStore {
                                 n_exp += 1;
                             }
                         }
-                        graph.moe_output.fill(0.0);
-                        if n_exp > 0 {
-                            let scratch = graph.moe_scratch.as_mut().unwrap();
-                            let pool = &mut graph.moe_scratch_pool;
-                            let mut no_shared: Option<ExpertScratch> = None;
-                            moe_forward_unified(
-                                moe_store, moe_layer_idx,
-                                &graph.moe_act_bf16[..hs],
-                                &expert_indices[..n_exp],
-                                &expert_weights_arr[..n_exp],
-                                &mut graph.moe_output,
-                                scratch, pool, &mut no_shared,
-                                graph.moe_parallel, None);
-                        }
-                        if rsf != 1.0 {
+                        // SAFETY: rayon::join closures access disjoint graph fields.
+                        // Routed: moe_output(w), moe_scratch(w), moe_scratch_pool(w), moe_act_bf16(r)
+                        // Shared: act_int16(w), act_scales(w), mlp_gate_up(w), mlp_hidden_buf(w), shared_out(w), hidden(r)
+                        let gp = &mut **graph as *mut DecodeGraph as usize;
+                        let moe_par = graph.moe_parallel;
+                        let gs = graph.group_size;
+                        rayon::join(
+                            move || unsafe {
+                                let g = &mut *(gp as *mut DecodeGraph);
+                                g.moe_output.fill(0.0);
+                                if n_exp > 0 {
+                                    let scratch = g.moe_scratch.as_mut().unwrap();
+                                    let pool = &mut g.moe_scratch_pool;
+                                    let mut no_shared: Option<ExpertScratch> = None;
+                                    moe_forward_unified(
+                                        &*moe_store, moe_layer_idx,
+                                        &g.moe_act_bf16[..hs],
+                                        &expert_indices[..n_exp],
+                                        &expert_weights_arr[..n_exp],
+                                        &mut g.moe_output,
+                                        scratch, pool, &mut no_shared,
+                                        moe_par, None);
+                                }
+                                if rsf != 1.0 {
+                                    for j in 0..hs { g.moe_output[j] *= rsf; }
+                                }
+                            },
+                            move || unsafe {
+                                if !has_shared { return; }
+                                let g = &mut *(gp as *mut DecodeGraph);
+                                let gu_wid = sgu_wid.unwrap();
+                                let dn_wid = sd_wid.unwrap();
+                                let gu_w = &weights[gu_wid];
+                                let k_in = gu_w.cols;
+                                let n_gu = gu_w.rows;
+                                let intermediate = n_gu / 2;
+                                quantize_activation_int16_f32(
+                                    &g.hidden[..k_in], gs,
+                                    &mut g.act_int16[..k_in],
+                                    &mut g.act_scales[..k_in / gs]);
+                                dispatch_matmul_free(gu_w,
+                                    &g.act_int16[..k_in],
+                                    &g.act_scales[..k_in / gs],
+                                    &mut g.mlp_gate_up[..n_gu], parallel);
+                                fast_silu_mul_avx2(
+                                    &g.mlp_gate_up[..intermediate],
+                                    &g.mlp_gate_up[intermediate..n_gu],
+                                    &mut g.mlp_hidden_buf[..intermediate],
+                                    intermediate);
+                                let dn_w = &weights[dn_wid];
+                                let k_dn = dn_w.cols;
+                                quantize_activation_int16_f32(
+                                    &g.mlp_hidden_buf[..k_dn], gs,
+                                    &mut g.act_int16[..k_dn],
+                                    &mut g.act_scales[..k_dn / gs]);
+                                dispatch_matmul_free(dn_w,
+                                    &g.act_int16[..k_dn],
+                                    &g.act_scales[..k_dn / gs],
+                                    &mut g.shared_out[..hs], parallel);
+                                if let Some(sg) = sg_wid {
+                                    let sg_w = &weights[sg];
+                                    let sg_k = sg_w.cols;
+                                    quantize_activation_int16_f32(
+                                        &g.hidden[..sg_k], gs,
+                                        &mut g.act_int16[..sg_k],
+                                        &mut g.act_scales[..sg_k / gs]);
+                                    let mut gate_val = [0.0f32; 1];
+                                    dispatch_matmul_free(sg_w,
+                                        &g.act_int16[..sg_k],
+                                        &g.act_scales[..sg_k / gs],
+                                        &mut gate_val, parallel);
+                                    let gate_sigmoid = 1.0 / (1.0 + (-gate_val[0]).exp());
+                                    for j in 0..hs { g.shared_out[j] *= gate_sigmoid; }
+                                }
+                            },
+                        );
+                        if has_shared {
                             for j in 0..hs {
-                                graph.moe_output[j] *= rsf;
+                                graph.hidden[j] = graph.moe_output[j] + graph.shared_out[j];
                             }
+                        } else {
+                            graph.hidden[..hs].copy_from_slice(&graph.moe_output[..hs]);
                         }
                     }
                     if timing { graph.t_moe_experts += t0.elapsed().as_secs_f64(); }
-
-                    // Shared expert
-                    let t0 = if timing { Instant::now() } else { t_step_start };
-                    if let (Some(gu_wid), Some(dn_wid)) = (sgu_wid, sd_wid) {
-                        let gu_w = &weights[gu_wid];
-                        let k_in = gu_w.cols;
-                        let n_gu = gu_w.rows;
-                        let intermediate = n_gu / 2;
-                        quantize_activation_int16_f32(
-                            &graph.hidden[..k_in], graph.group_size,
-                            &mut graph.act_int16[..k_in],
-                            &mut graph.act_scales[..k_in / graph.group_size]);
-                        dispatch_matmul_free(gu_w,
-                            &graph.act_int16[..k_in],
-                            &graph.act_scales[..k_in / graph.group_size],
-                            &mut graph.mlp_gate_up[..n_gu], parallel);
-                        // AVX2 fused SiLU(gate) * up
-                        unsafe {
-                            fast_silu_mul_avx2(
-                                &graph.mlp_gate_up[..intermediate],
-                                &graph.mlp_gate_up[intermediate..n_gu],
-                                &mut graph.mlp_hidden_buf[..intermediate],
-                                intermediate);
-                        }
-                        let dn_w = &weights[dn_wid];
-                        let k_dn = dn_w.cols;
-                        quantize_activation_int16_f32(
-                            &graph.mlp_hidden_buf[..k_dn], graph.group_size,
-                            &mut graph.act_int16[..k_dn],
-                            &mut graph.act_scales[..k_dn / graph.group_size]);
-                        dispatch_matmul_free(dn_w,
-                            &graph.act_int16[..k_dn],
-                            &graph.act_scales[..k_dn / graph.group_size],
-                            &mut graph.shared_out[..hs], parallel);
-                        if let Some(sg) = sg_wid {
-                            let sg_w = &weights[sg];
-                            let sg_k = sg_w.cols;
-                            quantize_activation_int16_f32(
-                                &graph.hidden[..sg_k], graph.group_size,
-                                &mut graph.act_int16[..sg_k],
-                                &mut graph.act_scales[..sg_k / graph.group_size]);
-                            let mut gate_val = [0.0f32; 1];
-                            dispatch_matmul_free(sg_w,
-                                &graph.act_int16[..sg_k],
-                                &graph.act_scales[..sg_k / graph.group_size],
-                                &mut gate_val, parallel);
-                            let gate_sigmoid = 1.0 / (1.0 + (-gate_val[0]).exp());
-                            for j in 0..hs {
-                                graph.shared_out[j] *= gate_sigmoid;
-                            }
-                        }
-                        for j in 0..hs {
-                            graph.hidden[j] = graph.moe_output[j] + graph.shared_out[j];
-                        }
-                    } else {
-                        graph.hidden[..hs].copy_from_slice(&graph.moe_output[..hs]);
-                    }
-                    if timing { graph.t_moe_shared += t0.elapsed().as_secs_f64(); }
                 }
 
                 DecodeMlpConfig::Dense { gate_proj_wid, up_proj_wid, down_proj_wid } => {
@@ -2655,6 +2691,214 @@ impl CpuDecodeStore {
 
         Ok(())
     }
+
+    /// Run the full decode loop in Rust: decode_step -> sample -> tokenize -> callback.
+    ///
+    /// This eliminates all per-token Python overhead. The only Python interaction
+    /// is the callback invocation to stream tokens back (one GIL acquisition per token).
+    ///
+    /// Args:
+    ///   first_token: Initial token ID (from prefill sampling, already emitted by caller)
+    ///   start_position: Sequence position for the first decode step
+    ///   max_tokens: Maximum tokens to generate
+    ///   temperature: Sampling temperature (0 = greedy)
+    ///   top_k: Top-k filtering (0 = disabled)
+    ///   top_p: Top-p nucleus filtering (1.0 = disabled)
+    ///   stop_ids: List of stop token IDs
+    ///   tokenizer_path: Path to tokenizer.json
+    ///   callback: Python callable(token_id: int, text: str, finish_reason: Optional[str])
+    ///
+    /// Returns: total tokens generated
+    #[pyo3(signature = (first_token, start_position, max_tokens, temperature, top_k, top_p, stop_ids, tokenizer_path, callback))]
+    pub fn generate_loop(
+        &mut self,
+        py: pyo3::Python<'_>,
+        first_token: usize,
+        start_position: usize,
+        max_tokens: usize,
+        temperature: f32,
+        top_k: usize,
+        top_p: f32,
+        stop_ids: Vec<usize>,
+        tokenizer_path: &str,
+        callback: pyo3::PyObject,
+    ) -> PyResult<usize> {
+        use std::time::Instant;
+        use tokenizers::Tokenizer;
+
+        let graph = self.decode_graph.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure_decode first"))?;
+        let vocab_size = graph.vocab_size;
+
+        // Load tokenizer (one-time cost ~10ms, happens once per generation)
+        let tokenizer = Tokenizer::from_file(tokenizer_path)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("Failed to load tokenizer {}: {}", tokenizer_path, e)))?;
+
+        // Pre-allocate logits buffer
+        let mut logits = vec![0.0f32; vocab_size];
+        let output_ptr = logits.as_mut_ptr() as usize;
+
+        // Build stop set for O(1) lookup
+        let stop_set: std::collections::HashSet<usize> = stop_ids.into_iter().collect();
+
+        // RNG for sampling (xorshift64)
+        let mut rng_state: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        if rng_state == 0 { rng_state = 0xDEADBEEF; }
+        let mut rng_next = move || -> u64 {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            rng_state
+        };
+
+        let decode_start = Instant::now();
+        let mut next_token = first_token;
+        let mut generated = 0usize;
+
+        for step in 0..max_tokens {
+            let pos = start_position + step;
+
+            // decode_step: all Rust compute, no Python involvement (~133ms)
+            self.decode_step(next_token, pos, output_ptr)?;
+
+            // Sample next token (pure Rust, ~0.1ms on 152K vocab)
+            next_token = sample_from_logits(
+                &mut logits, vocab_size, temperature, top_k, top_p, &mut rng_next);
+            generated += 1;
+
+            // Decode token to text (pure Rust tokenizer)
+            let text = tokenizer.decode(&[next_token as u32], true)
+                .unwrap_or_default();
+
+            // Check stop conditions
+            let finish_reason = if stop_set.contains(&next_token) {
+                Some("stop")
+            } else if generated >= max_tokens {
+                Some("length")
+            } else {
+                None
+            };
+
+            // Callback to Python (GIL already held here)
+            let finished = finish_reason.is_some();
+            callback.call1(py, (next_token, &text, finish_reason))?;
+
+            if finished {
+                break;
+            }
+        }
+
+        let elapsed = decode_start.elapsed().as_secs_f64();
+        if generated > 0 {
+            let tps = generated as f64 / elapsed;
+            log::info!("generate_loop: {} tokens in {:.2}s ({:.1} tok/s)",
+                generated, elapsed, tps);
+        }
+
+        Ok(generated)
+    }
+}
+
+// ── Sampling (pure Rust, no PyTorch) ──
+
+/// Sample a token from logits using temperature, top-k, and top-p.
+fn sample_from_logits(
+    logits: &mut [f32],
+    vocab_size: usize,
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    rng_next: &mut dyn FnMut() -> u64,
+) -> usize {
+    // Greedy
+    if temperature == 0.0 {
+        let mut best_idx = 0usize;
+        let mut best_val = logits[0];
+        for i in 1..vocab_size {
+            if logits[i] > best_val {
+                best_val = logits[i];
+                best_idx = i;
+            }
+        }
+        return best_idx;
+    }
+
+    // Apply temperature
+    let inv_temp = 1.0 / temperature;
+    for i in 0..vocab_size {
+        logits[i] *= inv_temp;
+    }
+
+    // Top-k: find k-th largest value, mask everything below it
+    let effective_k = if top_k > 0 && top_k < vocab_size { top_k } else { vocab_size };
+
+    // Build index array for sorting (only if we need top-k or top-p)
+    let mut indices: Vec<usize> = (0..vocab_size).collect();
+    // Partial sort: we only need top-k elements
+    indices.select_nth_unstable_by(effective_k.min(vocab_size) - 1, |&a, &b| {
+        logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Sort the top-k portion for top-p filtering
+    let top_slice = &mut indices[..effective_k];
+    top_slice.sort_unstable_by(|&a, &b| {
+        logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Softmax over top-k (numerically stable)
+    let max_logit = logits[top_slice[0]];
+    let mut probs = Vec::with_capacity(effective_k);
+    let mut sum = 0.0f32;
+    for &idx in top_slice.iter() {
+        let p = (logits[idx] - max_logit).exp();
+        probs.push(p);
+        sum += p;
+    }
+    let inv_sum = 1.0 / sum;
+    for p in probs.iter_mut() {
+        *p *= inv_sum;
+    }
+
+    // Top-p (nucleus) filtering
+    let mut cutoff = effective_k;
+    if top_p < 1.0 {
+        let mut cum = 0.0f32;
+        for (i, &p) in probs.iter().enumerate() {
+            cum += p;
+            if cum >= top_p {
+                cutoff = i + 1;
+                break;
+            }
+        }
+    }
+
+    // Renormalize after top-p
+    if cutoff < effective_k {
+        let mut new_sum = 0.0f32;
+        for i in 0..cutoff {
+            new_sum += probs[i];
+        }
+        let inv_new_sum = 1.0 / new_sum;
+        for i in 0..cutoff {
+            probs[i] *= inv_new_sum;
+        }
+    }
+
+    // Weighted random sampling
+    let r = (rng_next() as f64 / u64::MAX as f64) as f32;
+    let mut cum = 0.0f32;
+    for i in 0..cutoff {
+        cum += probs[i];
+        if r < cum {
+            return top_slice[i];
+        }
+    }
+    // Fallback (rounding)
+    top_slice[cutoff - 1]
 }
 
 // ── Helper: LA conv (factored out for clarity) ──
@@ -3303,7 +3547,8 @@ pub fn bench_decode_synthetic(
             let q_out = if gqa_gated { gqa_num_heads * gqa_head_dim * 2 } else { gqa_num_heads * gqa_head_dim };
             let kv_out = gqa_num_kv_heads * gqa_head_dim;
             for &(r, c) in &[(q_out, hidden_size), (kv_out, hidden_size), (kv_out, hidden_size),
-                             (hidden_size, gqa_num_heads * gqa_head_dim)] {
+                             (hidden_size, gqa_num_heads * gqa_head_dim),
+                             (q_out + kv_out + kv_out, hidden_size)] { // fused QKV
                 total_packed_u32 += packed_count_for(r, c);
                 total_scales_u16 += scales_count_for(r, c);
             }
@@ -3452,6 +3697,7 @@ pub fn bench_decode_synthetic(
         gqa_q_buf: Vec::new(),
         gqa_k_buf: Vec::new(),
         gqa_v_buf: Vec::new(),
+        gqa_qkv_buf: Vec::new(),
         gqa_scores: Vec::new(),
         gqa_attn_out: Vec::new(),
         mlp_gate_up: Vec::new(),
@@ -3495,6 +3741,8 @@ pub fn bench_decode_synthetic(
             let k_proj_wid = mmap_weight(kv_out, hidden_size);
             let v_proj_wid = mmap_weight(kv_out, hidden_size);
             let o_proj_wid = mmap_weight(hidden_size, gqa_num_heads * gqa_head_dim);
+            // Fused Q+K+V weight: one big [q_out+kv_out+kv_out, hidden_size] matrix
+            let fused_qkv_wid = mmap_weight(q_out + kv_out + kv_out, hidden_size);
             let sm_scale = 1.0 / (gqa_head_dim as f32).sqrt();
 
             // Random norm weights around 1.0
@@ -3519,6 +3767,7 @@ pub fn bench_decode_synthetic(
                     num_kv_heads: gqa_num_kv_heads,
                     head_dim: gqa_head_dim,
                     sm_scale,
+                    fused_qkv_wid: Some(fused_qkv_wid),
                 },
                 mlp: DecodeMlpConfig::None, // set below
             });
