@@ -175,7 +175,7 @@ esac
 info "Using $PYTHON (Python $PY_VER_DOT)"
 
 # ── Ensure venv module ───────────────────────────────────────────────
-if ! "$PYTHON" -c "import venv" &>/dev/null; then
+if ! "$PYTHON" -c "import venv; import ensurepip" &>/dev/null; then
     warn "Python venv module not found. Installing python${PY_VER_DOT}-venv..."
     if command -v apt-get &>/dev/null; then
         SUDO=()
@@ -219,7 +219,28 @@ fi
 if [[ "$NEED_VENV" == true ]]; then
     info "Creating environment at $VENV_DIR..."
     mkdir -p "$(dirname "$VENV_DIR")"
-    "$PYTHON" -m venv "$VENV_DIR"
+    "$PYTHON" -m venv "$VENV_DIR" 2>&1 || {
+        # venv creation failed — likely missing ensurepip despite our earlier check
+        warn "venv creation failed. Attempting to install python${PY_VER_DOT}-venv..."
+        if command -v apt-get &>/dev/null; then
+            SUDO=()
+            [[ "$(id -u)" -ne 0 ]] && SUDO=(sudo)
+            "${SUDO[@]}" apt-get update -qq 2>/dev/null
+            "${SUDO[@]}" apt-get install -y "python${PY_VER_DOT}-venv" \
+                || err "Failed to install python${PY_VER_DOT}-venv.\n  Try: sudo apt install python${PY_VER_DOT}-venv"
+        elif command -v dnf &>/dev/null; then
+            SUDO=()
+            [[ "$(id -u)" -ne 0 ]] && SUDO=(sudo)
+            "${SUDO[@]}" dnf install -y "python3-libs" 2>/dev/null \
+                || err "Failed to install python venv. Try: sudo dnf install python3-libs"
+        else
+            err "venv creation failed.\n  Install: sudo apt install python${PY_VER_DOT}-venv"
+        fi
+        # Retry
+        rm -rf "$VENV_DIR"
+        "$PYTHON" -m venv "$VENV_DIR" \
+            || err "venv creation still failing after installing python${PY_VER_DOT}-venv."
+    }
     "$VENV_DIR/bin/pip" install --upgrade pip -q 2>&1 | tail -1
 fi
 
