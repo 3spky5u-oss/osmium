@@ -553,8 +553,7 @@ OPTIONS = [
                  choices=["int8", "bf16"], affects_budget=True),
     ConfigOption("CPU threads", "krasis_threads",
                  opt_type="number", min_val=1, max_val=256),
-    ConfigOption("Host", "host", opt_type="text"),
-    ConfigOption("Port", "port", opt_type="number", min_val=1, max_val=65535),
+    ConfigOption("Host/Port", "host", opt_type="text"),
 ]
 
 def _format_value(opt: ConfigOption, val: Any) -> str:
@@ -1066,7 +1065,10 @@ class Launcher:
 
         for i, opt in enumerate(visible_options):
             val = getattr(self.cfg, opt.key)
-            display = _format_value(opt, val)
+            if opt.key == "host":
+                display = f"{val}:{self.cfg.port}"
+            else:
+                display = _format_value(opt, val)
 
             if i == cursor:
                 prefix = f"  {CYAN}\u25b8{NC} "
@@ -1143,62 +1145,70 @@ class Launcher:
 
         lines.append("")
 
-        # Budget display
+        # Budget display — VRAM and System RAM side by side
         if self.budget:
             b = self.budget
             wr = b["worst_rank"]
             rank = b["ranks"][wr]
             gpu_vram = b["gpu_vram_mb"]
 
-            lines.append(f"  {DIM}\u2500\u2500\u2500 VRAM (fixed costs) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{NC}")
-            embed_mb = rank.get("embedding_mb", 0)
-            norms_gates_mb = rank.get("norms_gates_mb", 0)
-            cuda_mb = rank.get("cuda_overhead_mb", 0)
-            flashinfer_mb = rank.get("flashinfer_mb", 0)
-            prefill_ws_mb = rank.get("prefill_workspace_mb", 0)
-            lines.append(f"    Embedding:         {CYAN}{int(embed_mb):>8,} MB{NC}")
-            lines.append(f"    Norms + gates:     {CYAN}{int(norms_gates_mb):>8,} MB{NC}")
-            lines.append(f"    FlashInfer:        {CYAN}{int(flashinfer_mb):>8,} MB{NC}")
-            lines.append(f"    Prefill workspace: {CYAN}{int(prefill_ws_mb):>8,} MB{NC}")
-            lines.append(f"    CUDA overhead:     {CYAN}{int(cuda_mb):>8,} MB{NC}")
-            lines.append(f"    {DIM}\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{NC}")
+            embed_mb = int(rank.get("embedding_mb", 0))
+            norms_gates_mb = int(rank.get("norms_gates_mb", 0))
+            cuda_mb = int(rank.get("cuda_overhead_mb", 0))
+            flashinfer_mb = int(rank.get("flashinfer_mb", 0))
+            prefill_ws_mb = int(rank.get("prefill_workspace_mb", 0))
             total_with_kv = int(rank.get("total_with_kv_mb", rank["total_mb"]))
             free_after_kv = int(rank.get("free_after_kv_mb", rank["free_mb"]))
             kv_alloc_tokens = rank.get("kv_alloc_tokens", rank["kv_tokens"])
             kv_label = "fp8" if self.cfg.kv_dtype == "fp8_e4m3" else "bf16"
-            lines.append(
-                f"    Total:             {CYAN}{total_with_kv:>8,} MB{NC} / {int(gpu_vram):,} MB"
-                f"  {DIM}(~{_format_tokens(kv_alloc_tokens)} tokens {kv_label} KV){NC}"
-            )
-            if free_after_kv >= 0:
-                lines.append(f"    Free:              {CYAN}{free_after_kv:>8,} MB{NC}")
-            else:
+
+            ram_lw_gb = b.get('ram_layer_weights_mb', 0) / 1024
+            ram_dec_gb = b.get('ram_decode_mb', 0) / 1024
+            ram_kv_gb = b.get('ram_cpu_kv_mb', 0) / 1024
+            ram_tot_gb = b.get('ram_total_mb', 0) / 1024
+            sys_ram_gb = b['total_ram_gb']
+
+            COL_W = 36  # visible width per column
+
+            def _pad_col(text, width=COL_W):
+                vl = _visible_len(text)
+                return text + " " * max(0, width - vl)
+
+            # Left column (VRAM) — 5 data rows + sep + total
+            left = [
+                f"{DIM}\u2500\u2500 VRAM (fixed costs) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{NC}",
+                f"  Embedding:       {CYAN}{embed_mb:>8,} MB{NC}",
+                f"  Norms + gates:   {CYAN}{norms_gates_mb:>8,} MB{NC}",
+                f"  FlashInfer:      {CYAN}{flashinfer_mb:>8,} MB{NC}",
+                f"  Prefill w/s:     {CYAN}{prefill_ws_mb:>8,} MB{NC}",
+                f"  CUDA overhead:   {CYAN}{cuda_mb:>8,} MB{NC}",
+                f"  {DIM}\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{NC}",
+                f"  Total: {CYAN}{total_with_kv:>8,}{NC} / {int(gpu_vram):,} MB",
+            ]
+            # Right column (RAM) — pad top to align sep + total with left
+            right = [
+                f"{DIM}\u2500\u2500 System RAM (fixed costs) \u2500\u2500\u2500\u2500\u2500\u2500{NC}",
+                "",
+                "",
+                f"  Layer weights:   {GREEN}{ram_lw_gb:>7.1f} GB{NC}",
+                f"  CPU decode:      {GREEN}{ram_dec_gb:>7.1f} GB{NC}",
+                f"  CPU KV cache:    {GREEN}{ram_kv_gb:>7.1f} GB{NC}",
+                f"  {DIM}\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{NC}",
+                f"  Total:   {GREEN}{ram_tot_gb:>7.1f}{NC} / {sys_ram_gb:.0f} GB",
+            ]
+            for l_line, r_line in zip(left, right):
+                lines.append(f"  {_pad_col(l_line)}  {r_line}")
+
+            # Token estimate + over-budget warning below tables
+            lines.append(f"    {DIM}~{_format_tokens(kv_alloc_tokens)} tokens {kv_label} KV{NC}")
+            if free_after_kv < 0:
                 over = -free_after_kv
                 lines.append(f"    {RED}\u26a0 OVER BUDGET by {int(over):,} MB!{NC}")
-
-            # System RAM
-            lines.append("")
-            lines.append(f"  {DIM}\u2500\u2500\u2500 System RAM \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{NC}")
-            ram_lw = int(b.get('ram_layer_weights_mb', 0))
-            ram_ge = int(b.get('ram_gpu_experts_mb', 0))
-            ram_ce = int(b.get('ram_cpu_experts_mb', 0))
-            ram_dec = int(b.get('ram_decode_mb', 0))
-            ram_kv = int(b.get('ram_cpu_kv_mb', 0))
-            ram_tot = int(b.get('ram_total_mb', 0))
-            sys_ram_mb = int(b['total_ram_gb'] * 1024)
-            lines.append(f"    Layer weights:     {GREEN}{ram_lw:>8,} MB{NC}")
-            lines.append(f"    GPU experts:       {GREEN}{ram_ge:>8,} MB{NC}")
-            lines.append(f"    CPU experts:       {GREEN}{ram_ce:>8,} MB{NC}")
-            lines.append(f"    CPU decode store:  {GREEN}{ram_dec:>8,} MB{NC}")
-            lines.append(f"    CPU KV cache:      {GREEN}{ram_kv:>8,} MB{NC}")
-            lines.append(f"    {DIM}\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{NC}")
-            lines.append(f"    Total:             {GREEN}{ram_tot:>8,} MB{NC} / {sys_ram_mb:,} MB")
         else:
             lines.append(f"  {DIM}(budget unavailable){NC}")
 
         lines.append("")
-        lines.append(f"  {DIM}[\u2191\u2193] Navigate  [\u2190\u2192] Change  [Enter] Launch{NC}")
-        lines.append(f"  {DIM}[L] Load config  [S] Save config  [q] Quit{NC}")
+        lines.append(f"  {DIM}[\u2191\u2193] Navigate  [\u2190\u2192] Change  [Enter] Launch  [L] Load  [S] Save  [q] Quit{NC}")
 
         return "\n".join(lines)
 
@@ -1409,10 +1419,23 @@ class Launcher:
                     elif opt.opt_type == "text":
                         # Open inline editor for text fields on left/right
                         _show_cursor()
-                        current = str(getattr(self.cfg, opt.key))
-                        new_val = _edit_value(opt.label, current)
+                        if opt.key == "host":
+                            current = f"{self.cfg.host}:{self.cfg.port}"
+                            new_val = _edit_value(opt.label, current)
+                            if ":" in new_val:
+                                h, p = new_val.rsplit(":", 1)
+                                self.cfg.host = h
+                                try:
+                                    self.cfg.port = int(p)
+                                except ValueError:
+                                    pass
+                            else:
+                                self.cfg.host = new_val
+                        else:
+                            current = str(getattr(self.cfg, opt.key))
+                            new_val = _edit_value(opt.label, current)
+                            setattr(self.cfg, opt.key, new_val)
                         _hide_cursor()
-                        setattr(self.cfg, opt.key, new_val)
                     if opt.affects_budget:
                         self.budget = self._compute_budget()
                 elif key in ("l", "L"):
