@@ -68,7 +68,7 @@ Krasis is a new project, and although I believe the results are very promising t
 | **Qwen3-Coder-Next** | 80B | 148 GB | 512 routed, top-10 | Hybrid (36 linear + 12 GQA) | Tested | 
 | **Qwen3.5-35B-A3B** | 35B | 67 GB | 256 routed, top-8 | Hybrid (30 linear + 10 GQA) | Partially Tested |
 | **Qwen3-235B-A22B** | 235B | 438 GB | 128 routed, top-8 | GQA | Partially Tested |
-| **DeepSeek V2-Lite** | 16B | 29 GB | 64 + 2 shared, top-6 | MLA | Tested |
+| **DeepSeek V2-Lite** | 16B | 29 GB | 64 + 2 shared, top-6 | MLA | Partially Tested |
 
 ## Models in progress
 
