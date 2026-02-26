@@ -70,12 +70,12 @@ In order to achieve these speeds, Krasis has a few requirements.
 
 Measured with INT4 GPU + INT4 CPU experts (Q4), BF16 attention, INT8 shared/MLP/lm_head, FP8 KV cache. Sliding window (2048 tokens, stride 1024).
 
-| Model | Dataset | Tokens | PPL | BPC | Throughput |
-|-------|---------|:------:|:---:|:---:|:----------:|
-| **Qwen3-Coder-Next** | WikiText-2 | 299K | 7.23 | 2.85 | 128 tok/s |
-| **Qwen3-Coder-Next** | C4 validation | 1M | - | - | - tok/s |
-| **DeepSeek V2-Lite** | WikiText-2 | 307K | 6.03 | 2.59 | 593 tok/s |
-| **DeepSeek V2-Lite** | C4 validation | 500K | 9.22 | 3.20 | 573 tok/s |
+| Model | Dataset | Tokens | PPL | BPC |
+|-------|---------|:------:|:---:|:---:|
+| **Qwen3-Coder-Next** | WikiText-2 | 299K | 7.23 | 2.85 |
+| **Qwen3-Coder-Next** | C4 validation | 1M | 12.52 | 3.65 |
+| **DeepSeek V2-Lite** | WikiText-2 | 307K | 6.03 | 2.59 |
+| **DeepSeek V2-Lite** | C4 validation | 500K | 9.22 | 3.20 |
 
 ## Benchmark: AMD 5900X + 1x RTX 5080 16GB
 
