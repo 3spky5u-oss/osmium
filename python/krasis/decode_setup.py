@@ -622,22 +622,23 @@ class CpuDecoder:
         """
         model = self._model
         copied = 0
-        for layer_idx in self._la_recur_state:
-            attn = model.layers[layer_idx].attention
-            if attn._recurrent_state is not None:
-                self._la_recur_state[layer_idx].copy_(
-                    attn._recurrent_state.float().cpu())
-                copied += 1
-            else:
-                self._la_recur_state[layer_idx].zero_()
+        with torch.inference_mode():
+            for layer_idx in self._la_recur_state:
+                attn = model.layers[layer_idx].attention
+                if attn._recurrent_state is not None:
+                    self._la_recur_state[layer_idx].copy_(
+                        attn._recurrent_state.float().cpu())
+                    copied += 1
+                else:
+                    self._la_recur_state[layer_idx].zero_()
 
-        for layer_idx in self._la_conv_state:
-            attn = model.layers[layer_idx].attention
-            if attn._conv_state is not None:
-                self._la_conv_state[layer_idx].copy_(
-                    attn._conv_state.float().cpu())
-            else:
-                self._la_conv_state[layer_idx].zero_()
+            for layer_idx in self._la_conv_state:
+                attn = model.layers[layer_idx].attention
+                if attn._conv_state is not None:
+                    self._la_conv_state[layer_idx].copy_(
+                        attn._conv_state.float().cpu())
+                else:
+                    self._la_conv_state[layer_idx].zero_()
 
         logger.info("Copied recurrent state from GPU: %d/%d layers",
                      copied, len(self._la_recur_state))
@@ -648,6 +649,10 @@ class CpuDecoder:
 
     def _copy_kv_cache(self, model, seq_states):
         """Unpage GPU KV cache into flat CPU float32 arrays."""
+        with torch.inference_mode():
+            self._copy_kv_cache_inner(model, seq_states)
+
+    def _copy_kv_cache_inner(self, model, seq_states):
         for gpu_idx, (start, end) in enumerate(model._layer_split):
             kv_cache = model.kv_caches[gpu_idx]
             if kv_cache is None:

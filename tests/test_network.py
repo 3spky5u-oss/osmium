@@ -444,6 +444,176 @@ def run_large_prompt_tests(base_url: str) -> List[TestResult]:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Test 6: Multi-turn sequential conversation
+# ═══════════════════════════════════════════════════════════════════
+
+def run_multi_turn_tests(base_url: str) -> List[TestResult]:
+    """Test 6: multi-turn conversation with separate sequential HTTP requests.
+
+    Simulates a real chat where each request includes growing conversation
+    history. Each request goes through a full prefill -> KV cache copy -> decode
+    cycle, exercising _copy_kv_cache and _copy_recurrent_state_from_gpu
+    repeatedly. This catches inference_mode bugs on inplace ops on KV tensors.
+    """
+    results = []
+
+    print(f"\n{BOLD}{CYAN}Test 6: Multi-Turn Sequential Conversation{NC}")
+    print("=" * 60)
+
+    # ── Turn 1: Establish facts ──
+    messages = [
+        {"role": "user", "content": (
+            "I need you to remember three facts for our conversation: "
+            "1) My dog's name is Biscuit. "
+            "2) I live in Wellington, New Zealand. "
+            "3) My favorite number is 42. "
+            "Acknowledge each fact."
+        )},
+    ]
+    print(f"  Turn 1: establishing facts...", end="", flush=True)
+    t0 = time.time()
+    status, body = send_chat_request(
+        base_url, messages, max_tokens=128, temperature=0.1,
+        stream=False, timeout=120,
+    )
+    elapsed = time.time() - t0
+
+    if status != 200:
+        r = TestResult("multi_turn_t1", False, f"HTTP {status}", elapsed=elapsed)
+        results.append(r)
+        print(f" {_fail(r.detail)}")
+        return results  # can't continue
+
+    t1_text = body.get("choices", [{}])[0].get("message", {}).get("content", "")
+    r = TestResult("multi_turn_t1", not is_garbage(t1_text),
+                   f"OK ({elapsed:.1f}s)" if not is_garbage(t1_text) else f"Garbage: {t1_text[:100]!r}",
+                   response_text=t1_text, elapsed=elapsed)
+    results.append(r)
+    print(f" {_pass(r.detail) if r.passed else _fail(r.detail)}")
+    if not r.passed:
+        return results
+
+    # ── Turn 2: Ask about one fact (tests KV cache copy from turn 1 prefill) ──
+    messages.append({"role": "assistant", "content": t1_text})
+    messages.append({"role": "user", "content": "What is my dog's name?"})
+
+    print(f"  Turn 2: recalling dog's name...", end="", flush=True)
+    t0 = time.time()
+    status, body = send_chat_request(
+        base_url, messages, max_tokens=32, temperature=0.1,
+        stream=False, timeout=120,
+    )
+    elapsed = time.time() - t0
+
+    if status != 200:
+        r = TestResult("multi_turn_t2_dog", False, f"HTTP {status}", elapsed=elapsed)
+        results.append(r)
+        print(f" {_fail(r.detail)}")
+        return results
+
+    t2_text = body.get("choices", [{}])[0].get("message", {}).get("content", "")
+    t2_pass = not is_garbage(t2_text) and "biscuit" in t2_text.lower()
+    detail = f"OK ({elapsed:.1f}s)" if t2_pass else f"Expected 'Biscuit': {t2_text[:100]!r}"
+    r = TestResult("multi_turn_t2_dog", t2_pass, detail,
+                   response_text=t2_text, elapsed=elapsed)
+    results.append(r)
+    print(f" {_pass(r.detail) if r.passed else _fail(r.detail)}")
+
+    # ── Turn 3: Ask about another fact (tests repeated KV copy cycles) ──
+    messages.append({"role": "assistant", "content": t2_text})
+    messages.append({"role": "user", "content": "Where do I live?"})
+
+    print(f"  Turn 3: recalling city...", end="", flush=True)
+    t0 = time.time()
+    status, body = send_chat_request(
+        base_url, messages, max_tokens=32, temperature=0.1,
+        stream=False, timeout=120,
+    )
+    elapsed = time.time() - t0
+
+    if status != 200:
+        r = TestResult("multi_turn_t3_city", False, f"HTTP {status}", elapsed=elapsed)
+        results.append(r)
+        print(f" {_fail(r.detail)}")
+        return results
+
+    t3_text = body.get("choices", [{}])[0].get("message", {}).get("content", "")
+    t3_pass = not is_garbage(t3_text) and "wellington" in t3_text.lower()
+    detail = f"OK ({elapsed:.1f}s)" if t3_pass else f"Expected 'Wellington': {t3_text[:100]!r}"
+    r = TestResult("multi_turn_t3_city", t3_pass, detail,
+                   response_text=t3_text, elapsed=elapsed)
+    results.append(r)
+    print(f" {_pass(r.detail) if r.passed else _fail(r.detail)}")
+
+    # ── Turn 4: Ask about the third fact via streaming (tests stream + KV copy) ──
+    messages.append({"role": "assistant", "content": t3_text})
+    messages.append({"role": "user", "content": "What is my favorite number?"})
+
+    print(f"  Turn 4: recalling number (streaming)...", end="", flush=True)
+    t0 = time.time()
+    status, body = send_chat_request(
+        base_url, messages, max_tokens=32, temperature=0.1,
+        stream=True, timeout=120,
+    )
+    elapsed = time.time() - t0
+
+    if status != 200:
+        r = TestResult("multi_turn_t4_number", False, f"HTTP {status}", elapsed=elapsed)
+        results.append(r)
+        print(f" {_fail(r.detail)}")
+        return results
+
+    t4_text, _ = parse_sse_content(body)
+    t4_pass = not is_garbage(t4_text) and "42" in t4_text
+    detail = f"OK ({elapsed:.1f}s)" if t4_pass else f"Expected '42': {t4_text[:100]!r}"
+    r = TestResult("multi_turn_t4_number", t4_pass, detail,
+                   response_text=t4_text, elapsed=elapsed)
+    results.append(r)
+    print(f" {_pass(r.detail) if r.passed else _fail(r.detail)}")
+
+    # ── Turn 5: All three facts at once (verifies full context retention) ──
+    messages.append({"role": "assistant", "content": t4_text})
+    messages.append({"role": "user", "content": (
+        "Repeat all three facts I told you at the start: "
+        "my dog's name, where I live, and my favorite number."
+    )})
+
+    print(f"  Turn 5: recalling all three facts...", end="", flush=True)
+    t0 = time.time()
+    status, body = send_chat_request(
+        base_url, messages, max_tokens=128, temperature=0.1,
+        stream=False, timeout=120,
+    )
+    elapsed = time.time() - t0
+
+    if status != 200:
+        r = TestResult("multi_turn_t5_all", False, f"HTTP {status}", elapsed=elapsed)
+        results.append(r)
+        print(f" {_fail(r.detail)}")
+        return results
+
+    t5_text = body.get("choices", [{}])[0].get("message", {}).get("content", "")
+    has_biscuit = "biscuit" in t5_text.lower()
+    has_wellington = "wellington" in t5_text.lower()
+    has_42 = "42" in t5_text
+    t5_pass = not is_garbage(t5_text) and has_biscuit and has_wellington and has_42
+    missing = []
+    if not has_biscuit:
+        missing.append("Biscuit")
+    if not has_wellington:
+        missing.append("Wellington")
+    if not has_42:
+        missing.append("42")
+    detail = f"OK ({elapsed:.1f}s)" if t5_pass else f"Missing: {', '.join(missing)} in: {t5_text[:200]!r}"
+    r = TestResult("multi_turn_t5_all", t5_pass, detail,
+                   response_text=t5_text, elapsed=elapsed)
+    results.append(r)
+    print(f" {_pass(r.detail) if r.passed else _fail(r.detail)}")
+
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Server discovery
 # ═══════════════════════════════════════════════════════════════════
 
@@ -548,6 +718,11 @@ def main():
     if args.large and not args.quick:
         results_5 = run_large_prompt_tests(base_url)
         all_results.extend(results_5)
+
+    # Test 6: Multi-turn sequential conversation (always runs unless --quick)
+    if not args.quick:
+        results_6 = run_multi_turn_tests(base_url)
+        all_results.extend(results_6)
 
     # Summary
     total_time = time.time() - t_start

@@ -510,6 +510,7 @@ class ConfigOption:
         suffix: str = "",
         min_val: int = 1,
         max_val: int = 65536,
+        step: int = 1,
     ):
         self.label = label
         self.key = key
@@ -519,6 +520,7 @@ class ConfigOption:
         self.suffix = suffix
         self.min_val = min_val
         self.max_val = max_val
+        self.step = step
 
 
 # Config options shown in TUI
@@ -527,7 +529,7 @@ OPTIONS = [
     ConfigOption("Layer group size", "layer_group_size",
                  choices=[2, 4, 6, 8, 10, 12], affects_budget=True),
     ConfigOption("KV cache (MB)", "kv_cache_mb",
-                 opt_type="number", min_val=256, max_val=65536, affects_budget=True),
+                 opt_type="number", min_val=200, max_val=65500, step=100, affects_budget=True),
     ConfigOption("KV dtype", "kv_dtype",
                  choices=["fp8_e4m3", "bf16"], affects_budget=True),
     ConfigOption("GPU expert bits", "gpu_expert_bits",
@@ -1200,7 +1202,7 @@ class Launcher:
             idx = (idx + direction) % len(choices)
             setattr(self.cfg, opt.key, choices[idx])
         elif opt.opt_type == "number":
-            new_val = int(val) + direction
+            new_val = int(val) + direction * opt.step
             new_val = max(opt.min_val, min(opt.max_val, new_val))
             setattr(self.cfg, opt.key, new_val)
 
@@ -1573,7 +1575,7 @@ def _apply_cli_overrides(cfg: LauncherConfig, args: argparse.Namespace) -> None:
     if args.layer_group_size is not None:
         cfg.layer_group_size = max(2, args.layer_group_size)
     if args.kv_cache_mb is not None:
-        cfg.kv_cache_mb = max(256, args.kv_cache_mb)
+        cfg.kv_cache_mb = max(200, args.kv_cache_mb)
     if args.kv_dtype is not None:
         cfg.kv_dtype = args.kv_dtype
     if args.gpu_expert_bits is not None:
