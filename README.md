@@ -4,6 +4,7 @@ Python-orchestrated Rust MoE runtime for large mixture-of-experts LLMs. Runs 200
 
 You can [contact me here](https://forms.gle/ue4nvyvNNHtUZ7MQ7) but for bugs, difficulties, suggestions or requests for support for other models please report an issue instead.
 
+If you want to easily monitor Krasis during runs, [check out ktop](https://github.com/brontoguana/ktop).
 
 ## Krasis runs MoE LLMs fast on consumer level hardware
 
