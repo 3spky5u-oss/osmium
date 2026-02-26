@@ -321,7 +321,7 @@ def scan_gguf_files(search_dir: str) -> List[Dict[str, Any]]:
 
 CONFIG_KEYS = [
     "MODEL_PATH", "CFG_SELECTED_GPUS", "CFG_PP_PARTITION", "CFG_LAYER_GROUP_SIZE",
-    "CFG_KV_DTYPE", "CFG_GPU_EXPERT_BITS", "CFG_CPU_EXPERT_BITS",
+    "CFG_KV_CACHE_MB", "CFG_KV_DTYPE", "CFG_GPU_EXPERT_BITS", "CFG_CPU_EXPERT_BITS",
     "CFG_ATTENTION_QUANT", "CFG_SHARED_EXPERT_QUANT", "CFG_DENSE_MLP_QUANT",
     "CFG_LM_HEAD_QUANT", "CFG_KRASIS_THREADS", "CFG_HOST", "CFG_PORT",
     "CFG_GPU_PREFILL_THRESHOLD", "CFG_GGUF_PATH", "CFG_FORCE_LOAD",
@@ -372,6 +372,7 @@ class LauncherConfig:
         self.selected_gpu_indices: List[int] = []  # empty = all GPUs
         self.pp_partition: str = ""
         self.layer_group_size: int = 2  # layers per group (must be even, min 2 for double buffering)
+        self.kv_cache_mb: int = 2000
         self.kv_dtype: str = "fp8_e4m3"
         self.gpu_expert_bits: int = 4
         self.cpu_expert_bits: int = 4
@@ -415,6 +416,11 @@ class LauncherConfig:
                 v = int(val)
                 if v >= 2:
                     self.layer_group_size = v
+            except ValueError:
+                pass
+        if "CFG_KV_CACHE_MB" in saved:
+            try:
+                self.kv_cache_mb = int(saved["CFG_KV_CACHE_MB"])
             except ValueError:
                 pass
         if "CFG_KV_DTYPE" in saved:
@@ -470,6 +476,7 @@ class LauncherConfig:
             "CFG_SELECTED_GPUS": ",".join(str(i) for i in self.selected_gpu_indices),
             "CFG_PP_PARTITION": self.pp_partition,
             "CFG_LAYER_GROUP_SIZE": str(self.layer_group_size),
+            "CFG_KV_CACHE_MB": str(self.kv_cache_mb),
             "CFG_KV_DTYPE": self.kv_dtype,
             "CFG_GPU_EXPERT_BITS": str(self.gpu_expert_bits),
             "CFG_CPU_EXPERT_BITS": str(self.cpu_expert_bits),
@@ -519,6 +526,8 @@ OPTIONS = [
     ConfigOption("PP partition", "pp_partition", opt_type="text", affects_budget=True),
     ConfigOption("Layer group size", "layer_group_size",
                  choices=[2, 4, 6, 8, 10, 12], affects_budget=True),
+    ConfigOption("KV cache (MB)", "kv_cache_mb",
+                 opt_type="number", min_val=256, max_val=65536, affects_budget=True),
     ConfigOption("KV dtype", "kv_dtype",
                  choices=["fp8_e4m3", "bf16"], affects_budget=True),
     ConfigOption("GPU expert bits", "gpu_expert_bits",
@@ -545,6 +554,8 @@ def _format_value(opt: ConfigOption, val: Any) -> str:
         return f"{GREEN}ON{NC}" if val else f"{DIM}OFF{NC}"
     if opt.key == "layer_group_size":
         return f"{val} layers (double-buffered)"
+    if opt.key == "kv_cache_mb":
+        return f"{val:,} MB"
     return str(val)
 
 
@@ -1050,6 +1061,18 @@ class Launcher:
             annotation = _quality_annotation(native_dtype, opt.key, val)
             suffix = f"  {annotation}" if annotation else ""
 
+            # KV cache: show max-context estimate
+            if opt.key == "kv_cache_mb" and self.model_info:
+                mi = self.model_info
+                kv_dim = mi.get("kv_dim", 0)
+                num_kv_layers = mi.get("num_kv_layers", 0)
+                max_ctx = mi.get("max_context", 0)
+                if kv_dim > 0 and num_kv_layers > 0:
+                    elem_size = 1 if self.cfg.kv_dtype == "fp8_e4m3" else 2
+                    bytes_per_token = kv_dim * elem_size * num_kv_layers
+                    max_ctx_mb = (max_ctx * bytes_per_token) / (1024 * 1024)
+                    suffix = f"  {DIM}(max context {max_ctx // 1000}K = {max_ctx_mb:,.0f} MB){NC}"
+
             # Right-align values
             label_part = f"{label_style}{opt.label:<20s}{NC}"
             lines.append(f"{prefix}{label_part}{display}{suffix}")
@@ -1333,16 +1356,48 @@ class Launcher:
             else:
                 first_k_dense = 0
 
+            # Compute KV cache dimensions for max-context estimate
+            num_layers = cfg.get("num_hidden_layers", 0)
+            is_mla = "kv_lora_rank" in cfg
+
+            # Count layers that need KV cache (hybrid models skip linear attention layers)
+            full_attn_interval = cfg.get("full_attention_interval", 0)
+            if "layer_types" in cfg:
+                num_kv_layers = sum(
+                    1 for t in cfg["layer_types"]
+                    if t in ("full_attention", "sliding_attention")
+                )
+            elif full_attn_interval > 0:
+                num_kv_layers = sum(
+                    1 for i in range(num_layers)
+                    if (i + 1) % full_attn_interval == 0
+                )
+            else:
+                num_kv_layers = num_layers
+
+            # Bytes per token per layer in KV cache
+            if is_mla:
+                kv_dim = cfg.get("kv_lora_rank", 512) + cfg.get("qk_rope_head_dim", 64)
+            else:
+                num_kv_heads = cfg.get("num_key_value_heads", cfg.get("num_attention_heads", 1))
+                head_dim = cfg.get("head_dim", 128)
+                kv_dim = num_kv_heads * head_dim * 2  # K + V
+
+            max_context = cfg.get("max_position_embeddings", 131072)
+
             self.model_info = {
                 "name": os.path.basename(self.cfg.model_path),
                 "path": self.cfg.model_path,
                 "arch": cfg.get("model_type", "?"),
-                "layers": cfg.get("num_hidden_layers", 0),
+                "layers": num_layers,
                 "experts": cfg.get("n_routed_experts", cfg.get("num_experts", 0)),
                 "shared_experts": cfg.get("n_shared_experts", 0),
                 "dense_layers": first_k_dense,
                 "native_dtype": raw.get("torch_dtype", "bfloat16"),
                 "ram_gb": 0,
+                "num_kv_layers": num_kv_layers,
+                "kv_dim": kv_dim,
+                "max_context": max_context,
             }
         except (json.JSONDecodeError, KeyError, TypeError):
             pass
@@ -1360,6 +1415,7 @@ class Launcher:
             print(f"  CPU experts:     Build INT{self.cfg.cpu_expert_bits} from native")
         print(f"  PP partition:    {self.cfg.pp_partition}")
         print(f"  Layer group:     {self.cfg.layer_group_size} layers (double-buffered)")
+        print(f"  KV cache:        {self.cfg.kv_cache_mb:,} MB")
         print(f"  KV dtype:        {self.cfg.kv_dtype}")
         print(f"  GPU expert bits: {self.cfg.gpu_expert_bits}")
         print(f"  CPU expert bits: {self.cfg.cpu_expert_bits}")
@@ -1401,6 +1457,7 @@ class Launcher:
             "--model-path", self.cfg.model_path,
             "--num-gpus", str(num_gpus),
             "--layer-group-size", str(self.cfg.layer_group_size),
+            "--kv-cache-mb", str(self.cfg.kv_cache_mb),
             "--kv-dtype", self.cfg.kv_dtype,
             "--gpu-expert-bits", str(self.cfg.gpu_expert_bits),
             "--cpu-expert-bits", str(self.cfg.cpu_expert_bits),
@@ -1461,6 +1518,8 @@ def parse_args() -> argparse.Namespace:
                         help="Comma-separated GPU indices to use (e.g. '0,2')")
     parser.add_argument("--layer-group-size", type=int, default=None,
                         help="Layers per streaming group (even number, min 2 for double buffering)")
+    parser.add_argument("--kv-cache-mb", type=int, default=None,
+                        help="KV cache size in MB (default: 2000)")
     parser.add_argument("--kv-dtype", default=None,
                         help="KV cache dtype: fp8_e4m3 or bf16")
     parser.add_argument("--gpu-expert-bits", type=int, default=None,
@@ -1513,6 +1572,8 @@ def _apply_cli_overrides(cfg: LauncherConfig, args: argparse.Namespace) -> None:
         cfg.pp_partition = args.pp_partition
     if args.layer_group_size is not None:
         cfg.layer_group_size = max(2, args.layer_group_size)
+    if args.kv_cache_mb is not None:
+        cfg.kv_cache_mb = max(256, args.kv_cache_mb)
     if args.kv_dtype is not None:
         cfg.kv_dtype = args.kv_dtype
     if args.gpu_expert_bits is not None:

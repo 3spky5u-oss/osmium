@@ -521,8 +521,8 @@ def main():
                         help="CPU threads for expert computation")
     parser.add_argument("--kv-dtype", default="fp8_e4m3",
                         choices=["fp8_e4m3", "bf16"])
-    parser.add_argument("--kv-cache-mb", type=int, default=0,
-                        help="KV cache size in MB (0 = auto-size to available VRAM)")
+    parser.add_argument("--kv-cache-mb", type=int, default=2000,
+                        help="KV cache size in MB (default: 2000)")
     parser.add_argument("--heatmap-path", default=None,
                         help="Path to expert_heatmap.json for HCS init")
     parser.add_argument("--gpu-expert-bits", type=int, default=4, choices=[4, 8],
@@ -972,9 +972,8 @@ def main():
         sys.exit(0)
 
     max_ctx = _model.get_max_context_tokens()
-    kv_label = "auto" if args.kv_cache_mb == 0 else f"{args.kv_cache_mb} MB"
     _status(f"Server ready on {args.host}:{args.port}")
-    print(f"  {_DIM}KV cache: {kv_label} → {max_ctx:,} max context tokens{_NC}", flush=True)
+    print(f"  {_DIM}KV cache: {args.kv_cache_mb:,} MB → {max_ctx:,} max context tokens{_NC}", flush=True)
     print(f"  {_DIM}Press Q to quit, Ctrl-C to force exit{_NC}", flush=True)
     logger.info(
         "Model loaded, starting server on %s:%d (max context: %d tokens)",

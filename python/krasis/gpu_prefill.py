@@ -554,7 +554,7 @@ class GpuPrefillManager:
             self._prefill_mode, self._layer_group_size,
         )
 
-        # Pre-allocate GPU buffer eagerly so KV cache auto-sizer sees the reservation
+        # Pre-allocate GPU buffer eagerly for chunked mode
         # (not needed for persistent/layer_grouped — buffers allocated per-group)
         if self._prefill_mode == "chunked":
             self._allocate_gpu_buffer()
