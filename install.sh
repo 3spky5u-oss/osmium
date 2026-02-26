@@ -69,7 +69,66 @@ for candidate in python3.13 python3.12 python3.11 python3.10 python3; do
     ((N_PY++)) || true
 done
 
-[[ $N_PY -eq 0 ]] && err "Python 3.10+ not found. Install it:\n  sudo apt install python3"
+if [[ $N_PY -eq 0 ]]; then
+    warn "Python 3.10+ not found."
+    if command -v apt-get &>/dev/null; then
+        echo -en "  Install Python 3 now? [Y/n] "
+        read -r answer < /dev/tty 2>/dev/null || answer="n"
+        if [[ "${answer,,}" =~ ^(y|yes|)$ ]]; then
+            SUDO=()
+            [[ "$(id -u)" -ne 0 ]] && SUDO=(sudo)
+            info "Installing Python 3..."
+            "${SUDO[@]}" apt-get update -qq 2>/dev/null
+            "${SUDO[@]}" apt-get install -y python3 python3-venv \
+                || err "Failed to install Python 3.\n  Try manually: sudo apt install python3 python3-venv"
+            # Re-scan for Python
+            for candidate in python3.13 python3.12 python3.11 python3.10 python3; do
+                command -v "$candidate" &>/dev/null || continue
+                ver=$("$candidate" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null) || continue
+                major="${ver%%.*}"; minor="${ver##*.}"
+                [[ "$major" -eq 3 && "$minor" -ge 10 ]] || continue
+                pyver="${major}${minor}"
+                [[ "$SEEN_VERS" == *" $pyver "* ]] && continue
+                SEEN_VERS="$SEEN_VERS $pyver "
+                PY_BINS[$N_PY]="$candidate"
+                PY_VERS[$N_PY]="$pyver"
+                PY_DOTS[$N_PY]="$ver"
+                ((N_PY++)) || true
+            done
+            [[ $N_PY -eq 0 ]] && err "Python 3.10+ still not found after install."
+        else
+            err "Python 3.10+ is required.\n  Install it: sudo apt install python3"
+        fi
+    elif command -v dnf &>/dev/null; then
+        echo -en "  Install Python 3 now? [Y/n] "
+        read -r answer < /dev/tty 2>/dev/null || answer="n"
+        if [[ "${answer,,}" =~ ^(y|yes|)$ ]]; then
+            SUDO=()
+            [[ "$(id -u)" -ne 0 ]] && SUDO=(sudo)
+            info "Installing Python 3..."
+            "${SUDO[@]}" dnf install -y python3 \
+                || err "Failed to install Python 3.\n  Try manually: sudo dnf install python3"
+            for candidate in python3.13 python3.12 python3.11 python3.10 python3; do
+                command -v "$candidate" &>/dev/null || continue
+                ver=$("$candidate" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null) || continue
+                major="${ver%%.*}"; minor="${ver##*.}"
+                [[ "$major" -eq 3 && "$minor" -ge 10 ]] || continue
+                pyver="${major}${minor}"
+                [[ "$SEEN_VERS" == *" $pyver "* ]] && continue
+                SEEN_VERS="$SEEN_VERS $pyver "
+                PY_BINS[$N_PY]="$candidate"
+                PY_VERS[$N_PY]="$pyver"
+                PY_DOTS[$N_PY]="$ver"
+                ((N_PY++)) || true
+            done
+            [[ $N_PY -eq 0 ]] && err "Python 3.10+ still not found after install."
+        else
+            err "Python 3.10+ is required.\n  Install it: sudo dnf install python3"
+        fi
+    else
+        err "Python 3.10+ not found.\n  Install it with your package manager (e.g. sudo apt install python3)"
+    fi
+fi
 
 # Use the first Python we found for JSON parsing
 PARSE_PY="${PY_BINS[0]}"
