@@ -1,5 +1,24 @@
 # Krasis Benchmark Results
 
+## Standard Benchmarks — 2026-02-27 (Rust server, unified timing)
+
+**Hardware:** EPYC 7742 (64 cores, 4 NUMA nodes), DDR4-2666 8-channel, 1x RTX 2000 Ada 16 GB, PCIe 4.0 x8.
+
+Config: 20K–50K token prompts, FP8 KV cache, BF16 attention, INT8 shared_expert/dense_mlp/lm_head, 40 CPU threads, NUMA thread pinning + interleaved allocation, LGS=2, pure CPU decode, Rust HTTP server with ring buffer SSE.
+
+| Model | GPUs | GPU/CPU bits | Engine Prefill | Engine Decode | Network Prefill | Network Decode | Overhead | Log |
+|-------|-----:|-------------:|---------------:|--------------:|----------------:|---------------:|---------:|-----|
+| Qwen3-Coder-Next | 1 | INT4/INT4 | 1,003 tok/s | 12.97 tok/s | 932 tok/s | 12.13 tok/s | 7.1% / 6.5% | [log](Qwen3-Coder-Next_native_1gpu_int4gpu_int4cpu_stream_lgs2.log) |
+
+### Key changes from previous benchmarks
+
+- **Rust-internal timing**: Both engine and network decode use Rust `Instant` timers. Previous Python timing included `torch.cuda.synchronize()` overhead, making engine decode appear 33% slower than network (impossible).
+- **Ring buffer SSE**: Decode loop pushes to mpsc channel, writer thread flushes every 100ms. First token flushed immediately for accurate TTFT.
+- **Unified tokenization**: Both paths use `apply_chat_template(enable_thinking=False)`. Network sends text (not pre-tokenized IDs).
+- **Model warmup before benchmarks**: Full generate cycle runs before any measurement, paying all cold-start costs.
+
+---
+
 ## Standard Benchmarks — 2026-02-25 (NUMA-optimized, 1 GPU)
 
 **Hardware:** EPYC 7742 (64 cores, 4 NUMA nodes), DDR4-2666 8-channel, 1x RTX 2000 Ada 16 GB, PCIe 4.0 x8.
@@ -19,6 +38,7 @@ Config: 10K–50K token prompts, FP8 KV cache, BF16 attention, INT8 shared_exper
 - **MPOL_INTERLEAVE**: Weight mmap pages spread across all memory controllers. 4x aggregate DRAM bandwidth.
 - **MLA AVX2 kernels**: w_kc/w_vc absorption and attention vectorized with parallel head dispatch.
 - **Combined effect**: QCN decode 7.89 → 15.81 tok/s (+100%), V2-Lite decode 6.22 → 20.18 tok/s (+224%).
+- **Note**: Decode numbers from Feb 25 used Python timing that included cuda.synchronize() — may be slightly pessimistic. Feb 27 numbers use Rust-internal timing.
 
 ---
 

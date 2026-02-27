@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-02-27 08:31:44
+Krasis Benchmark — 2026-02-27 08:55:41
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -25,16 +25,16 @@ Strategy:
   Mode:           pure_cpu decode, layer_grouped(2) + stream_attn prefill
 
 Prefill (3 runs at different lengths):
-  Run 1:  1000.0 tok/s, TTFT=20.00s (20,000 tokens)
-  Run 2:  911.0 tok/s, TTFT=38.42s (35,000 tokens)
-  Run 3:  808.4 tok/s, TTFT=61.85s (50,000 tokens)
-  Best:    1000.0 tok/s, TTFT=20.00s (20,000 tokens)
+  Run 1:  1003.0 tok/s, TTFT=19.94s (20,000 tokens)
+  Run 2:  900.8 tok/s, TTFT=38.86s (35,000 tokens)
+  Run 3:  799.9 tok/s, TTFT=62.51s (50,000 tokens)
+  Best:    1003.0 tok/s, TTFT=19.94s (20,000 tokens)
 
 Decode (64 tokens, 3 runs, different prompts):
-  Run 1:  13.50 tok/s (74.1ms/tok)
-  Run 2:  10.89 tok/s (91.8ms/tok)
-  Run 3:  11.37 tok/s (87.9ms/tok)
-  Average: 11.92 tok/s (84.6ms/tok)
+  Run 1:  12.55 tok/s (79.7ms/tok)
+  Run 2:  11.32 tok/s (88.3ms/tok)
+  Run 3:  15.04 tok/s (66.5ms/tok)
+  Average: 12.97 tok/s (78.2ms/tok)
 
 Verification:
   Prefill prompt: Summarise the following in one paragraph: THE COUNT OF MONTE CRISTO
@@ -53,7 +53,7 @@ Chapter 2. Father and Son
 Chapter 3. The Cat... [77314 chars total]
   Decode prompt:  Explain how public key cryptography works, including the RSA algorithm and why it is considered secure.
   Generated output (64 tokens):
-    Public key cryptography (also called **asymmetric cryptography**) is a cryptographic system that uses a pair of mathematically linked keys: a **public key** (shared openly) and a **private key** (kept secret). Unlike symmetric-key cryptography (where the same key encrypts and decrypts), here, what one
+    Public key cryptography (also called **asymmetric cryptography**) is a cryptographic system that uses a pair of mathematically linked keys: a **public key** (freely shared) and a **private key** (kept secret). Unlike symmetric-key cryptography (where the same key encrypts and decrypts), here, encryption
 ================================================================
 
 ────────────────────────────────────────────────────────────────
@@ -61,12 +61,12 @@ Chapter 3. The Cat... [77314 chars total]
 ────────────────────────────────────────────────────────────────
                                          Engine        Network   Overhead
   ────────────────────────────── ────────────── ────────────── ──────────
-  Prefill (best tok/s)                 1000.0          929.5       -7.1%
-  TTFT (s)                              20.00          21.52     +1520ms
-    20,000 tokens                      1000.0          929.5       -7.1%
-    35,000 tokens                       911.0          730.6      -19.8%
-    50,000 tokens                       808.4          773.4       -4.3%
+  Prefill (best tok/s)                 1003.0          932.0       -7.1%
+  TTFT (s)                              19.94          21.46     +1520ms
+    20,000 tokens                      1003.0          932.0       -7.1%
+    35,000 tokens                       900.8          724.4      -19.6%
+    50,000 tokens                       799.9          775.0       -3.1%
 
-  Decode (avg tok/s)                    11.92          15.87      +33.1%
-  Decode (ms/tok)                        84.6           63.1     -21.5ms
+  Decode (avg tok/s)                    12.97          12.13       -6.5%
+  Decode (ms/tok)                        78.2           82.6      +4.4ms
 ────────────────────────────────────────────────────────────────

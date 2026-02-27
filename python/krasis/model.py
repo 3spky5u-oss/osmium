@@ -2629,40 +2629,18 @@ class KrasisModel:
         max_retries = 0 if not getattr(self, '_oom_retry_enabled', True) else 3
         freed_graphs = False
 
-        # Identify caller for instrumentation
-        import traceback as _tb
-        _caller = "unknown"
-        for _frame in _tb.extract_stack():
-            if "server_prefill" in _frame.name:
-                _caller = "server_prefill"
-                break
-            if "generate" in _frame.name:
-                _caller = "generate"
-                break
-
         # Defragment the PyTorch allocator before prefill.  Decode leaves many
         # small cached-but-free blocks that prevent contiguous DMA allocations.
         # This reclaims those blocks so layer group DMA can allocate freely.
-        torch.cuda.synchronize()
-        _t_ec = time.perf_counter()
         torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        _ec_ms = (time.perf_counter() - _t_ec) * 1000
-        logger.info("[prefill_instr] caller=%s empty_cache=%.1fms M=%d", _caller, _ec_ms, token_ids.shape[0])
 
         for attempt in range(max_retries + 1):
             try:
-                _t_fwd = time.perf_counter()
                 result = self.forward_prefill_layer_grouped(
                     token_ids, positions, seq_states,
                     max_chunk_override=max_chunk_override,
                     return_all_logits=return_all_logits,
                 )
-                torch.cuda.synchronize()
-                _fwd_ms = (time.perf_counter() - _t_fwd) * 1000
-                logger.info("[prefill_instr] caller=%s forward_grouped=%.1fms M=%d (%.0f tok/s)",
-                            _caller, _fwd_ms, token_ids.shape[0],
-                            token_ids.shape[0] / (_fwd_ms / 1000) if _fwd_ms > 0 else 0)
 
                 # Re-capture CUDA graphs if we freed them during OOM recovery.
                 # Prefill is done so the activation VRAM is free again.
@@ -3506,8 +3484,6 @@ class KrasisModel:
             cpu_decoder = self._cpu_decoder
             cpu_decoder.prepare(seq_states_per_rank, max_new_tokens)
 
-            _t_decode_start = time.perf_counter()
-
             decode_tokens = cpu_decoder._store.generate_batch(
                 first_token=next_token,
                 start_position=len(prompt_tokens),
@@ -3521,10 +3497,10 @@ class KrasisModel:
             generated.extend(decode_tokens)
 
         finally:
-            torch.cuda.synchronize()
+            # Use Rust-internal timing (same Instant timer as network path)
             n_decode = len(generated) - 1  # First token is from prefill
             if n_decode > 0:
-                self._last_decode_time = time.perf_counter() - _t_decode_start
+                self._last_decode_time = cpu_decoder._store.last_decode_elapsed_s
                 self._last_decode_tok_s = n_decode / self._last_decode_time
             else:
                 self._last_decode_time = 0.0
@@ -3639,6 +3615,7 @@ class KrasisModel:
         r = _Result()
         r.first_token = first_token
         r.prompt_len = len(prompt_tokens)
+        r.prefill_time = prefill_time
         r.stop_ids = stop_ids
         r.store_addr = store_addr
         return r

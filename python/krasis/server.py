@@ -115,31 +115,43 @@ def _build_heatmap(model: KrasisModel, save_path: str) -> str:
 def _warmup_model(model: KrasisModel):
     """Run a short generation to warm up GPU kernels, expert DMA, and CUDA caches.
 
-    This ensures the first real user request runs at normal speed instead of
-    paying cold-start penalties (kernel compilation, first DMA, etc.).
+    Uses server_prefill + generate_batch + server_cleanup — the same path
+    as real HTTP requests, so all kernels get compiled for the production path.
     """
-    import torch
+    import json as _json
 
     logger.info("Warming up model (short generation)...")
     t0 = time.time()
 
     try:
-        # Use generate() which handles all state setup/cleanup (KV, linear attn, etc.)
-        warmup_tokens = model.tokenizer.apply_chat_template(
-            [{"role": "user", "content": "Hi"}]
+        messages_json = _json.dumps([{"role": "user", "content": "Hi"}])
+        result = model.server_prefill(
+            messages_json, max_new_tokens=5, temperature=0.6, top_k=50,
+            top_p=0.95, presence_penalty=0.0,
+            enable_thinking=False, extra_stop_tokens=[],
         )
-        with torch.inference_mode():
-            model.generate(
-                warmup_tokens,
-                max_new_tokens=5,
+        if result.first_token not in result.stop_ids:
+            model._cpu_decoder._store.generate_batch(
+                first_token=result.first_token,
+                start_position=result.prompt_len,
+                max_tokens=4,
                 temperature=0.6,
+                top_k=50,
+                top_p=0.95,
+                stop_ids=result.stop_ids,
+                presence_penalty=0.0,
             )
+        model.server_cleanup()
 
         elapsed = time.time() - t0
         logger.info("Warmup complete (%.1fs) — server ready at full speed", elapsed)
     except Exception as e:
         logger.warning("Warmup failed (non-fatal): %s", e)
-        # generate() cleans up its own state in its finally block
+        # Try to cleanup even on failure
+        try:
+            model.server_cleanup()
+        except Exception:
+            pass
 
 
 _registry_file: Optional[Path] = None

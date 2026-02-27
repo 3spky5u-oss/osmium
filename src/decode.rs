@@ -219,6 +219,8 @@ pub struct CpuDecodeStore {
     mmap_regions: Vec<(usize, usize)>,
     /// Cancellation flag — checked each iteration in generate_stream.
     cancel_flag: Arc<AtomicBool>,
+    /// Last decode elapsed time (seconds), measured by Rust Instant timer inside generate_batch.
+    last_decode_elapsed_s: f64,
 }
 
 #[pymethods]
@@ -241,8 +243,15 @@ impl CpuDecodeStore {
             route_corrected: Vec::new(),
             decode_graph: None,
             mmap_regions: Vec::new(),
+            last_decode_elapsed_s: 0.0,
             cancel_flag: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Last decode elapsed time in seconds, measured by Rust Instant inside generate_batch/generate_stream.
+    #[getter]
+    pub fn last_decode_elapsed_s(&self) -> f64 {
+        self.last_decode_elapsed_s
     }
 
     /// Signal the generate_loop to stop after the current token.
@@ -3573,6 +3582,7 @@ impl CpuDecodeStore {
         }
 
         let elapsed = decode_start.elapsed().as_secs_f64();
+        self.last_decode_elapsed_s = elapsed;
         if !result.is_empty() {
             let tps = result.len() as f64 / elapsed;
             log::info!("generate_batch: {} tokens in {:.2}s ({:.1} tok/s)",
@@ -3683,6 +3693,7 @@ impl CpuDecodeStore {
         }
 
         let elapsed = decode_start.elapsed().as_secs_f64();
+        self.last_decode_elapsed_s = elapsed;
         if generated > 0 {
             let tps = generated as f64 / elapsed;
             log::info!("generate_stream: {} tokens in {:.2}s ({:.1} tok/s)",

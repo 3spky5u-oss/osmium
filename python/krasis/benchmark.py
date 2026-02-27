@@ -232,12 +232,6 @@ class KrasisBenchmark:
             f"Benchmark prompt file '{filename}' not found at {prompt_path}"
         )
 
-    def _make_short_prompt(self) -> List[int]:
-        """Build decode prompt from file."""
-        content = self._load_prompt_file("decode_prompt")
-        messages = [{"role": "user", "content": content}]
-        return self.model.tokenizer.apply_chat_template(messages, enable_thinking=False)
-
     def _kv_cache_max_tokens(self) -> int:
         """Return the maximum number of tokens the KV cache can hold."""
         for cache in self.model.kv_caches:
@@ -374,34 +368,83 @@ class KrasisBenchmark:
         return prompts, content_texts
 
     # ──────────────────────────────────────────────────────────
+    # Core engine request (same path as network, minus HTTP)
+    # ──────────────────────────────────────────────────────────
+
+    def _engine_request(
+        self, content_text: str, max_new_tokens: int,
+        temperature: float = 0.6, top_k: int = 50,
+    ) -> Dict:
+        """Run a request through the exact same path as the Rust HTTP server.
+
+        Calls server_prefill() → generate_batch() → server_cleanup().
+        The ONLY difference vs the network path is no HTTP/SSE transport.
+        Timing uses Rust's Instant clock (same as the server).
+        """
+        messages = [{"role": "user", "content": content_text}]
+        messages_json = json.dumps(messages)
+
+        result = self.model.server_prefill(
+            messages_json, max_new_tokens, temperature, top_k,
+            top_p=0.95, presence_penalty=0.0,
+            enable_thinking=False, extra_stop_tokens=[],
+        )
+
+        generated = [result.first_token]
+        decode_time = 0.0
+
+        if max_new_tokens > 1 and result.first_token not in result.stop_ids:
+            store = self.model._cpu_decoder._store
+            decode_tokens = store.generate_batch(
+                first_token=result.first_token,
+                start_position=result.prompt_len,
+                max_tokens=max_new_tokens - 1,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=0.95,
+                stop_ids=result.stop_ids,
+                presence_penalty=0.0,
+            )
+            generated.extend(decode_tokens)
+            decode_time = store.last_decode_elapsed_s
+
+        prefill_time = result.prefill_time
+        prompt_len = result.prompt_len
+
+        self.model.server_cleanup()
+
+        return {
+            "prompt_len": prompt_len,
+            "prefill_time": prefill_time,
+            "generated": generated,
+            "decode_time": decode_time,
+        }
+
+    # ──────────────────────────────────────────────────────────
     # Benchmark phases
     # ──────────────────────────────────────────────────────────
 
     def _warmup(self):
         """Run 2 short generations to warm up CUDA graphs and caches."""
         print("  Warmup: 2 short generations...")
-        short = self._make_short_prompt()
         for i in range(2):
-            self.model.generate(short, max_new_tokens=8, temperature=0.6, top_k=50)
+            self._engine_request("Hello, how are you?", max_new_tokens=8)
         print("  Warmup complete.")
 
-    def _benchmark_prefill(self, prompts: List[List[int]]) -> Dict:
+    def _benchmark_prefill(self, prompt_texts: List[str]) -> Dict:
         """Measure prefill speed — one run per prompt (each may be different length).
 
-        Reports the **best** (maximum) tok/s across runs, along with
-        the TTFT from that best run.
+        Uses server_prefill() + server_cleanup() — same path as the HTTP server.
+        Reports the **best** (maximum) tok/s across runs.
         """
         runs = []
-        for i, tokens in enumerate(prompts):
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            self.model.generate(tokens, max_new_tokens=1, temperature=0.6)
-            torch.cuda.synchronize()
-            t1 = time.perf_counter()
+        for text in prompt_texts:
+            r = self._engine_request(text, max_new_tokens=1)
 
-            ttft = getattr(self.model, '_last_ttft', t1 - t0)
-            tok_s = len(tokens) / ttft if ttft > 0 else 0
-            runs.append({"ttft": round(ttft, 2), "tok_s": round(tok_s, 1), "num_tokens": len(tokens)})
+            ttft = r["prefill_time"]
+            n_tokens = r["prompt_len"]
+            tok_s = n_tokens / ttft if ttft > 0 else 0
+            runs.append({"ttft": round(ttft, 2), "tok_s": round(tok_s, 1), "num_tokens": n_tokens})
 
         best_run = max(runs, key=lambda r: r["tok_s"])
         return {
@@ -411,24 +454,20 @@ class KrasisBenchmark:
             "runs": runs,
         }
 
-    def _benchmark_decode(self, prompts: List[List[int]]) -> Dict:
-        """Measure decode speed — one run per prompt. Captures output from last run."""
+    def _benchmark_decode(self, prompt_texts: List[str]) -> Dict:
+        """Measure decode speed — one run per prompt. Captures output from last run.
+
+        Uses server_prefill() + generate_batch() + server_cleanup() — same path
+        as the HTTP server. Decode timing from Rust's Instant clock.
+        """
         runs = []
         last_generated_ids = []
-        for i, tokens in enumerate(prompts):
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            generated = self.model.generate(
-                tokens, max_new_tokens=self.decode_tokens,
-                temperature=0.6, top_k=50,
-            )
-            torch.cuda.synchronize()
-            t1 = time.perf_counter()
+        for text in prompt_texts:
+            r = self._engine_request(text, max_new_tokens=self.decode_tokens)
 
-            n_gen = len(generated)
-            # Use internal decode timing (excludes prepare() and cleanup overhead)
-            decode_s = getattr(self.model, '_last_decode_time', 0)
-            n_decode = n_gen - 1  # First token is from prefill
+            generated = r["generated"]
+            n_decode = len(generated) - 1  # First token is from prefill
+            decode_s = r["decode_time"]
             if decode_s > 0 and n_decode > 0:
                 tok_s = n_decode / decode_s
                 ms_per_tok = (decode_s / n_decode) * 1000
@@ -438,7 +477,7 @@ class KrasisBenchmark:
             runs.append({
                 "tok_s": round(tok_s, 2),
                 "ms_per_tok": round(ms_per_tok, 1),
-                "n_gen": n_gen,
+                "n_gen": len(generated),
             })
             last_generated_ids = generated
 
@@ -855,43 +894,41 @@ class KrasisBenchmark:
         lengths_str = "/".join(f"{l//1000}K" for l in self.PREFILL_LENGTHS)
         print(_section(f"Loading benchmark prompts (warmup + timed at {lengths_str})"))
 
-        warmup_prefill, warmup_prefill_texts = self._make_prefill_prompts(self.n_runs, max_tokens_override=25000)
-        timed_prefill, timed_prefill_texts = self._make_prefill_prompts_at_lengths(
+        warmup_prefill_tokens, warmup_prefill_texts = self._make_prefill_prompts(self.n_runs, max_tokens_override=25000)
+        timed_prefill_tokens, timed_prefill_texts = self._make_prefill_prompts_at_lengths(
             self.PREFILL_LENGTHS, file_offset=self.n_runs)
-        decode_prompts, decode_texts = self._make_decode_prompts(self.n_runs * 2)
+        decode_tokens_all, decode_texts_all = self._make_decode_prompts(self.n_runs * 2)
 
-        print(f"  Warmup prefill:  {self.n_runs} prompts, ~{len(warmup_prefill[0]):,} tokens each")
+        print(f"  Warmup prefill:  {self.n_runs} prompts, ~{len(warmup_prefill_tokens[0]):,} tokens each")
         print(f"  Timed prefill:   {n_timed_prefill} prompts at {lengths_str} tokens")
-        for i, p in enumerate(timed_prefill):
+        for i, p in enumerate(timed_prefill_tokens):
             print(f"    [{i+1}] {len(p):,} tokens")
-        print(f"  Decode:          {len(decode_prompts)} prompts")
+        print(f"  Decode:          {len(decode_tokens_all)} prompts")
 
-        warmup_decode = decode_prompts[:self.n_runs]
-        warmup_decode_texts = decode_texts[:self.n_runs]
-        timed_decode = decode_prompts[self.n_runs:]
-        timed_decode_texts = decode_texts[self.n_runs:]
+        warmup_decode_texts = decode_texts_all[:self.n_runs]
+        timed_decode_texts = decode_texts_all[self.n_runs:]
 
         # 3. Warmup — compile kernels + warm caches with DIFFERENT prompts than timed runs
         print(_section(f"Warmup ({self.n_runs} prefill + {self.n_runs} decode, all different prompts)"))
         self._warmup()
         t0 = time.perf_counter()
         print(f"  Prefill warmup ({self.n_runs} runs, ~25K tokens each)...")
-        self._benchmark_prefill(warmup_prefill)
+        self._benchmark_prefill(warmup_prefill_texts)
         print(f"  Decode warmup ({self.n_runs} runs, different prompts)...")
-        self._benchmark_decode(warmup_decode)
+        self._benchmark_decode(warmup_decode_texts)
         warmup_s = time.perf_counter() - t0
         print(f"  Warmup complete ({warmup_s:.1f}s). All kernels compiled.")
 
         # 4. Prefill benchmark (timed — different lengths: 20K/35K/50K tokens)
         print(_section(f"Running prefill benchmark ({lengths_str} tokens, {n_timed_prefill} runs)"))
-        prefill_result = self._benchmark_prefill(timed_prefill)
+        prefill_result = self._benchmark_prefill(timed_prefill_texts)
         for i, run in enumerate(prefill_result["runs"]):
             print(f"  Run {i+1}: {run['tok_s']:.1f} tok/s, TTFT={run['ttft']:.2f}s ({run['num_tokens']:,} tokens)")
         print(f"  {BOLD}Best: {prefill_result['best_tok_s']:.1f} tok/s, TTFT={prefill_result['best_ttft']:.2f}s ({prefill_result['best_num_tokens']:,} tokens){NC}")
 
         # 5. Decode benchmark (timed — different prompts from warmup)
         print(_section(f"Running decode benchmark ({self.decode_tokens} tokens, {self.n_runs} runs, different prompts)"))
-        decode_result = self._benchmark_decode(timed_decode)
+        decode_result = self._benchmark_decode(timed_decode_texts)
         for i, run in enumerate(decode_result["runs"]):
             print(f"  Run {i+1}: {run['tok_s']:.2f} tok/s ({run['ms_per_tok']:.1f}ms/tok)")
         print(f"  {BOLD}Average: {decode_result['avg_tok_s']:.2f} tok/s ({decode_result['avg_ms_per_tok']:.1f}ms/tok){NC}")
@@ -908,14 +945,14 @@ class KrasisBenchmark:
             print(f"  Server running on {bench_host}:{bench_port}")
 
             # Network warmup — send text through HTTP (same as real client)
-            n_prefill_warmup = len(warmup_prefill)
+            n_prefill_warmup = len(warmup_prefill_tokens)
             print(_section(f"Network warmup ({n_prefill_warmup} prefill + {self.n_runs} decode requests)"))
-            for i, (tokens, text) in enumerate(zip(warmup_prefill, warmup_prefill_texts)):
+            for i, (tokens, text) in enumerate(zip(warmup_prefill_tokens, warmup_prefill_texts)):
                 self._network_request(bench_host, bench_port, text, len(tokens),
                                       max_new_tokens=1)
                 print(f"  Prefill warmup {i+1}/{n_prefill_warmup} complete ({len(tokens):,} tokens)")
-            for i, (tokens, text) in enumerate(zip(warmup_decode, warmup_decode_texts)):
-                self._network_request(bench_host, bench_port, text, len(tokens),
+            for i, text in enumerate(warmup_decode_texts):
+                self._network_request(bench_host, bench_port, text, 0,
                                       max_new_tokens=8)
                 print(f"  Decode warmup {i+1}/{self.n_runs} complete")
             print(f"  Network warmup complete.")
@@ -923,7 +960,7 @@ class KrasisBenchmark:
             # Network prefill (text through HTTP, same enable_thinking=False as engine)
             print(_section(f"Network prefill benchmark ({lengths_str} tokens)"))
             net_prefill_result = self._benchmark_network_prefill(
-                timed_prefill, timed_prefill_texts,
+                timed_prefill_tokens, timed_prefill_texts,
                 bench_host, bench_port)
             for i, run in enumerate(net_prefill_result["runs"]):
                 print(f"  Run {i+1}: {run['tok_s']:.1f} tok/s, TTFT={run['ttft']:.2f}s ({run['num_tokens']:,} tokens)")
@@ -932,7 +969,7 @@ class KrasisBenchmark:
             # Network decode (text through HTTP, same enable_thinking=False as engine)
             print(_section(f"Network decode benchmark ({self.decode_tokens} tokens, {self.n_runs} runs)"))
             net_decode_result = self._benchmark_network_decode(
-                timed_decode, timed_decode_texts,
+                decode_tokens_all[self.n_runs:], timed_decode_texts,
                 bench_host, bench_port)
             for i, run in enumerate(net_decode_result["runs"]):
                 print(f"  Run {i+1}: {run['tok_s']:.2f} tok/s ({run['ms_per_tok']:.1f}ms/tok)")
