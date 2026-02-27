@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-02-27 08:04:25
+Krasis Benchmark — 2026-02-27 08:31:44
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -21,20 +21,20 @@ Quantization:
 
 Strategy:
   Layer group size: 2 (layer_grouped(2) + stream_attn)
-  Prefill threshold: 500
+  Prefill threshold: 300
   Mode:           pure_cpu decode, layer_grouped(2) + stream_attn prefill
 
 Prefill (3 runs at different lengths):
-  Run 1:  985.5 tok/s, TTFT=20.29s (20,000 tokens)
-  Run 2:  906.3 tok/s, TTFT=38.62s (35,000 tokens)
-  Run 3:  807.3 tok/s, TTFT=61.93s (50,000 tokens)
-  Best:    985.5 tok/s, TTFT=20.29s (20,000 tokens)
+  Run 1:  1000.0 tok/s, TTFT=20.00s (20,000 tokens)
+  Run 2:  911.0 tok/s, TTFT=38.42s (35,000 tokens)
+  Run 3:  808.4 tok/s, TTFT=61.85s (50,000 tokens)
+  Best:    1000.0 tok/s, TTFT=20.00s (20,000 tokens)
 
 Decode (64 tokens, 3 runs, different prompts):
-  Run 1:  10.96 tok/s (91.3ms/tok)
-  Run 2:  10.70 tok/s (93.5ms/tok)
-  Run 3:  10.17 tok/s (98.3ms/tok)
-  Average: 10.61 tok/s (94.4ms/tok)
+  Run 1:  13.50 tok/s (74.1ms/tok)
+  Run 2:  10.89 tok/s (91.8ms/tok)
+  Run 3:  11.37 tok/s (87.9ms/tok)
+  Average: 11.92 tok/s (84.6ms/tok)
 
 Verification:
   Prefill prompt: Summarise the following in one paragraph: THE COUNT OF MONTE CRISTO
@@ -53,13 +53,7 @@ Chapter 2. Father and Son
 Chapter 3. The Cat... [77314 chars total]
   Decode prompt:  Explain how public key cryptography works, including the RSA algorithm and why it is considered secure.
   Generated output (64 tokens):
-    Public key cryptography (also called **asymmetric cryptography**) is a cryptographic system that uses a pair of mathematically linked keys—**a public key** and a **private key**—to enable secure communication without requiring the parties to share a secret key beforehand.
-    
-    ---
-    
-    ### 🔑 Core Concepts
-    
-    | Component | Description
+    Public key cryptography (also called **asymmetric cryptography**) is a cryptographic system that uses a pair of mathematically linked keys: a **public key** (shared openly) and a **private key** (kept secret). Unlike symmetric-key cryptography (where the same key encrypts and decrypts), here, what one
 ================================================================
 
 ────────────────────────────────────────────────────────────────
@@ -67,12 +61,12 @@ Chapter 3. The Cat... [77314 chars total]
 ────────────────────────────────────────────────────────────────
                                          Engine        Network   Overhead
   ────────────────────────────── ────────────── ────────────── ──────────
-  Prefill (best tok/s)                  985.5          777.4      -21.1%
-  TTFT (s)                              20.29          64.32    +44030ms
-    20,000 tokens                       985.5          458.0      -53.5%
-    35,000 tokens                       906.3          728.4      -19.6%
-    50,000 tokens                       807.3          777.4       -3.7%
+  Prefill (best tok/s)                 1000.0          929.5       -7.1%
+  TTFT (s)                              20.00          21.52     +1520ms
+    20,000 tokens                      1000.0          929.5       -7.1%
+    35,000 tokens                       911.0          730.6      -19.8%
+    50,000 tokens                       808.4          773.4       -4.3%
 
-  Decode (avg tok/s)                    10.61          12.54      +18.2%
-  Decode (ms/tok)                        94.4           79.7     -14.7ms
+  Decode (avg tok/s)                    11.92          15.87      +33.1%
+  Decode (ms/tok)                        84.6           63.1     -21.5ms
 ────────────────────────────────────────────────────────────────

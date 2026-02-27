@@ -70,42 +70,7 @@ resolve_config() {
     esac
 }
 
-# Parse a .conf file into server.py CLI args
-conf_to_args() {
-    local conf="$1"
-    local args=""
-    while IFS='=' read -r key value; do
-        # Skip comments and empty lines
-        [[ "$key" =~ ^#.*$ || -z "$key" ]] && continue
-        # Strip quotes from value
-        value="${value%\"}"
-        value="${value#\"}"
-        # Skip empty values
-        [[ -z "$value" ]] && continue
-
-        case "$key" in
-            MODEL_PATH)             args="$args --model-path $value" ;;
-            CFG_SELECTED_GPUS)      args="$args --selected-gpus $value" ;;
-            CFG_PP_PARTITION)       args="$args --pp-partition $value" ;;
-            CFG_LAYER_GROUP_SIZE)   args="$args --layer-group-size $value" ;;
-            CFG_KV_DTYPE)           args="$args --kv-dtype $value" ;;
-            CFG_GPU_EXPERT_BITS)    args="$args --gpu-expert-bits $value" ;;
-            CFG_CPU_EXPERT_BITS)    args="$args --cpu-expert-bits $value" ;;
-            CFG_ATTENTION_QUANT)    args="$args --attention-quant $value" ;;
-            CFG_SHARED_EXPERT_QUANT) args="$args --shared-expert-quant $value" ;;
-            CFG_DENSE_MLP_QUANT)    args="$args --dense-mlp-quant $value" ;;
-            CFG_LM_HEAD_QUANT)      args="$args --lm-head-quant $value" ;;
-            CFG_KRASIS_THREADS)     args="$args --krasis-threads $value" ;;
-            CFG_HOST)               args="$args --host $value" ;;
-            CFG_PORT)               args="$args --port $value" ;;
-            CFG_GPU_PREFILL_THRESHOLD) args="$args --gpu-prefill-threshold $value" ;;
-            CFG_GGUF_PATH)          [[ -n "$value" ]] && args="$args --gguf-path $value" ;;
-            CFG_FORCE_LOAD)         [[ -n "$value" ]] && args="$args --force-load" ;;
-            CFG_ENABLE_THINKING)    [[ "$value" == "true" ]] && args="$args --enable-thinking" || args="$args --no-enable-thinking" ;;
-        esac
-    done < "$conf"
-    echo "$args"
-}
+# No need for conf_to_args — server.py has native --config support
 
 # Extract port from a .conf file
 conf_port() {
@@ -156,7 +121,8 @@ auto_rebuild() {
 do_build() {
     info "Building Rust extension (maturin develop --release)..."
     cd "$SCRIPT_DIR"
-    "$MATURIN" develop --release -i "$PYTHON" 2>&1
+    VIRTUAL_ENV="$(dirname "$(dirname "$PYTHON")")" PATH="$(dirname "$PYTHON"):$PATH" \
+        "$MATURIN" develop --release 2>&1
     ok "Build complete. Extension at: $SO_FILE"
 }
 
@@ -166,11 +132,8 @@ do_run() {
     conf=$(resolve_config "$1")
     shift
     auto_rebuild
-    local args
-    args=$(conf_to_args "$conf")
     info "Launching from: $conf"
-    info "Args: $args $*"
-    exec "$PYTHON" -m krasis.server $args "$@"
+    exec "$PYTHON" -m krasis.server --config "$conf" "$@"
 }
 
 do_test() {
@@ -185,9 +148,6 @@ do_test() {
     port=$(conf_port "$conf")
     [[ -z "$port" ]] && port=8012
 
-    local args
-    args=$(conf_to_args "$conf")
-
     info "=== Short Model Test ==="
     info "Config: $conf"
     info "Port: $port"
@@ -198,7 +158,7 @@ do_test() {
     logfile=$(mktemp /tmp/krasis_test_XXXXXX.log)
     info "Log: $logfile"
 
-    "$PYTHON" -m krasis.server $args --benchmark > >(tee "$logfile") 2>&1 &
+    "$PYTHON" -m krasis.server --config "$conf" --benchmark > >(tee "$logfile") 2>&1 &
     local pid=$!
 
     # Wait for server to be ready (benchmark completes, server starts)

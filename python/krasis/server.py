@@ -401,7 +401,7 @@ def main():
         layer_group_size=args.layer_group_size,
         gguf_path=args.gguf_path,
         force_load=args.force_load,
-        gpu_prefill_threshold=1 if args.hcs else int(os.environ.get("KRASIS_PREFILL_THRESHOLD", "500")),
+        gpu_prefill_threshold=1 if args.hcs else getattr(args, 'gpu_prefill_threshold', int(os.environ.get("KRASIS_PREFILL_THRESHOLD", "500"))),
         kv_cache_mb=args.kv_cache_mb,
         stream_attention=not args.no_stream_attention,
     )
