@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-02-27 11:53:33
+Krasis Benchmark — 2026-02-27 14:13:52
 ================================================================
 Model:            Qwen3.5-35B-A3B
 Architecture:     qwen3_5_moe_text, 40 layers, 256 experts, top-8, 10 GQA + 30 linear
@@ -7,7 +7,7 @@ PP Partition:     [40] (1 GPUs)
 
 Hardware:
   CPU:            AMD EPYC 7742 64-Core Processor (64 cores)
-  RAM:            1007 GB total, 41.9 GB used by process
+  RAM:            1007 GB total, 42.2 GB used by process
   GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 4209 MB allocated
 
 Quantization:
@@ -21,20 +21,20 @@ Quantization:
 
 Strategy:
   Layer group size: 2 (layer_grouped(2) + stream_attn)
-  Prefill threshold: 300
+  Prefill threshold: 500
   Mode:           pure_cpu decode, layer_grouped(2) + stream_attn prefill
 
 Prefill (3 runs at different lengths):
-  Run 1:  1320.7 tok/s, TTFT=15.52s (20,491 tokens)
-  Run 2:  1055.8 tok/s, TTFT=33.19s (35,045 tokens)
-  Run 3:  1015.2 tok/s, TTFT=49.13s (49,882 tokens)
-  Best:    1320.7 tok/s, TTFT=15.52s (20,491 tokens)
+  Run 1:  522.1 tok/s, TTFT=39.25s (20,491 tokens)
+  Run 2:  1057.3 tok/s, TTFT=33.14s (35,045 tokens)
+  Run 3:  1019.8 tok/s, TTFT=48.92s (49,882 tokens)
+  Best:    1057.3 tok/s, TTFT=33.14s (35,045 tokens)
 
 Decode (64 tokens, 3 runs, different prompts):
-  Run 1:  13.27 tok/s (75.4ms/tok)
-  Run 2:  18.37 tok/s (54.4ms/tok)
-  Run 3:  15.75 tok/s (63.5ms/tok)
-  Average: 15.80 tok/s (64.4ms/tok)
+  Run 1:  14.12 tok/s (70.8ms/tok)
+  Run 2:  14.95 tok/s (66.9ms/tok)
+  Run 3:  14.69 tok/s (68.1ms/tok)
+  Average: 14.59 tok/s (68.6ms/tok)
 
 Verification:
   Prefill prompt: Summarise the following in one paragraph: THE COUNT OF MONTE CRISTO
@@ -53,7 +53,7 @@ Chapter 2. Father and Son
 Chapter 3. The Cat... [75971 chars total]
   Decode prompt:  Explain how public key cryptography works, including the RSA algorithm and why it is considered secure.
   Generated output (64 tokens):
-    Public key cryptography, also known as **asymmetric cryptography**, is a fundamental pillar of modern digital security. Unlike symmetric encryption, which uses a single shared secret key for both encryption and decryption, public key cryptography uses a **pair** of mathematically linked keys: a **Public Key** and a **Private Key**.
+    Public-key cryptography (also known as asymmetric cryptography) is a fundamental technology that allows secure communication over insecure channels without the need to share a secret key beforehand. Unlike symmetric encryption, which uses the same key for both encryption and decryption, public-key cryptography uses a **pair** of mathematically linked keys: a **public
 ================================================================
 
 ────────────────────────────────────────────────────────────────
@@ -61,12 +61,12 @@ Chapter 3. The Cat... [75971 chars total]
 ────────────────────────────────────────────────────────────────
                                          Engine        Network   Overhead
   ────────────────────────────── ────────────── ────────────── ──────────
-  Prefill (best tok/s)                 1320.7         1210.0       -8.4%
-  TTFT (s)                              15.52          16.53     +1010ms
-    20,491 tokens                      1320.7         1210.0       -8.4%
-    35,045 tokens                      1055.8         1019.4       -3.4%
-    49,882 tokens                      1015.2          974.2       -4.0%
+  Prefill (best tok/s)                 1057.3          988.1       -6.5%
+  TTFT (s)                              33.14          35.42     +2280ms
+    20,491 tokens                       522.1          494.2       -5.3%
+    35,045 tokens                      1057.3          988.1       -6.5%
+    49,882 tokens                      1019.8          957.3       -6.1%
 
-  Decode (avg tok/s)                    15.80          17.21       +8.9%
-  Decode (ms/tok)                        64.4           58.7      -5.7ms
+  Decode (avg tok/s)                    14.59          16.33      +11.9%
+  Decode (ms/tok)                        68.6           61.4      -7.2ms
 ────────────────────────────────────────────────────────────────

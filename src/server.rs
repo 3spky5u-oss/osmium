@@ -15,6 +15,25 @@ use std::sync::Arc;
 use std::time::Instant;
 use std::sync::mpsc;
 
+/// Global pointer to the server's `running` flag so the raw SIGINT handler
+/// can set it to `false` without going through Python's signal mechanism.
+/// This is only written once (before the accept loop) and read from the
+/// signal handler, so the raw pointer is safe in practice.
+static SIGINT_RUNNING: AtomicBool = AtomicBool::new(false);
+static SIGINT_FLAG_PTR: std::sync::atomic::AtomicPtr<AtomicBool> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+extern "C" fn sigint_handler(_sig: libc::c_int) {
+    let ptr = SIGINT_FLAG_PTR.load(Ordering::Acquire);
+    if !ptr.is_null() {
+        // Safety: ptr points to the Arc<AtomicBool>'s inner value,
+        // which outlives this handler (server.run() is still on the stack).
+        unsafe { &*ptr }.store(false, Ordering::Release);
+    }
+    // Also set our own flag so we can detect it was us
+    SIGINT_RUNNING.store(true, Ordering::Release);
+}
+
 /// Server state shared across request handling.
 struct ServerState {
     py_model: Py<PyAny>,
@@ -584,6 +603,26 @@ impl RustServer {
         let default_enable_thinking = self.default_enable_thinking;
         let running = self.running.clone();
 
+        // Install raw SIGINT handler BEFORE releasing the GIL.
+        // Python's signal.signal handlers only dispatch between bytecodes,
+        // but run() enters allow_threads (native Rust) so Python never gets
+        // a chance to run the handler.  The raw handler sets `running` to
+        // false directly, and the accept loop exits on the next 10ms poll.
+        let running_ptr = Arc::as_ptr(&self.running) as *mut AtomicBool;
+        SIGINT_FLAG_PTR.store(running_ptr, Ordering::Release);
+
+        // Save previous handler so we can restore it
+        let prev_handler;
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = sigint_handler as *const () as usize;
+            libc::sigemptyset(&mut sa.sa_mask);
+            sa.sa_flags = libc::SA_RESTART;
+            let mut old_sa: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(libc::SIGINT, &sa, &mut old_sa);
+            prev_handler = old_sa;
+        }
+
         // Release GIL — server loop runs without it.
         // GIL is reacquired inside handle_request only for Python prefill/cleanup.
         py.allow_threads(move || {
@@ -645,6 +684,12 @@ impl RustServer {
 
             log::info!("Rust HTTP server stopped");
         });
+
+        // Restore previous SIGINT handler and clear global pointer
+        SIGINT_FLAG_PTR.store(std::ptr::null_mut(), Ordering::Release);
+        unsafe {
+            libc::sigaction(libc::SIGINT, &prev_handler, std::ptr::null_mut());
+        }
 
         Ok(())
     }
