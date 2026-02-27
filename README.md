@@ -101,9 +101,10 @@ Measured with INT4 GPU + INT4 CPU experts (Q4), BF16 attention, INT8 shared/MLP/
 
 Benchmark uses 10K–50K token prompts (prefill) and 64-token generation runs (decode). Prefill speed is best of 20K/35K/50K. Decode is average of 3 runs with different prompts.
 
-| Model | Expert Quant | Prefill (tok/s) | TTFT | Decode (tok/s) | ms/tok |
-|-------|:------------:|:---------------:|:----------:|:--------------:|:------:|
-| **Qwen3-Coder-Next** | INT4 GPU + INT4 CPU | 3,595 | 9.7s | 14.7 | 68 |
+| Model | Expert Quant | Prefill (tok/s) | Decode (tok/s) | ms/tok | Notes |
+|-------|:------------:|:---------------:|:--------------:|:------:|
+| **Qwen3-Coder-Next** | INT4 GPU + INT4 CPU | 3,595 | 14.7 | 68 | - |
+| **Qwen3.5-35B-A3B**  | INT4 GPU + INT4 CPU | 2,295 | 7.11 | 140 | (Windows via WSL) |
 | **DeepSeek V2-Lite** | INT4 GPU + INT4 CPU | - | - | - | - |
 
 ## Benchmark: EPYC 7742 + 1x RTX 2000 Ada 16 GB
