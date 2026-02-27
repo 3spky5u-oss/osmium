@@ -14,7 +14,7 @@ Krasis can run MoE language models that are much too large to fit in a consumer 
 
 **Most importantly, it runs these models at usable speeds.**
 
-## Qwen3-Coder-Next Results (80B params, 3595 tok/sec prefill on 1x 5080 16GB)
+## Qwen3-Coder-Next Results (80B params, 3324 tok/sec prefill on 1x 5080 16GB)
 
 Qwen3-Coder-Next (80B params, 148 GB BF16) is a model which will clearly not fit inside a single consumer GPU unless very heavily quantised to Q2 or less.
 
@@ -22,7 +22,7 @@ At Q4 Qwen3-Coder-Next is around 37GB, too much to fit on even the largest consu
 
 Krasis is able to run Qwen3-Coder-Next (Q4 quantised) with **one 16GB GPU** at the following speeds:
 
-- 5900X, 3200 DDR4, 1x 5080 16GB (PCIE4.0x16) : **3595 tok/sec prefill, 14.7 tok/sec decode**
+- 5900X, 3200 DDR4, 1x 5080 16GB (PCIE4.0x16) : **3324 tok/sec prefill, 14.93 tok/sec decode**
 - Epyc 7742, 2666 DDR4, 1x RTX Ada 2000 16GB (PCIE4.0x8) : **1060 tok/sec prefill, 18.9 tok/sec decode**
 
 Krasis can likely run QCN at speed with even lower VRAM limited GPUs than these (further testing is planned).  Qwen 235B will run with a 16GB card given sufficient system RAM (around 230GB).
