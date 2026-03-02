@@ -6,7 +6,6 @@
 //!
 //! Single-request at a time (matches our hardware constraint).
 
-use crate::decode::CpuDecodeStore;
 use crate::gpu_decode::GpuDecodeStore;
 use pyo3::prelude::*;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -42,7 +41,6 @@ struct ServerState {
     tokenizer: tokenizers::Tokenizer,
     max_context_tokens: usize,
     default_enable_thinking: bool,
-    gpu_decode: bool,
     /// Raw pointer to a GpuDecodeStore instance (set from Python during server init).
     /// Safety: single-request guarantee means no concurrent access.
     gpu_store_addr: usize,
@@ -306,8 +304,7 @@ fn handle_chat_completion(
     };
 
     // ── Call Python for prefill (GIL required) ──
-    let decode_mode = if state.gpu_decode { "gpu" } else { "cpu" };
-    let prefill_result = Python::with_gil(|py| -> PyResult<(usize, usize, Vec<usize>, usize)> {
+    let prefill_result = Python::with_gil(|py| -> PyResult<(usize, usize, Vec<usize>)> {
         let result = state.py_model.call_method(
             py,
             "server_prefill",
@@ -320,18 +317,17 @@ fn handle_chat_completion(
                 presence_penalty,
                 enable_thinking,
                 stop_tokens.clone(),
-                decode_mode,
+                "gpu",
             ),
             None,
         )?;
         let first_token: usize = result.getattr(py, "first_token")?.extract(py)?;
         let prompt_len: usize = result.getattr(py, "prompt_len")?.extract(py)?;
         let stop_ids: Vec<usize> = result.getattr(py, "stop_ids")?.extract(py)?;
-        let store_addr: usize = result.getattr(py, "store_addr")?.extract(py)?;
-        Ok((first_token, prompt_len, stop_ids, store_addr))
+        Ok((first_token, prompt_len, stop_ids))
     });
 
-    let (first_token, prompt_len, stop_ids, store_addr) = match prefill_result {
+    let (first_token, prompt_len, stop_ids) = match prefill_result {
         Ok(v) => v,
         Err(e) => {
             log::error!("Prefill failed: {}", e);
@@ -365,32 +361,20 @@ fn handle_chat_completion(
     }
 
     log::info!(
-        "Request {}: {} prompt tokens, max_new={}, stream={}, decode={}",
-        request_id, prompt_len, max_tokens, is_stream, decode_mode
+        "Request {}: {} prompt tokens, max_new={}, stream={}, decode=gpu",
+        request_id, prompt_len, max_tokens, is_stream
     );
 
     let tokenizer = &state.tokenizer;
 
-    if state.gpu_decode {
-        // ── GPU decode: GIL-free Rust decode via GpuDecodeStore ──
-        let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
-        handle_gpu_decode(
-            stream, is_stream, state, store, tokenizer,
-            first_token, prompt_len, max_tokens, temperature,
-            top_k, top_p, presence_penalty, &stop_ids,
-            &request_id, &state.model_name, created,
-        );
-    } else {
-        // ── CPU decode (GIL-free!) ──
-        // Safety: single-request guarantee. store_addr is a valid *mut CpuDecodeStore.
-        let store = unsafe { &mut *(store_addr as *mut CpuDecodeStore) };
-        handle_cpu_decode(
-            stream, is_stream, state, store, tokenizer,
-            first_token, prompt_len, max_tokens, temperature,
-            top_k, top_p, presence_penalty, &stop_ids,
-            &request_id, &state.model_name, created,
-        );
-    }
+    // ── GPU decode: GIL-free Rust decode via GpuDecodeStore ──
+    let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
+    handle_gpu_decode(
+        stream, is_stream, state, store, tokenizer,
+        first_token, prompt_len, max_tokens, temperature,
+        top_k, top_p, presence_penalty, &stop_ids,
+        &request_id, &state.model_name, created,
+    );
 
     // ── Cleanup (GIL required) ──
     Python::with_gil(|py| {
@@ -399,7 +383,7 @@ fn handle_chat_completion(
 }
 
 /// GPU decode: GIL-free Rust decode loop via GpuDecodeStore.
-/// Same pattern as handle_cpu_decode — pure Rust, zero Python per token.
+/// Pure Rust, zero Python per token.
 #[allow(clippy::too_many_arguments)]
 fn handle_gpu_decode(
     stream: &mut TcpStream,
@@ -563,170 +547,6 @@ fn handle_gpu_decode(
     }
 }
 
-/// CPU decode: GIL-free Rust decode loop via CpuDecodeStore.
-#[allow(clippy::too_many_arguments)]
-fn handle_cpu_decode(
-    stream: &mut TcpStream,
-    is_stream: bool,
-    state: &ServerState,
-    store: &mut CpuDecodeStore,
-    tokenizer: &tokenizers::Tokenizer,
-    first_token: usize,
-    prompt_len: usize,
-    max_tokens: usize,
-    temperature: f32,
-    top_k: usize,
-    top_p: f32,
-    presence_penalty: f32,
-    stop_ids: &[usize],
-    request_id: &str,
-    model_name: &str,
-    created: u64,
-) {
-    if is_stream {
-        if let Err(e) = begin_sse(stream) {
-            log::error!("Failed to send SSE headers: {}", e);
-            return;
-        }
-
-        let first_text = tokenizer.decode(&[first_token as u32], true).unwrap_or_default();
-        let chunk = format_sse_token(request_id, model_name, &first_text, None, created);
-        let _ = send_sse_chunk(stream, &chunk);
-
-        let (tx, rx) = mpsc::channel::<String>();
-        let writer_disconnected = Arc::new(AtomicBool::new(false));
-        let writer_disc_clone = writer_disconnected.clone();
-
-        let mut writer_stream = match stream.try_clone() {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("Failed to clone stream for writer: {}", e);
-                return;
-            }
-        };
-
-        let writer_handle = std::thread::spawn(move || {
-            let flush_interval = std::time::Duration::from_millis(100);
-            let mut buf = String::new();
-            let mut last_flush = Instant::now();
-            let mut is_first = true;
-            loop {
-                match rx.recv_timeout(flush_interval) {
-                    Ok(chunk) => {
-                        buf.push_str(&chunk);
-                        if is_first || last_flush.elapsed() >= flush_interval || buf.len() > 8192 {
-                            if writer_stream.write_all(buf.as_bytes()).is_err()
-                                || writer_stream.flush().is_err()
-                            {
-                                writer_disc_clone.store(true, Ordering::Release);
-                                return;
-                            }
-                            buf.clear();
-                            last_flush = Instant::now();
-                            is_first = false;
-                        }
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if !buf.is_empty() {
-                            if writer_stream.write_all(buf.as_bytes()).is_err()
-                                || writer_stream.flush().is_err()
-                            {
-                                writer_disc_clone.store(true, Ordering::Release);
-                                return;
-                            }
-                            buf.clear();
-                            last_flush = Instant::now();
-                        }
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        if !buf.is_empty() {
-                            let _ = writer_stream.write_all(buf.as_bytes());
-                            let _ = writer_stream.flush();
-                        }
-                        return;
-                    }
-                }
-            }
-        });
-
-        let decode_start = Instant::now();
-        let mut decode_token_count = 0usize;
-
-        store.generate_stream(
-            first_token,
-            prompt_len,
-            max_tokens.saturating_sub(1),
-            temperature,
-            top_k,
-            top_p,
-            stop_ids,
-            tokenizer,
-            presence_penalty,
-            |_token_id, text, finish_reason| {
-                decode_token_count += 1;
-                let chunk = format_sse_token(request_id, model_name, text, finish_reason, created);
-                let formatted = format!("data: {}\n\n", chunk);
-                if tx.send(formatted).is_err() || writer_disconnected.load(Ordering::Acquire) {
-                    return false;
-                }
-                true
-            },
-        );
-
-        let elapsed = decode_start.elapsed().as_secs_f64();
-        let total_gen = decode_token_count + 1;
-        let decode_tok_s = if elapsed > 0.0 && decode_token_count > 0 {
-            decode_token_count as f64 / elapsed
-        } else {
-            0.0
-        };
-        let timing_chunk = format!(
-            r#"{{"id":"{}","object":"chat.completion.chunk","created":{},"model":"{}","choices":[],"krasis_timing":{{"decode_tokens":{},"decode_time_ms":{:.1},"decode_tok_s":{:.2},"total_generated":{},"prompt_tokens":{}}}}}"#,
-            request_id, created, model_name,
-            decode_token_count, elapsed * 1000.0, decode_tok_s, total_gen, prompt_len
-        );
-        let _ = tx.send(format!("data: {}\n\n", timing_chunk));
-        let _ = tx.send("data: [DONE]\n\n".to_string());
-        drop(tx);
-        let _ = writer_handle.join();
-
-        log::info!("Request {} CPU streaming complete ({:.2}s, {} tokens, {:.2} tok/s)",
-            request_id, elapsed, total_gen, decode_tok_s);
-    } else {
-        let mut all_text = String::new();
-        let first_text = tokenizer.decode(&[first_token as u32], true).unwrap_or_default();
-        all_text.push_str(&first_text);
-        let mut total_tokens = 1usize;
-        let mut finish = "length".to_string();
-
-        store.generate_stream(
-            first_token,
-            prompt_len,
-            max_tokens.saturating_sub(1),
-            temperature,
-            top_k,
-            top_p,
-            stop_ids,
-            tokenizer,
-            presence_penalty,
-            |_token_id, text, finish_reason| {
-                all_text.push_str(text);
-                total_tokens += 1;
-                if let Some(fr) = finish_reason {
-                    finish = fr.to_string();
-                }
-                true
-            },
-        );
-
-        let response = format_completion(
-            request_id, model_name, &all_text, prompt_len,
-            total_tokens, &finish, created,
-        );
-        let _ = send_json(stream, 200, &response);
-    }
-}
-
 /// The Rust HTTP server, exposed to Python via PyO3.
 #[pyclass]
 pub struct RustServer {
@@ -736,7 +556,6 @@ pub struct RustServer {
     tokenizer_path: String,
     max_context_tokens: usize,
     default_enable_thinking: bool,
-    gpu_decode: bool,
     gpu_store_addr: usize,
     py_model: Py<PyAny>,
     running: Arc<AtomicBool>,
@@ -745,7 +564,7 @@ pub struct RustServer {
 #[pymethods]
 impl RustServer {
     #[new]
-    #[pyo3(signature = (py_model, host, port, model_name, tokenizer_path, max_context_tokens, enable_thinking=true, gpu_decode=true, gpu_store_addr=0))]
+    #[pyo3(signature = (py_model, host, port, model_name, tokenizer_path, max_context_tokens, enable_thinking=true, gpu_store_addr=0))]
     fn new(
         py_model: PyObject,
         host: String,
@@ -754,7 +573,6 @@ impl RustServer {
         tokenizer_path: String,
         max_context_tokens: usize,
         enable_thinking: bool,
-        gpu_decode: bool,
         gpu_store_addr: usize,
     ) -> Self {
         Self {
@@ -764,7 +582,6 @@ impl RustServer {
             tokenizer_path,
             max_context_tokens,
             default_enable_thinking: enable_thinking,
-            gpu_decode,
             gpu_store_addr,
             py_model: py_model.into(),
             running: Arc::new(AtomicBool::new(false)),
@@ -782,7 +599,6 @@ impl RustServer {
         let tokenizer_path = self.tokenizer_path.clone();
         let max_context_tokens = self.max_context_tokens;
         let default_enable_thinking = self.default_enable_thinking;
-        let gpu_decode = self.gpu_decode;
         let gpu_store_addr = self.gpu_store_addr;
         let running = self.running.clone();
 
@@ -839,7 +655,6 @@ impl RustServer {
                 tokenizer,
                 max_context_tokens,
                 default_enable_thinking,
-                gpu_decode,
                 gpu_store_addr,
             };
 

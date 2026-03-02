@@ -198,14 +198,14 @@ def _warmup_prefill(model: KrasisModel):
 
 
 def _warmup_decode(model: KrasisModel, num_steps: int = 4):
-    """Run a short GPU decode warmup after HCS is loaded.
+    """Run a short GPU decode warmup.
 
-    Validates that GPU decode with HCS works correctly.
+    Validates that GPU decode (with or without HCS) works correctly.
+    Uses Rust GpuDecodeStore — zero Python in the decode loop.
     """
     import json as _json
 
-    decode_mode = getattr(model, 'decode_mode', 'gpu')
-    logger.info("Warming up %s decode (%d steps)...", decode_mode.upper(), num_steps)
+    logger.info("Warming up GPU decode (%d steps)...", num_steps)
     _vram_snap("before-decode-warmup")
     t0 = time.time()
 
@@ -215,29 +215,24 @@ def _warmup_decode(model: KrasisModel, num_steps: int = 4):
             messages_json, max_new_tokens=num_steps + 1, temperature=0.6, top_k=50,
             top_p=0.95, presence_penalty=0.0,
             enable_thinking=False, extra_stop_tokens=[],
-            decode_mode=decode_mode,
+            decode_mode="gpu",
         )
         _vram_snap("decode-warmup-after-prefill")
         if result.first_token not in result.stop_ids:
-            if decode_mode == "gpu":
-                next_token = result.first_token
-                for step in range(num_steps):
-                    pos = result.prompt_len + step
-                    next_token = model.server_gpu_decode_step(next_token, pos)
-                    if next_token in result.stop_ids:
-                        break
-                _vram_snap("decode-warmup-after-gpu-decode")
-            elif model._cpu_decoder is not None:
-                model._cpu_decoder._store.generate_batch(
-                    first_token=result.first_token,
-                    start_position=result.prompt_len,
-                    max_tokens=num_steps,
-                    temperature=0.6,
-                    top_k=50,
-                    top_p=0.95,
-                    stop_ids=result.stop_ids,
-                    presence_penalty=0.0,
-                )
+            gpu_store = getattr(model, '_gpu_decode_store', None)
+            if gpu_store is None:
+                raise RuntimeError("GPU decode store not configured for warmup")
+            gpu_store.gpu_generate_batch(
+                first_token=result.first_token,
+                start_position=result.prompt_len,
+                max_tokens=num_steps,
+                temperature=0.6,
+                top_k=50,
+                top_p=0.95,
+                stop_ids=result.stop_ids,
+                presence_penalty=0.0,
+            )
+            _vram_snap("decode-warmup-after-gpu-decode")
         model.server_cleanup()
         _vram_snap("decode-warmup-after-cleanup")
 
@@ -340,7 +335,7 @@ def main():
             "CFG_MULTI_GPU_HCS": "multi_gpu_hcs",
             "CFG_KV_CACHE_MB": "kv_cache_mb",
             "CFG_ENABLE_THINKING": "enable_thinking",
-            "CFG_CPU_DECODE": "cpu_decode",
+            "CFG_CPU_DECODE": None,  # CPU decode removed, ignore config key
         }
         with open(config_path) as f:
             for line in f:
@@ -435,10 +430,10 @@ def main():
                         help="(deprecated, now the default) Attention is resident on GPU by default.")
     parser.add_argument("--layer-group-size", type=int, default=2,
                         help="Number of MoE layers to load per group during prefill (default: 2)")
+    # GPU decode is the only mode — CPU decode has been removed.
+    # Keep --gpu-decode as a no-op for config file compatibility.
     parser.add_argument("--gpu-decode", action="store_true", default=True,
-                        help="Use GPU for decode (default). Runs model.forward() per token on GPU.")
-    parser.add_argument("--cpu-decode", action="store_true", default=False,
-                        help="Use CPU for decode. GIL-free Rust decode loop.")
+                        help="(default, only mode) GPU decode via Rust GpuDecodeStore.")
     parser.add_argument("--benchmark", action="store_true",
                         help="Run standardized benchmark before starting server")
     parser.add_argument("--benchmark-only", action="store_true",
@@ -538,17 +533,15 @@ def main():
     num_layers = cfg.num_hidden_layers
     num_gpus_available = args.num_gpus or torch.cuda.device_count()
 
-    # Determine decode mode early — needed for gpu_only loading
-    gpu_decode = not args.cpu_decode
-    gpu_only = gpu_decode  # GPU decode = skip CPU expert weights + CPU decoder
+    # GPU decode is the only mode — skip CPU expert weights + CPU decoder
+    gpu_only = True
 
     # ── Configuration summary ──
     _status(f"Krasis — {_model_name}")
-    _detail(f"Decode: {'GPU' if gpu_decode else 'CPU'}  |  HCS: {'on' if args.hcs else 'off'}  |  GPUs: {num_gpus_available}")
-    _detail(f"Experts: GPU INT{args.gpu_expert_bits}" + (f" + CPU INT{args.cpu_expert_bits}" if not gpu_only else "") + f"  |  Attention: {args.attention_quant}  |  KV: {args.kv_dtype}")
+    _detail(f"Decode: GPU  |  HCS: {'on' if args.hcs else 'off'}  |  GPUs: {num_gpus_available}")
+    _detail(f"Experts: GPU INT{args.gpu_expert_bits}  |  Attention: {args.attention_quant}  |  KV: {args.kv_dtype}")
     _detail(f"Layer groups: {args.layer_group_size}  |  KV cache: {args.kv_cache_mb} MB  |  Threads: {args.krasis_threads}")
-    if gpu_only:
-        _dim("GPU-only mode: CPU expert weights and CPU decoder will be skipped")
+    _dim("GPU-only mode: CPU expert weights and CPU decoder skipped")
 
     pp_partition = [num_layers]  # PP=1: all layers on primary GPU
     logger.info("HCS strategy: PP=1, %d GPUs available", num_gpus_available)
@@ -586,8 +579,14 @@ def main():
     _model.warmup_cuda_runtime(devices)
     _detail("cuBLAS + Triton kernel compilation done")
 
-    # ── Set decode mode early (needed for warmup) ──
-    _model.decode_mode = "gpu" if gpu_decode else "cpu"
+    # ── Set decode mode (GPU only) ──
+    _model.decode_mode = "gpu"
+
+    # ── GPU decode store setup (before warmup so decode warmup can use it) ──
+    _status("Setting up GPU decode store")
+    gpu_store = _model.setup_gpu_decode_store()
+    gpu_store_addr = gpu_store.gpu_store_addr()
+    _detail(f"GPU decode store ready (addr={gpu_store_addr:#x})")
 
     # ── Start VRAM monitor (before warmup, warnings off) ──
     from krasis import VramMonitor
@@ -636,12 +635,8 @@ def main():
         )
 
     if not args.hcs:
-        if gpu_decode:
-            _status("GPU decode (no HCS)")
-            _warn("All experts streamed via DMA per token (slow for decode)")
-        else:
-            _status("CPU decode")
-            _detail("M=1 via Rust engine, GIL-free")
+        _status("GPU decode (no HCS)")
+        _warn("All experts streamed via DMA per token (slow for decode)")
     else:
         _status("Calculating HCS budget")
 
@@ -832,31 +827,20 @@ def main():
 
         sys.exit(0)
 
-    # ── Decode mode (already set earlier, just derive label) ──
-    _decode_label = "GPU" if gpu_decode else "CPU"
-
     max_ctx = _model.get_max_context_tokens()
 
     _status(f"Server ready on {args.host}:{args.port}")
-    _detail(f"Decode: {_decode_label}  |  HCS: {'on' if args.hcs else 'off'}  |  Max context: {max_ctx:,} tokens")
+    _detail(f"Decode: GPU  |  HCS: {'on' if args.hcs else 'off'}  |  Max context: {max_ctx:,} tokens")
     _dim(f"KV cache: {args.kv_cache_mb:,} MB")
     _dim("Press Q or Ctrl-C to stop")
     logger.info(
-        "Model loaded, starting server on %s:%d (max context: %d, decode: %s)",
-        args.host, args.port, max_ctx, _decode_label,
+        "Model loaded, starting server on %s:%d (max context: %d, decode: GPU)",
+        args.host, args.port, max_ctx,
     )
 
     # ── Server registry: write entry + register cleanup ──
     _write_registry(args.host, args.port, _model_name)
     atexit.register(_remove_registry)
-
-    # ── GPU decode store setup ──
-    gpu_store_addr = 0
-    if gpu_decode:
-        _status("Setting up GPU decode store")
-        gpu_store = _model.setup_gpu_decode_store()
-        gpu_store_addr = gpu_store.gpu_store_addr()
-        _detail(f"GPU decode store ready (addr={gpu_store_addr:#x})")
 
     # ── Rust HTTP server ──
     from krasis import RustServer
@@ -870,7 +854,6 @@ def main():
         tokenizer_path,
         max_ctx,
         args.enable_thinking,
-        gpu_decode,
         gpu_store_addr,
     )
 

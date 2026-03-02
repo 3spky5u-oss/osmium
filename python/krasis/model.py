@@ -498,7 +498,7 @@ class KrasisModel:
 
         # Decode mode: "gpu" (default) or "cpu".
         # GPU decode runs model.forward() per token on GPU.
-        # CPU decode uses CpuDecodeStore in Rust (GIL-free).
+        # GPU decode uses GpuDecodeStore in Rust (GIL-free).
         self.decode_mode: str = "gpu"
 
         # Streaming attention decode: weights on CPU pinned memory, DMA'd per-layer.
@@ -654,17 +654,8 @@ class KrasisModel:
                         self.cfg.eos_token_id, self.tokenizer.eos_token_id)
             self.cfg.eos_token_id = self.tokenizer.eos_token_id
 
-        # Phase 5: Initialize CPU decode weights (one-time, immutable)
-        # Skip entirely in GPU-only mode — CPU decode not available.
-        if gpu_only:
-            self._cpu_decoder = None
-            logger.info("GPU-only mode: skipping CPU decode weight initialization")
-        else:
-            print(f"\n\033[1m\033[36m▸ Initializing CPU decode weights\033[0m", flush=True)
-            from krasis.decode_setup import CpuDecoder
-            cpu_decoder = CpuDecoder(self)
-            cpu_decoder.init_weights()
-            self._cpu_decoder = cpu_decoder
+        # CPU decode has been removed — GPU decode via Rust GpuDecodeStore only.
+        # CpuDecoder is preserved in frozen-oracle for verification.
 
         self._loaded = True
         total = time.perf_counter() - start
@@ -3565,53 +3556,29 @@ class KrasisModel:
             if next_token in stop_token_ids:
                 return generated
 
-            if self.decode_mode == "gpu":
-                # ── Decode (GPU) — per-token model.forward() on GPU ──
-                _t_decode_start = time.perf_counter()
-                stop_set = set(stop_token_ids)
-                for step in range(max_new_tokens - 1):
-                    pos = len(prompt_tokens) + step
-                    token_tensor = torch.tensor([next_token], dtype=torch.long, device=device)
-                    pos_tensor = torch.tensor([pos], dtype=torch.int32, device=device)
-                    logits = self.forward(token_tensor, pos_tensor, seq_states_per_rank)
-                    next_token = sample(
-                        logits[-1:], temperature, top_k, top_p,
-                        presence_penalty=presence_penalty,
-                        generated_tokens=generated_set,
-                    ).item()
-                    generated_set.add(next_token)
-                    generated.append(next_token)
-                    if next_token in stop_set:
-                        break
-                torch.cuda.synchronize()
-                self._last_decode_time = time.perf_counter() - _t_decode_start
-            else:
-                # ── Decode (CPU) — entire loop in Rust, zero Python per token ──
-                cpu_decoder = self._cpu_decoder
-                if cpu_decoder is None:
-                    raise RuntimeError("CPU decode requested but CPU decoder not loaded (gpu_only mode?)")
-                cpu_decoder.prepare(seq_states_per_rank, max_new_tokens)
-
-                decode_tokens = cpu_decoder._store.generate_batch(
-                    first_token=next_token,
-                    start_position=len(prompt_tokens),
-                    max_tokens=max_new_tokens - 1,
-                    temperature=temperature,
-                    top_k=top_k,
-                    top_p=top_p,
-                    stop_ids=list(stop_token_ids),
-                    presence_penalty=presence_penalty,
-                )
-                generated.extend(decode_tokens)
+            # ── Decode (GPU) — entire loop in Rust, zero Python per token ──
+            gpu_store = getattr(self, '_gpu_decode_store', None)
+            if gpu_store is None:
+                raise RuntimeError("GPU decode store not configured. Call setup_gpu_decode_store() first.")
+            self._export_kv_to_rust(seq_states_per_rank, len(prompt_tokens))
+            self._update_la_state_ptrs()
+            decode_tokens = gpu_store.gpu_generate_batch(
+                first_token=next_token,
+                start_position=len(prompt_tokens),
+                max_tokens=max_new_tokens - 1,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                stop_ids=list(stop_token_ids),
+                presence_penalty=presence_penalty,
+            )
+            generated.extend(decode_tokens)
 
         finally:
             n_decode = len(generated) - 1  # First token is from prefill
             if n_decode > 0:
-                if self.decode_mode == "gpu":
-                    self._last_decode_tok_s = n_decode / self._last_decode_time if self._last_decode_time > 0 else 0.0
-                elif self._cpu_decoder is not None:
-                    self._last_decode_time = self._cpu_decoder._store.last_decode_elapsed_s
-                    self._last_decode_tok_s = n_decode / self._last_decode_time
+                self._last_decode_time = gpu_store.last_decode_elapsed_s if gpu_store else 0.0
+                self._last_decode_tok_s = n_decode / self._last_decode_time if self._last_decode_time > 0 else 0.0
             else:
                 self._last_decode_time = 0.0
                 self._last_decode_tok_s = 0.0
@@ -3659,12 +3626,7 @@ class KrasisModel:
         """GPU prefill for Rust server. Returns result object with first_token, etc.
 
         Called by the Rust HTTP server (with GIL) before decode.
-        Stores seq_states on self for cleanup via server_cleanup().
-
-        Args:
-            decode_mode: "gpu" (default) or "cpu". GPU decode calls
-                server_gpu_decode_step() per token. CPU decode uses
-                CpuDecodeStore.generate_stream() in Rust (GIL-free).
+        Exports KV cache + LA state to Rust GpuDecodeStore for GPU decode.
         """
         import json
 
@@ -3718,30 +3680,13 @@ class KrasisModel:
             decode_mode,
         )
 
-        store_addr = 0
-        if decode_mode == "cpu":
-            # Prepare CPU decode
-            cpu_decoder = self._cpu_decoder
-            if cpu_decoder is None:
-                raise RuntimeError("CPU decode requested but CPU decoder not loaded (gpu_only mode?)")
-            cpu_decoder._store.reset_cancel()
-            cpu_decoder.prepare(seq_states, max_new_tokens)
-            store_addr = cpu_decoder._store.self_addr()
-        else:
-            # GPU decode: set up for Python decode step (benchmark engine path)
-            self._gpu_decode_device = device
-            self._gpu_decode_temperature = temperature
-            self._gpu_decode_top_k = top_k
-            self._gpu_decode_top_p = top_p
-            self._gpu_decode_presence_penalty = presence_penalty
-            self._gpu_decode_seen_tokens = set()
-
-            # Export KV cache + LA state to Rust GpuDecodeStore (server path)
-            gpu_store = getattr(self, '_gpu_decode_store', None)
-            if gpu_store is not None:
-                self._export_kv_to_rust(seq_states, len(prompt_tokens))
-                self._update_la_state_ptrs()
-                store_addr = gpu_store.gpu_store_addr()
+        # GPU decode: export state to Rust GpuDecodeStore
+        gpu_store = getattr(self, '_gpu_decode_store', None)
+        if gpu_store is None:
+            raise RuntimeError("GpuDecodeStore not configured. Call setup_gpu_decode_store() first.")
+        self._export_kv_to_rust(seq_states, len(prompt_tokens))
+        self._update_la_state_ptrs()
+        store_addr = gpu_store.gpu_store_addr()
 
         class _Result:
             pass
@@ -3753,31 +3698,6 @@ class KrasisModel:
         r.store_addr = store_addr
         r.decode_mode = decode_mode
         return r
-
-    @torch.inference_mode()
-    def server_gpu_decode_step(self, token_id: int, position: int) -> int:
-        """One GPU decode step: forward pass + sampling. Returns next token ID.
-
-        Uses the same model.forward() path as prefill (M=1), with HCS for MoE.
-        Sampling params were stored during server_prefill().
-        Called by the Rust HTTP server per token (with GIL).
-        """
-        device = self._gpu_decode_device
-        token = torch.tensor([token_id], dtype=torch.long, device=device)
-        pos = torch.tensor([position], dtype=torch.int32, device=device)
-
-        logits = self.forward(token, pos, self._server_seq_states)
-
-        next_token = sample(
-            logits[-1:],
-            self._gpu_decode_temperature,
-            self._gpu_decode_top_k,
-            self._gpu_decode_top_p,
-            presence_penalty=self._gpu_decode_presence_penalty,
-            generated_tokens=self._gpu_decode_seen_tokens,
-        ).item()
-        self._gpu_decode_seen_tokens.add(next_token)
-        return next_token
 
     def setup_gpu_decode_store(self) -> "GpuDecodeStore":
         """Create and configure a GpuDecodeStore for Rust-native GPU decode.

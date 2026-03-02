@@ -645,6 +645,7 @@ pub struct GpuDecodeStore {
     prefetch_stream: CudaStream,
     graph: Option<Box<GpuDecodeGraph>>,
     kernels_loaded: bool,
+    last_decode_elapsed: f64,
 }
 
 #[pymethods]
@@ -728,6 +729,7 @@ impl GpuDecodeStore {
             prefetch_stream: CudaStream(prefetch_stream),
             graph: None,
             kernels_loaded,
+            last_decode_elapsed: 0.0,
         })
     }
 
@@ -2064,6 +2066,88 @@ impl GpuDecodeStore {
     /// Get self pointer for Rust-side access (same pattern as CpuDecodeStore).
     fn gpu_store_addr(&self) -> usize {
         self as *const GpuDecodeStore as usize
+    }
+
+    /// Batch GPU decode: generate tokens without streaming. Returns list of token IDs.
+    /// Used by benchmark engine path and decode warmup.
+    #[pyo3(signature = (first_token, start_position, max_tokens, temperature, top_k, top_p, stop_ids, presence_penalty=0.0))]
+    fn gpu_generate_batch(
+        &mut self,
+        first_token: usize,
+        start_position: usize,
+        max_tokens: usize,
+        temperature: f32,
+        top_k: usize,
+        top_p: f32,
+        stop_ids: Vec<usize>,
+        presence_penalty: f32,
+    ) -> PyResult<Vec<usize>> {
+        let vocab_size = match self.graph.as_ref() {
+            Some(g) => g.vocab_size,
+            None => return Err(pyo3::exceptions::PyRuntimeError::new_err("graph not configured")),
+        };
+
+        let stop_set: std::collections::HashSet<usize> = stop_ids.iter().copied().collect();
+
+        let mut rng_state: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        if rng_state == 0 { rng_state = 0xDEADBEEF; }
+        let mut rng_next = move || -> u64 {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            rng_state
+        };
+
+        let mut next_token = first_token;
+        let mut tokens = Vec::with_capacity(max_tokens);
+        let mut seen_tokens: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        seen_tokens.insert(first_token);
+
+        let decode_start = std::time::Instant::now();
+
+        for step in 0..max_tokens {
+            let pos = start_position + step;
+            self.gpu_decode_step(next_token, pos)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("gpu_decode_step error: {}", e)))?;
+
+            let logits = &mut self.graph.as_mut().unwrap().h_logits;
+            if presence_penalty != 0.0 {
+                for &tok in &seen_tokens {
+                    if tok < vocab_size {
+                        logits[tok] -= presence_penalty;
+                    }
+                }
+            }
+
+            next_token = crate::decode::sample_from_logits_pub(
+                logits, vocab_size, temperature, top_k, top_p, &mut rng_next);
+            seen_tokens.insert(next_token);
+            tokens.push(next_token);
+
+            if stop_set.contains(&next_token) {
+                break;
+            }
+        }
+
+        let elapsed = decode_start.elapsed().as_secs_f64();
+        if !tokens.is_empty() {
+            let tps = tokens.len() as f64 / elapsed;
+            log::info!("gpu_generate_batch: {} tokens in {:.2}s ({:.1} tok/s)",
+                tokens.len(), elapsed, tps);
+        }
+        self.last_decode_elapsed = elapsed;
+
+        Ok(tokens)
+    }
+
+    /// Get elapsed time of last decode run (seconds).
+    #[getter]
+    fn last_decode_elapsed_s(&self) -> f64 {
+        self.last_decode_elapsed
     }
 }
 

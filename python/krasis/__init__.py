@@ -7,7 +7,7 @@ except PackageNotFoundError:
     __version__ = "dev"
 
 try:
-    from krasis.krasis import KrasisEngine, WeightStore, CpuDecodeStore, RustServer, system_check, bench_decode_synthetic
+    from krasis.krasis import KrasisEngine, WeightStore, RustServer, system_check, bench_decode_synthetic
     try:
         from krasis.krasis import GpuDecodeStore
     except ImportError:
@@ -18,12 +18,6 @@ try:
         pass  # Built without CUDA feature
 except ImportError:
     # Native module not built yet
-    pass
-
-try:
-    from krasis.sglang_bridge import KrasisMoEWrapper
-except ImportError:
-    # torch/numpy not available
     pass
 
 try:
