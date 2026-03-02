@@ -634,6 +634,11 @@ struct GpuDecodeGraph {
     t_shared: f64,
     t_dense_mlp: f64,
     t_lm_head: f64,
+    // Sub-MoE timing breakdown (accumulated across all layers per token, then across tokens)
+    t_moe_route_sync: f64,   // time waiting for routing sync (device.synchronize in Step 4)
+    t_moe_expert_loop: f64,  // total expert loop time (HCS compute + DMA + cold compute)
+    t_moe_shared: f64,       // shared expert DMA + compute + gate
+    t_moe_overhead: f64,     // bf16->fp32 conv, zero, scale, etc.
 }
 
 // ── Thread-safe CUDA wrappers ──────────────────────────────────────────
@@ -937,6 +942,10 @@ impl GpuDecodeStore {
             t_shared: 0.0,
             t_dense_mlp: 0.0,
             t_lm_head: 0.0,
+            t_moe_route_sync: 0.0,
+            t_moe_expert_loop: 0.0,
+            t_moe_shared: 0.0,
+            t_moe_overhead: 0.0,
         }));
 
         // Cache kernel function handles (avoid HashMap lookup per call)
@@ -1190,6 +1199,10 @@ impl GpuDecodeStore {
                 graph.t_shared = 0.0;
                 graph.t_dense_mlp = 0.0;
                 graph.t_lm_head = 0.0;
+                graph.t_moe_route_sync = 0.0;
+                graph.t_moe_expert_loop = 0.0;
+                graph.t_moe_shared = 0.0;
+                graph.t_moe_overhead = 0.0;
             }
         }
         Ok(())
@@ -3518,6 +3531,16 @@ impl GpuDecodeStore {
                 log::info!("│  Other:       {:7.2} ms  ({:4.1}%)              │",
                     avg_total - avg_attn - avg_moe - avg_norm - avg_dense - avg_lm,
                     (avg_total - avg_attn - avg_moe - avg_norm - avg_dense - avg_lm) / avg_total * 100.0);
+                log::info!("├─────────────────────────────────────────────────┤");
+                let avg_route_sync = graph.t_moe_route_sync / n * 1000.0;
+                let avg_expert_loop = graph.t_moe_expert_loop / n * 1000.0;
+                let avg_shared = graph.t_moe_shared / n * 1000.0;
+                let avg_moe_other = avg_moe - avg_route_sync - avg_expert_loop - avg_shared;
+                log::info!("│  MoE breakdown (of {:.2} ms):                    │", avg_moe);
+                log::info!("│    Route sync:  {:7.2} ms  ({:4.1}%)             │", avg_route_sync, avg_route_sync / avg_moe * 100.0);
+                log::info!("│    Expert loop: {:7.2} ms  ({:4.1}%)             │", avg_expert_loop, avg_expert_loop / avg_moe * 100.0);
+                log::info!("│    Shared exp:  {:7.2} ms  ({:4.1}%)             │", avg_shared, avg_shared / avg_moe * 100.0);
+                log::info!("│    MoE other:   {:7.2} ms  ({:4.1}%)             │", avg_moe_other, avg_moe_other / avg_moe * 100.0);
                 log::info!("└─────────────────────────────────────────────────┘");
 
                 // PCIe utilization estimate
@@ -4374,6 +4397,8 @@ impl GpuDecodeStore {
         let t_route_start = Instant::now();
         device.synchronize()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
+        let t_after_route_sync = Instant::now();
+        if timing { graph.t_moe_route_sync += (t_after_route_sync - t_route_start).as_secs_f64(); }
 
         #[cfg(feature = "gpu-debug")]
         let t_route = t_start.elapsed().as_secs_f64() * 1000.0;
@@ -4672,6 +4697,8 @@ impl GpuDecodeStore {
                 &graph.h_topk_ids[..topk], &graph.h_topk_weights[..topk]);
         }
 
+        let t_expert_loop_start = Instant::now();
+
         for i in 0..topk {
             let eid = graph.h_topk_ids[i];
             if eid < 0 { continue; }
@@ -4938,15 +4965,24 @@ impl GpuDecodeStore {
             }
         }
 
-        // Wait for all expert work to complete (debug: also records timing)
-        #[cfg(feature = "gpu-debug")]
-        {
+        // Wait for all expert work to complete
+        if timing {
             device.synchronize()
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
+            graph.t_moe_expert_loop += (Instant::now() - t_expert_loop_start).as_secs_f64();
+        }
+        #[cfg(feature = "gpu-debug")]
+        {
+            if !timing {
+                device.synchronize()
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
+            }
             let expert_elapsed = t_expert_start.elapsed().as_secs_f64() * 1000.0;
             dma_total = expert_elapsed * 0.87;
             compute_total = expert_elapsed * 0.10;
         }
+
+        let t_shared_start = Instant::now();
 
         // ── Step 7: Shared expert (if any) ──
         // Priority: VRAM-resident (pinned at registration) > DMA fallback
@@ -5069,6 +5105,10 @@ impl GpuDecodeStore {
         #[cfg(feature = "gpu-debug")]
         device.synchronize()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
+
+        if timing {
+            graph.t_moe_shared += (Instant::now() - t_shared_start).as_secs_f64();
+        }
 
         // ── HCS stats update ──
         if let Some(ref mut hcs) = graph.hcs {
