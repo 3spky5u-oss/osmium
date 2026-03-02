@@ -639,6 +639,12 @@ struct GpuDecodeGraph {
     t_moe_expert_loop: f64,  // total expert loop time (HCS compute + DMA + cold compute)
     t_moe_shared: f64,       // shared expert DMA + compute + gate
     t_moe_overhead: f64,     // bf16->fp32 conv, zero, scale, etc.
+    // DMA instrumentation (accumulated across all layers per token, then across tokens)
+    dma_bytes_total: u64,    // total bytes DMA'd (cold experts only)
+    dma_call_count: u64,     // number of cuMemcpyHtoDAsync calls
+    dma_cold_experts: u64,   // number of cold (DMA'd) experts
+    dma_hcs_experts: u64,    // number of HCS-hit experts
+    dma_wait_ms: f64,        // CPU wall time spent in cuStreamWaitEvent for DMA
 }
 
 // ── Thread-safe CUDA wrappers ──────────────────────────────────────────
@@ -946,6 +952,11 @@ impl GpuDecodeStore {
             t_moe_expert_loop: 0.0,
             t_moe_shared: 0.0,
             t_moe_overhead: 0.0,
+            dma_bytes_total: 0,
+            dma_call_count: 0,
+            dma_cold_experts: 0,
+            dma_hcs_experts: 0,
+            dma_wait_ms: 0.0,
         }));
 
         // Cache kernel function handles (avoid HashMap lookup per call)
@@ -1203,6 +1214,11 @@ impl GpuDecodeStore {
                 graph.t_moe_expert_loop = 0.0;
                 graph.t_moe_shared = 0.0;
                 graph.t_moe_overhead = 0.0;
+                graph.dma_bytes_total = 0;
+                graph.dma_call_count = 0;
+                graph.dma_cold_experts = 0;
+                graph.dma_hcs_experts = 0;
+                graph.dma_wait_ms = 0.0;
             }
         }
         Ok(())
@@ -3543,26 +3559,28 @@ impl GpuDecodeStore {
                 log::info!("│    MoE other:   {:7.2} ms  ({:4.1}%)             │", avg_moe_other, avg_moe_other / avg_moe * 100.0);
                 log::info!("└─────────────────────────────────────────────────┘");
 
-                // PCIe utilization estimate
-                // QCN: 10 experts per layer, ~1.5 MB each, 48 MoE layers
-                let moe_layers = graph.moe_layers.iter().filter(|m| m.is_some()).count();
-                if moe_layers > 0 {
-                    let expert_size_mb = graph.expert_buf_total_size as f64 / (1024.0 * 1024.0);
-                    let topk = graph.h_topk_ids.len();
-                    let data_per_tok_mb = expert_size_mb * topk as f64 * moe_layers as f64;
-                    let (hcs_ratio, hcs_cached, hcs_hits, hcs_misses) = if let Some(ref hcs) = graph.hcs {
-                        let r = if hcs.total_hits + hcs.total_misses > 0 {
-                            hcs.total_hits as f64 / (hcs.total_hits + hcs.total_misses) as f64
-                        } else { 0.0 };
-                        (r, hcs.num_cached, hcs.total_hits, hcs.total_misses)
-                    } else { (0.0, 0, 0, 0) };
-                    let dma_per_tok_mb = data_per_tok_mb * (1.0 - hcs_ratio);
-                    let pcie_bw = if avg_moe > 0.001 { dma_per_tok_mb / (avg_moe / 1000.0) } else { 0.0 };
-                    log::info!("│  MoE data:    {:.1} MB/tok ({:.0}% HCS, {} cached, {}/{} hit/miss) │",
-                        data_per_tok_mb, hcs_ratio * 100.0, hcs_cached, hcs_hits, hcs_misses);
-                    log::info!("│  DMA needed:  {:.1} MB/tok (after HCS)          │", dma_per_tok_mb);
-                    log::info!("│  Est PCIe BW: {:.1} GB/s                        │", pcie_bw / 1024.0);
-                }
+                // Measured PCIe DMA stats
+                let (hcs_cached, hcs_hits, hcs_misses) = if let Some(ref hcs) = graph.hcs {
+                    (hcs.num_cached, hcs.total_hits, hcs.total_misses)
+                } else { (0, 0, 0) };
+                let avg_dma_bytes = graph.dma_bytes_total as f64 / n;
+                let avg_dma_calls = graph.dma_call_count as f64 / n;
+                let avg_cold = graph.dma_cold_experts as f64 / n;
+                let avg_hcs = graph.dma_hcs_experts as f64 / n;
+                let avg_dma_wait = graph.dma_wait_ms / n;
+                let dma_mb = avg_dma_bytes / (1024.0 * 1024.0);
+                let actual_bw = if avg_dma_wait > 0.001 { dma_mb / (avg_dma_wait / 1000.0) / 1024.0 } else { 0.0 };
+                log::info!("├─────────────────────────────────────────────────┤");
+                log::info!("│  PCIe DMA (measured):                           │");
+                log::info!("│    Cold experts/tok: {:.1} ({:.0} calls)          │", avg_cold, avg_dma_calls);
+                log::info!("│    HCS experts/tok:  {:.1} ({} cached)            │", avg_hcs, hcs_cached);
+                log::info!("│    DMA bytes/tok:    {:.2} MB                     │", dma_mb);
+                log::info!("│    DMA wait/tok:     {:.2} ms                     │", avg_dma_wait);
+                log::info!("│    Actual PCIe BW:   {:.1} GB/s (of 27 peak)     │", actual_bw);
+                log::info!("│    HCS hit/miss:     {}/{}                        │", hcs_hits, hcs_misses);
+                let bytes_per_call = if avg_dma_calls > 0.0 { avg_dma_bytes / avg_dma_calls } else { 0.0 };
+                log::info!("│    Avg DMA call size: {:.1} KB                   │", bytes_per_call / 1024.0);
+                log::info!("└─────────────────────────────────────────────────┘");
             }
         }
 
@@ -4725,6 +4743,7 @@ impl GpuDecodeStore {
             if let Some((w13p, w13s, w2p, w2s)) = hcs_entry_ptrs {
                 // ── HCS HIT: zero DMA, VRAM-resident at full bandwidth ──
                 hcs_hits += 1;
+                if timing { graph.dma_hcs_experts += 1; }
 
                 // w13 GEMV: hidden -> gate_up (use v2 K-split if beneficial)
                 if use_v2_w13 {
@@ -4765,6 +4784,13 @@ impl GpuDecodeStore {
                 // Expert N DMAs to buf[slot], expert N-1 computes from buf[prev_slot].
                 // The copy engine and compute SMs run concurrently on different buffers.
                 apfl_misses += 1;
+                if timing {
+                    let dma_bytes = expert.w13_packed_bytes + expert.w13_scales_bytes
+                                  + expert.w2_packed_bytes + expert.w2_scales_bytes;
+                    graph.dma_bytes_total += dma_bytes as u64;
+                    graph.dma_call_count += 4;
+                    graph.dma_cold_experts += 1;
+                }
 
                 let slot = (dma_expert_count % 2) as usize;
 
@@ -4810,8 +4836,17 @@ impl GpuDecodeStore {
                 }
 
                 // Wait for THIS expert's DMA to complete before computing
+                let t_dma_wait = if timing { Instant::now() } else { Instant::now() };
                 unsafe {
+                    // Sync default_stream to wait for DMA on copy_stream
                     cuda_sys::lib().cuStreamWaitEvent(default_stream, ev_dma[slot], 0);
+                    // Also sync host to measure actual DMA latency (only when timing)
+                    if timing {
+                        cuda_sys::lib().cuStreamSynchronize(copy_stream);
+                    }
+                }
+                if timing {
+                    graph.dma_wait_ms += t_dma_wait.elapsed().as_secs_f64() * 1000.0;
                 }
 
                 // Compute from buf[slot]
@@ -4887,6 +4922,13 @@ impl GpuDecodeStore {
             } else {
                 // ── Fallback: legacy single-buffer DMA (no ping-pong) ──
                 apfl_misses += 1;
+                if timing {
+                    let dma_bytes = expert.w13_packed_bytes + expert.w13_scales_bytes
+                                  + expert.w2_packed_bytes + expert.w2_scales_bytes;
+                    graph.dma_bytes_total += dma_bytes as u64;
+                    graph.dma_call_count += 4;
+                    graph.dma_cold_experts += 1;
+                }
 
                 unsafe {
                     let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
@@ -5428,6 +5470,79 @@ impl GpuDecodeStore {
         // Add 20% headroom for alignment.
         let buf_size = ((max_expert_bytes as f64) * 1.2) as usize;
         self.resize_expert_buffers(buf_size.max(1024))?;
+
+        // Step 4: Pin expert weight memory for async DMA (page-lock for full PCIe bandwidth)
+        // Without pinning, CUDA must bounce through a staging buffer, halving effective bandwidth.
+        let t_pin = std::time::Instant::now();
+        let mut pinned_regions = 0usize;
+        let mut pinned_bytes = 0usize;
+        let mut pin_failures = 0usize;
+
+        for moe_idx in 0..n_moe_layers {
+            let gpu_experts = &store.experts_gpu[moe_idx];
+            for expert in gpu_experts.iter() {
+                // Pin each weight buffer (w13_packed, w13_scales, w2_packed, w2_scales)
+                let regions: [(usize, usize); 4] = [
+                    (expert.w13_packed.as_ptr() as usize, expert.w13_packed.len() * 4),
+                    (expert.w13_scales.as_ptr() as usize, expert.w13_scales.len() * 2),
+                    (expert.w2_packed.as_ptr() as usize, expert.w2_packed.len() * 4),
+                    (expert.w2_scales.as_ptr() as usize, expert.w2_scales.len() * 2),
+                ];
+                for (ptr, size) in regions {
+                    if size == 0 { continue; }
+                    let err = unsafe {
+                        cuda_sys::lib().cuMemHostRegister_v2(
+                            ptr as *mut std::ffi::c_void,
+                            size,
+                            0, // CU_MEMHOSTREGISTER_DEFAULT
+                        )
+                    };
+                    if err == cuda_sys::CUresult::CUDA_SUCCESS {
+                        pinned_regions += 1;
+                        pinned_bytes += size;
+                    } else {
+                        pin_failures += 1;
+                        if pin_failures == 1 {
+                            log::warn!("First pin failure at moe_idx={}: {:?} (size={})",
+                                moe_idx, err, size);
+                        }
+                    }
+                }
+            }
+            // Also pin shared expert buffers
+            if moe_idx < store.shared_experts_gpu.len() {
+                let se = &store.shared_experts_gpu[moe_idx];
+                let regions: [(usize, usize); 4] = [
+                    (se.w13_packed.as_ptr() as usize, se.w13_packed.len() * 4),
+                    (se.w13_scales.as_ptr() as usize, se.w13_scales.len() * 2),
+                    (se.w2_packed.as_ptr() as usize, se.w2_packed.len() * 4),
+                    (se.w2_scales.as_ptr() as usize, se.w2_scales.len() * 2),
+                ];
+                for (ptr, size) in regions {
+                    if size == 0 { continue; }
+                    let err = unsafe {
+                        cuda_sys::lib().cuMemHostRegister_v2(
+                            ptr as *mut std::ffi::c_void,
+                            size,
+                            0,
+                        )
+                    };
+                    if err == cuda_sys::CUresult::CUDA_SUCCESS {
+                        pinned_regions += 1;
+                        pinned_bytes += size;
+                    } else {
+                        pin_failures += 1;
+                    }
+                }
+            }
+        }
+
+        let pin_elapsed = t_pin.elapsed().as_secs_f64();
+        log::info!(
+            "Expert memory pinning: {} regions ({:.1} GB) pinned in {:.1}s, {} failures",
+            pinned_regions, pinned_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            pin_elapsed, pin_failures,
+        );
 
         log::info!(
             "setup_from_engine complete: {} MoE layers, expert_buf={}KB, scaling_factor={}",
