@@ -12,6 +12,7 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = ["cuda"]
 cuda = ["cudarc"]
+gpu-debug = []  # Enable GPU decode debug instrumentation (syncs, peeks, layer capture)
 
 [dependencies]
 pyo3 = { version = "0.23", features = ["extension-module", "multiple-pymethods"] }

@@ -44,6 +44,9 @@ struct ServerState {
     /// Raw pointer to a GpuDecodeStore instance (set from Python during server init).
     /// Safety: single-request guarantee means no concurrent access.
     gpu_store_addr: usize,
+    /// When true, log wall-clock time for each Python GIL acquisition.
+    /// Enabled by KRASIS_GIL_TIMING=1. Zero cost when off (branch only).
+    gil_timing: bool,
 }
 
 /// Parsed HTTP request.
@@ -304,6 +307,7 @@ fn handle_chat_completion(
     };
 
     // ── Call Python for prefill (GIL required) ──
+    let t_prefill_gil = Instant::now();
     let prefill_result = Python::with_gil(|py| -> PyResult<(usize, usize, Vec<usize>)> {
         let result = state.py_model.call_method(
             py,
@@ -326,6 +330,7 @@ fn handle_chat_completion(
         let stop_ids: Vec<usize> = result.getattr(py, "stop_ids")?.extract(py)?;
         Ok((first_token, prompt_len, stop_ids))
     });
+    let prefill_gil_ms = t_prefill_gil.elapsed().as_secs_f64() * 1000.0;
 
     let (first_token, prompt_len, stop_ids) = match prefill_result {
         Ok(v) => v,
@@ -377,9 +382,16 @@ fn handle_chat_completion(
     );
 
     // ── Cleanup (GIL required) ──
+    let t_cleanup_gil = Instant::now();
     Python::with_gil(|py| {
         let _ = state.py_model.call_method0(py, "server_cleanup");
     });
+    let cleanup_gil_ms = t_cleanup_gil.elapsed().as_secs_f64() * 1000.0;
+
+    if state.gil_timing {
+        log::info!("GIL timing: prefill={:.1}ms cleanup={:.1}ms",
+            prefill_gil_ms, cleanup_gil_ms);
+    }
 }
 
 /// GPU decode: GIL-free Rust decode loop via GpuDecodeStore.
@@ -649,6 +661,13 @@ impl RustServer {
 
             log::info!("Rust HTTP server listening on {}", addr);
 
+            let gil_timing = std::env::var("KRASIS_GIL_TIMING")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if gil_timing {
+                log::info!("GIL timing enabled (KRASIS_GIL_TIMING=1)");
+            }
+
             let state = ServerState {
                 py_model,
                 model_name,
@@ -656,6 +675,7 @@ impl RustServer {
                 max_context_tokens,
                 default_enable_thinking,
                 gpu_store_addr,
+                gil_timing,
             };
 
             while running.load(Ordering::Acquire) {

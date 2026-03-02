@@ -647,11 +647,11 @@ pub struct GpuDecodeStore {
     graph: Option<Box<GpuDecodeGraph>>,
     kernels_loaded: bool,
     last_decode_elapsed: f64,
-    /// Debug: stop after this many layers (0 = run all layers). For testing.
+    #[cfg(feature = "gpu-debug")]
     debug_stop_layer: usize,
-    /// Debug: when true, capture d_hidden after each layer during gpu_decode_step.
+    #[cfg(feature = "gpu-debug")]
     debug_capture_layers: bool,
-    /// Debug: captured per-layer d_hidden states (BF16 u16 vecs).
+    #[cfg(feature = "gpu-debug")]
     debug_layer_captures: Vec<Vec<u16>>,
 }
 
@@ -737,8 +737,11 @@ impl GpuDecodeStore {
             graph: None,
             kernels_loaded,
             last_decode_elapsed: 0.0,
+            #[cfg(feature = "gpu-debug")]
             debug_stop_layer: 0,
+            #[cfg(feature = "gpu-debug")]
             debug_capture_layers: false,
+            #[cfg(feature = "gpu-debug")]
             debug_layer_captures: Vec::new(),
         })
     }
@@ -1620,18 +1623,18 @@ impl GpuDecodeStore {
         Ok(results.join("\n"))
     }
 
-    /// Set debug: stop after N layers (0 = run all). For comparing against Python per-layer.
+    #[cfg(feature = "gpu-debug")]
     fn set_debug_stop_layer(&mut self, n: usize) {
         self.debug_stop_layer = n;
     }
 
-    /// Enable/disable per-layer hidden state capture during gpu_decode_step.
+    #[cfg(feature = "gpu-debug")]
     fn set_debug_capture_layers(&mut self, enable: bool) {
         self.debug_capture_layers = enable;
         self.debug_layer_captures.clear();
     }
 
-    /// Download captured per-layer hidden states. Returns list of BF16 u16 vecs.
+    #[cfg(feature = "gpu-debug")]
     fn download_layer_captures(&self) -> PyResult<Vec<Vec<u16>>> {
         Ok(self.debug_layer_captures.clone())
     }
@@ -2426,7 +2429,7 @@ impl GpuDecodeStore {
             .ok_or_else(|| "Kernels not cached".to_string())?
             .clone();
 
-        // Debug: read first 4 BF16 values from a GPU buffer
+        #[cfg(feature = "gpu-debug")]
         let debug_peek_bf16 = |label: &str, ptr: u64, n: usize| {
             let mut buf = vec![0u16; n];
             unsafe {
@@ -2440,6 +2443,7 @@ impl GpuDecodeStore {
             }).collect();
             log::info!("DBG {} [{:.4}, {:.4}, {:.4}, {:.4}]", label, vals[0], vals[1], vals[2], vals[3]);
         };
+        #[cfg(feature = "gpu-debug")]
         let debug_peek_f32 = |label: &str, ptr: u64, n: usize| {
             let mut buf = vec![0f32; n];
             unsafe {
@@ -2451,6 +2455,7 @@ impl GpuDecodeStore {
         };
 
         // ── 1. Embedding lookup ──
+        #[cfg(feature = "gpu-debug")]
         log::info!("gpu_decode_step: token={}, pos={}", token_id, position);
         {
             let threads = 256u32;
@@ -2470,8 +2475,11 @@ impl GpuDecodeStore {
             }
         }
 
-        self.device.synchronize().map_err(|e| format!("sync after emb: {:?}", e))?;
-        debug_peek_bf16("after_embedding d_hidden", *graph.d_hidden.device_ptr(), 4);
+        #[cfg(feature = "gpu-debug")]
+        {
+            self.device.synchronize().map_err(|e| format!("sync after emb: {:?}", e))?;
+            debug_peek_bf16("after_embedding d_hidden", *graph.d_hidden.device_ptr(), 4);
+        }
 
         let mut first_residual = true;
         let num_layers = graph.layers.len();
@@ -3030,9 +3038,9 @@ impl GpuDecodeStore {
             // Check if this layer has MoE data registered
             let has_moe = layer_idx < graph.moe_layers.len()
                 && graph.moe_layers[layer_idx].is_some();
-            // Sync before MoE to catch attention errors
-            self.device.synchronize().map_err(|e| format!("sync before mlp[{}]: {:?}", layer_idx, e))?;
+            #[cfg(feature = "gpu-debug")]
             {
+                self.device.synchronize().map_err(|e| format!("sync before mlp[{}]: {:?}", layer_idx, e))?;
                 self.device.synchronize().map_err(|e| format!("sync norm dbg: {:?}", e))?;
                 let mut buf = vec![0u16; 4];
                 unsafe {
@@ -3064,6 +3072,7 @@ impl GpuDecodeStore {
                         return Err(format!("D2D moe_out->hidden[{}]: {:?}", layer_idx, err));
                     }
                 }
+                #[cfg(feature = "gpu-debug")]
                 {
                     self.device.synchronize().map_err(|e| format!("sync moe dbg: {:?}", e))?;
                     let mut buf = vec![0u16; 4];
@@ -3114,33 +3123,37 @@ impl GpuDecodeStore {
             }
             // GpuMlpConfig::None → skip (layer 0 in QCN is dense but registered separately)
 
-            // Debug: capture d_hidden after this layer
-            if self.debug_capture_layers {
-                self.device.synchronize().map_err(|e| format!("sync capture: {:?}", e))?;
-                let mut buf = vec![0u16; hs];
-                unsafe {
-                    let err = cuda_sys::lib().cuMemcpyDtoH_v2(
-                        buf.as_mut_ptr() as *mut std::ffi::c_void,
-                        *graph.d_hidden.device_ptr(),
-                        hs * 2);
-                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                        return Err(format!("capture D2H layer {}: {:?}", layer_idx, err));
+            #[cfg(feature = "gpu-debug")]
+            {
+                if self.debug_capture_layers {
+                    self.device.synchronize().map_err(|e| format!("sync capture: {:?}", e))?;
+                    let mut buf = vec![0u16; hs];
+                    unsafe {
+                        let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+                            buf.as_mut_ptr() as *mut std::ffi::c_void,
+                            *graph.d_hidden.device_ptr(),
+                            hs * 2);
+                        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                            return Err(format!("capture D2H layer {}: {:?}", layer_idx, err));
+                        }
                     }
+                    self.debug_layer_captures.push(buf);
                 }
-                self.debug_layer_captures.push(buf);
-            }
 
-            // Debug: stop after N layers for comparison testing
-            if self.debug_stop_layer > 0 && layer_idx + 1 >= self.debug_stop_layer {
-                self.device.synchronize().map_err(|e| format!("sync debug_stop: {:?}", e))?;
-                log::warn!("DEBUG: stopped after layer {} (debug_stop_layer={})", layer_idx, self.debug_stop_layer);
-                return Ok(());
+                if self.debug_stop_layer > 0 && layer_idx + 1 >= self.debug_stop_layer {
+                    self.device.synchronize().map_err(|e| format!("sync debug_stop: {:?}", e))?;
+                    log::warn!("DEBUG: stopped after layer {} (debug_stop_layer={})", layer_idx, self.debug_stop_layer);
+                    return Ok(());
+                }
             }
         }
 
         // ── 3. Final norm ──
-        self.device.synchronize().map_err(|e| format!("sync after all layers: {:?}", e))?;
-        debug_peek_bf16("before_final_norm d_hidden", *graph.d_hidden.device_ptr(), 4);
+        #[cfg(feature = "gpu-debug")]
+        {
+            self.device.synchronize().map_err(|e| format!("sync after all layers: {:?}", e))?;
+            debug_peek_bf16("before_final_norm d_hidden", *graph.d_hidden.device_ptr(), 4);
+        }
         {
             let smem = (hs as u32) * 4;
             let threads = 256u32.min(hs as u32);
@@ -3174,6 +3187,7 @@ impl GpuDecodeStore {
         self.device.synchronize()
             .map_err(|e| format!("sync: {:?}", e))?;
 
+        #[cfg(feature = "gpu-debug")]
         debug_peek_f32("logits[0..4]", *graph.d_logits.device_ptr(), 4);
 
         unsafe {
@@ -3186,7 +3200,7 @@ impl GpuDecodeStore {
             }
         }
 
-        // Debug: print top-3 logit values
+        #[cfg(feature = "gpu-debug")]
         {
             let mut top3: Vec<(usize, f32)> = graph.h_logits.iter().enumerate()
                 .map(|(i, &v)| (i, v)).collect();
@@ -3294,6 +3308,7 @@ impl GpuDecodeStore {
         let mut seen_tokens: std::collections::HashSet<usize> = std::collections::HashSet::new();
         seen_tokens.insert(first_token);
 
+        #[cfg(feature = "gpu-debug")]
         let debug_logits = std::env::var("KRASIS_DEBUG_LOGITS").ok()
             .map(|v| v.parse::<usize>().unwrap_or(0)).unwrap_or(0);
 
@@ -3307,7 +3322,7 @@ impl GpuDecodeStore {
             // Logits are now in graph.h_logits (host-side)
             let logits = &mut self.graph.as_mut().unwrap().h_logits;
 
-            // Debug: print top-5 logits for first N tokens
+            #[cfg(feature = "gpu-debug")]
             if debug_logits > 0 && step < debug_logits {
                 let mut indexed: Vec<(usize, f32)> = logits.iter().copied()
                     .enumerate().take(vocab_size).collect();
@@ -4088,6 +4103,7 @@ impl GpuDecodeStore {
         let use_v2_w13 = w13_ksplits > 1;
         let partial_ptr = *graph.d_v2_partial.device_ptr();
 
+        #[cfg(feature = "gpu-debug")]
         let t_start = Instant::now();
 
         // Get cached kernel handles (avoids HashMap lookup per call)
@@ -4185,6 +4201,7 @@ impl GpuDecodeStore {
         device.synchronize()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
 
+        #[cfg(feature = "gpu-debug")]
         let t_route = t_start.elapsed().as_secs_f64() * 1000.0;
 
         unsafe {
@@ -4422,8 +4439,11 @@ impl GpuDecodeStore {
         // DMAs into buf[(N+1)%2]. The DMA engine and compute SMs run in
         // parallel on separate hardware. HCS and APFL experts skip DMA entirely.
 
+        #[cfg(feature = "gpu-debug")]
         let t_expert_start = Instant::now();
+        #[cfg(feature = "gpu-debug")]
         let mut dma_total = 0.0f64;
+        #[cfg(feature = "gpu-debug")]
         let mut compute_total = 0.0f64;
         let mut apfl_hits = 0u32;
         let mut apfl_misses = 0u32;
@@ -4470,7 +4490,7 @@ impl GpuDecodeStore {
         // Track which ping-pong slot was last used for DMA (for compute/DMA overlap)
         let mut dma_expert_count = 0u32;
 
-        // Debug: log routing for layer 0
+        #[cfg(feature = "gpu-debug")]
         if layer_idx == 0 {
             let weight_sum: f32 = (0..topk).map(|j| graph.h_topk_weights[j]).sum();
             log::info!("DBG MoE L{} routing: weight_sum={:.4}, ids={:?}, weights={:?}",
@@ -4618,7 +4638,7 @@ impl GpuDecodeStore {
                     )?;
                 }
 
-                // Debug: dump gate_up after w13 GEMV for layer 0, first expert
+                #[cfg(feature = "gpu-debug")]
                 if layer_idx == 0 && i == 0 {
                     device.synchronize().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
                     let mut gu = vec![0u16; 4];
@@ -4643,7 +4663,7 @@ impl GpuDecodeStore {
                     k,
                 )?;
 
-                // Debug: dump moe_out after first expert for layer 0
+                #[cfg(feature = "gpu-debug")]
                 if layer_idx == 0 && i == 0 {
                     device.synchronize().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
                     let mut mo = vec![0u16; 4];
@@ -4744,13 +4764,15 @@ impl GpuDecodeStore {
             }
         }
 
-        // ── Wait for all expert work to complete ──
-        device.synchronize()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
-
-        let expert_elapsed = t_expert_start.elapsed().as_secs_f64() * 1000.0;
-        dma_total = expert_elapsed * 0.87;
-        compute_total = expert_elapsed * 0.10;
+        // Wait for all expert work to complete (debug: also records timing)
+        #[cfg(feature = "gpu-debug")]
+        {
+            device.synchronize()
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
+            let expert_elapsed = t_expert_start.elapsed().as_secs_f64() * 1000.0;
+            dma_total = expert_elapsed * 0.87;
+            compute_total = expert_elapsed * 0.10;
+        }
 
         // ── Step 7: Shared expert (if any) ──
         // Priority: VRAM-resident (pinned at registration) > DMA fallback
@@ -4872,7 +4894,9 @@ impl GpuDecodeStore {
             // No separate sync -- combined sync at end
         }
 
-        // ── Final sync: ensure shared expert + scale complete ──
+        // Final sync: ensure shared expert + scale complete (debug builds only;
+        // in release, same-stream ordering guarantees correctness without sync)
+        #[cfg(feature = "gpu-debug")]
         device.synchronize()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
 
@@ -4904,9 +4928,13 @@ impl GpuDecodeStore {
 
         // Events are pre-allocated and reused across calls (no cleanup needed)
 
-        let total = t_start.elapsed().as_secs_f64() * 1000.0;
-
-        Ok((t_route, dma_total, compute_total, total))
+        #[cfg(feature = "gpu-debug")]
+        {
+            let total = t_start.elapsed().as_secs_f64() * 1000.0;
+            return Ok((t_route, dma_total, compute_total, total));
+        }
+        #[cfg(not(feature = "gpu-debug"))]
+        Ok((0.0, 0.0, 0.0, 0.0))
     }
 
     /// Test the Marlin GEMV kernel against a known reference.
