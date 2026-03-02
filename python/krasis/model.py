@@ -3711,13 +3711,15 @@ class KrasisModel:
         gpu_idx = device.index or 0
 
         store = GpuDecodeStore(gpu_idx)
-        # Compute max QKV buffer size across all layer types
+        # Compute max QKV buffer size across all layer types.
+        # Use dimension attributes (not weight tensors) since streaming may have
+        # offloaded weights to CPU, leaving tensor attributes as None.
         max_qkv = self.cfg.hidden_size * 3  # default for standard GQA
         for layer in self.layers:
             if layer.layer_type == "linear_attention":
                 attn = layer.attention
-                # in_proj_qkvz output = nk*dk + nk*dk + nv*dv + nv*dv
-                qkvz_out = attn.in_proj_qkvz.shape[0]
+                # in_proj_qkvz output dim = nk*(dk + dk + hr*dv + hr*dv)
+                qkvz_out = attn.num_k_heads * (2 * attn.k_head_dim + 2 * attn.head_ratio * attn.v_head_dim)
                 max_qkv = max(max_qkv, qkvz_out)
             elif hasattr(layer.attention, 'num_heads'):
                 ga = layer.attention
@@ -3767,15 +3769,29 @@ class KrasisModel:
         self._la_wids = {}
         rope_set = False
 
+        # When streaming attention is enabled, the layer's weight attributes point to
+        # ping-pong GPU buffers that may contain a DIFFERENT layer's data.  We must
+        # create permanent GPU copies from the CPU-pinned originals so Rust decode
+        # always sees correct weights for every layer.
+        self._rust_decode_weights = []  # prevent GC of permanent GPU copies
+
         for layer_idx, layer in enumerate(self.layers):
             attn = layer.attention
             inp_norm = layer.input_norm_weight
             post_norm = layer.post_attn_norm_weight
 
             if layer.layer_type == "linear_attention":
-                qkvz_w = attn.in_proj_qkvz
-                ba_w = attn.in_proj_ba
-                out_w = attn.out_proj
+                # If streaming, copy from CPU-pinned source; otherwise use GPU tensor directly
+                if self._stream_attn_enabled and layer_idx in self._stream_attn_cpu:
+                    cpu_w = self._stream_attn_cpu[layer_idx]
+                    qkvz_w = cpu_w.get("in_proj_qkvz", attn.in_proj_qkvz).to(device, non_blocking=True)
+                    ba_w = cpu_w.get("in_proj_ba", attn.in_proj_ba).to(device, non_blocking=True)
+                    out_w = cpu_w.get("out_proj", attn.out_proj).to(device, non_blocking=True)
+                    self._rust_decode_weights.extend([qkvz_w, ba_w, out_w])
+                else:
+                    qkvz_w = attn.in_proj_qkvz
+                    ba_w = attn.in_proj_ba
+                    out_w = attn.out_proj
                 qkvz_wid = store.register_weight(
                     qkvz_w.data_ptr(), qkvz_w.shape[0], qkvz_w.shape[1], 0)
                 ba_wid = store.register_weight(
@@ -3785,20 +3801,32 @@ class KrasisModel:
                 self._la_wids[layer_idx] = (qkvz_wid, ba_wid, out_wid)
 
                 # Conv weight: [conv_dim, 1, kernel_dim] -> [conv_dim, kernel_dim]
-                # Rust LA kernels work in FP32, so create FP32 copies of BF16 tensors
-                conv_w = attn.conv1d_weight.squeeze(1).contiguous().float()
+                # Rust LA kernels work in FP32, so create FP32 copies of BF16 tensors.
+                # When streaming, attn.* may be None or stale — use CPU-pinned source.
+                if self._stream_attn_enabled and layer_idx in self._stream_attn_cpu:
+                    cpu_la = self._stream_attn_cpu[layer_idx]
+                    conv_src = cpu_la.get("conv1d_weight", attn.conv1d_weight)
+                    a_log_src = cpu_la.get("A_log", attn.A_log)
+                    dt_bias_src = cpu_la.get("dt_bias", attn.dt_bias)
+                    norm_w_src = cpu_la.get("norm_weight", attn.norm_weight)
+                else:
+                    conv_src = attn.conv1d_weight
+                    a_log_src = attn.A_log
+                    dt_bias_src = attn.dt_bias
+                    norm_w_src = attn.norm_weight
+                conv_w = conv_src.squeeze(1).contiguous().float()
                 attn._rust_conv_weight = conv_w
 
                 attn._init_state(batch_size=1)
                 # conv_state is BF16 from _init_state, Rust kernel needs FP32
                 attn._rust_conv_state = attn._conv_state.squeeze(0).float().contiguous()
                 # norm_weight is BF16, Rust gated_rmsnorm_silu kernel needs FP32
-                attn._rust_norm_weight = attn.norm_weight.float().contiguous()
+                attn._rust_norm_weight = norm_w_src.float().contiguous()
                 # recurrent_state may need FP32 conversion for Rust kernel
                 attn._rust_recur_state = attn._recurrent_state.squeeze(0).float().contiguous()
                 # A_log and dt_bias are BF16 from weight loader, Rust kernel needs FP32
-                attn._rust_a_log = attn.A_log.float().contiguous()
-                attn._rust_dt_bias = attn.dt_bias.float().contiguous()
+                attn._rust_a_log = a_log_src.float().contiguous()
+                attn._rust_dt_bias = dt_bias_src.float().contiguous()
 
                 store.register_la_layer(
                     layer_idx=layer_idx,
@@ -3818,24 +3846,44 @@ class KrasisModel:
                     scale=attn.scale,
                 )
             else:
-                # GQA attention
+                # GQA attention — same streaming fix as LA above
+                if self._stream_attn_enabled and layer_idx in self._stream_attn_cpu:
+                    cpu_w = self._stream_attn_cpu[layer_idx]
+                    q_w = cpu_w.get("q_proj", attn.q_proj).to(device, non_blocking=True)
+                    k_w = cpu_w.get("k_proj", attn.k_proj).to(device, non_blocking=True)
+                    v_w = cpu_w.get("v_proj", attn.v_proj).to(device, non_blocking=True)
+                    o_w = cpu_w.get("o_proj", attn.o_proj).to(device, non_blocking=True)
+                    self._rust_decode_weights.extend([q_w, k_w, v_w, o_w])
+                else:
+                    q_w = attn.q_proj
+                    k_w = attn.k_proj
+                    v_w = attn.v_proj
+                    o_w = attn.o_proj
                 q_wid = store.register_weight(
-                    attn.q_proj.data_ptr(), attn.q_proj.shape[0], attn.q_proj.shape[1], 0)
+                    q_w.data_ptr(), q_w.shape[0], q_w.shape[1], 0)
                 k_wid = store.register_weight(
-                    attn.k_proj.data_ptr(), attn.k_proj.shape[0], attn.k_proj.shape[1], 0)
+                    k_w.data_ptr(), k_w.shape[0], k_w.shape[1], 0)
                 v_wid = store.register_weight(
-                    attn.v_proj.data_ptr(), attn.v_proj.shape[0], attn.v_proj.shape[1], 0)
+                    v_w.data_ptr(), v_w.shape[0], v_w.shape[1], 0)
                 o_wid = store.register_weight(
-                    attn.o_proj.data_ptr(), attn.o_proj.shape[0], attn.o_proj.shape[1], 0)
+                    o_w.data_ptr(), o_w.shape[0], o_w.shape[1], 0)
 
                 # QK norm weights are BF16, Rust per_head_rmsnorm kernel needs FP32
-                if attn.q_norm is not None:
-                    attn._rust_q_norm = attn.q_norm.float().contiguous()
+                # When streaming, use CPU-pinned source for these small weights
+                if self._stream_attn_enabled and layer_idx in self._stream_attn_cpu:
+                    cpu_gqa = self._stream_attn_cpu[layer_idx]
+                    q_norm_src = cpu_gqa.get("q_norm", attn.q_norm)
+                    k_norm_src = cpu_gqa.get("k_norm", attn.k_norm)
+                else:
+                    q_norm_src = attn.q_norm
+                    k_norm_src = attn.k_norm
+                if q_norm_src is not None:
+                    attn._rust_q_norm = q_norm_src.float().contiguous()
                     q_norm_ptr = attn._rust_q_norm.data_ptr()
                 else:
                     q_norm_ptr = 0
-                if attn.k_norm is not None:
-                    attn._rust_k_norm = attn.k_norm.float().contiguous()
+                if k_norm_src is not None:
+                    attn._rust_k_norm = k_norm_src.float().contiguous()
                     k_norm_ptr = attn._rust_k_norm.data_ptr()
                 else:
                     k_norm_ptr = 0

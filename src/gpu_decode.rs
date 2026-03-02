@@ -1653,6 +1653,36 @@ impl GpuDecodeStore {
         Ok(out)
     }
 
+    /// Download FP32 data from an LA intermediate buffer (for testing/debugging).
+    /// buffer_name: "qkvz", "ba", "conv_out", "recur_out", "gated_out"
+    /// size: number of f32 elements to read
+    #[pyo3(signature = (buffer_name, size))]
+    fn download_la_buffer_f32(&self, buffer_name: &str, size: usize) -> PyResult<Vec<f32>> {
+        let graph = self.graph.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let ptr = match buffer_name {
+            "qkvz" => *graph.d_la_qkvz.device_ptr(),
+            "ba" => *graph.d_la_ba.device_ptr(),
+            "conv_out" => *graph.d_la_conv_out.device_ptr(),
+            "recur_out" => *graph.d_la_recur_out.device_ptr(),
+            "gated_out" => *graph.d_la_gated_out.device_ptr(),
+            _ => return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                format!("Unknown LA buffer: {}", buffer_name))),
+        };
+        let mut out = vec![0.0f32; size];
+        unsafe {
+            let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+                out.as_mut_ptr() as *mut std::ffi::c_void,
+                ptr,
+                size * 4);
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("D2H LA buffer '{}': {:?}", buffer_name, err)));
+            }
+        }
+        Ok(out)
+    }
+
     /// Upload BF16 hidden state to GPU d_hidden buffer (for testing).
     fn upload_hidden_bf16(&self, data: Vec<u16>) -> PyResult<()> {
         let graph = self.graph.as_ref()
@@ -4787,44 +4817,42 @@ impl GpuDecodeStore {
                 }
             }
 
-            // Fused: silu_mul + w2 GEMV + add to accumulator (weight=1.0 for shared expert)
+            // Compute sigmoid gate weight BEFORE accumulating shared expert.
+            // The gate must only scale the shared expert, not the routed experts.
+            // Python does: output = routed + sigmoid(gate) * shared
+            let shared_weight = if let Some(sg_wid) = moe.shared_gate_wid {
+                let sg_w = &graph.weights[sg_wid];
+                // GEMV: gate_weight[1, hs] @ d_hidden[hs] -> d_scratch[0] (1 BF16 scalar)
+                self.gemv_bf16_internal(
+                    sg_w,
+                    *graph.d_hidden.device_ptr(),
+                    *graph.d_scratch.device_ptr(),
+                ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("shared gate GEMV: {}", e)))?;
+                // Read back the single BF16 gate logit and compute sigmoid
+                let mut gate_bf16 = [0u16; 1];
+                unsafe {
+                    cuda_sys::lib().cuMemcpyDtoH_v2(
+                        gate_bf16.as_mut_ptr() as *mut std::ffi::c_void,
+                        *graph.d_scratch.device_ptr(), 2);
+                }
+                let gate_logit = f32::from_bits((gate_bf16[0] as u32) << 16);
+                let gate_value = 1.0 / (1.0 + (-gate_logit).exp());  // sigmoid
+                gate_value
+            } else {
+                1.0f32
+            };
+
+            // Fused: silu_mul + w2 GEMV + add to accumulator (weighted by sigmoid gate)
             self.launch_fused_silu_accum(
                 w2p, w2s,
                 *graph.d_expert_gate_up.device_ptr(),
                 *graph.d_moe_out.device_ptr(),
                 inv_wp, inv_sp,
                 intermediate, hs, gs,
-                1.0f32,
+                shared_weight,
                 k,
             )?;
-            // Apply sigmoid gate if shared_expert_gate weight exists
-            // gate_logit = hidden @ gate_weight.T  (BF16 GEMV, [1,hs] x [hs,1] -> [1])
-            // moe_out *= sigmoid(gate_logit)
-            if let Some(sg_wid) = moe.shared_gate_wid {
-                let sg_w = &graph.weights[sg_wid];
-                // GEMV: gate_weight[1, hs] @ d_hidden[hs] -> d_expert_gate_up[0] (1 BF16 scalar)
-                self.gemv_bf16_internal(
-                    sg_w,
-                    *graph.d_hidden.device_ptr(),
-                    *graph.d_expert_gate_up.device_ptr(),
-                ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                    format!("shared gate GEMV: {}", e)))?;
-                // sigmoid_gate_inplace: d_moe_out[i] *= sigmoid(d_expert_gate_up[0])
-                unsafe {
-                    let gate_fn = self.device.get_func(MODULE_NAME, "sigmoid_gate_inplace_bf16")
-                        .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
-                            "sigmoid_gate_inplace_bf16 not found"))?;
-                    gate_fn.launch(
-                        LaunchConfig::for_num_elems(hs as u32),
-                        (
-                            *graph.d_moe_out.device_ptr(),
-                            *graph.d_expert_gate_up.device_ptr(),
-                            hs as i32,
-                        ),
-                    ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                        format!("sigmoid_gate_inplace_bf16: {:?}", e)))?;
-                }
-            }
         }
 
         // ── Step 8: Scale by routed_scaling_factor ──
