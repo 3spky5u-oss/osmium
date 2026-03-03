@@ -1088,6 +1088,187 @@ extern "C" __global__ void gqa_attention(
     }
 }
 
+// ── FlashDecoding-style tiled GQA attention ───────────────────────────
+//
+// Splits the sequence dimension across grid.y blocks for massive SM
+// utilization on large GPUs.  Each block computes attention for one Q
+// head over a contiguous tile of KV positions.
+//
+// Output per tile: unnormalised weighted V (FP32), local max score, and
+// local sum of exp(score - max).  A lightweight reduce kernel merges
+// tiles using the log-sum-exp identity.
+//
+// Grid: (num_q_heads, num_tiles, 1)   Block: (256, 1, 1)
+// Shared memory: tile_size * 4 + 128 bytes  (scores + warp scratch)
+
+extern "C" __global__ void gqa_attention_tiled(
+    float* __restrict__ partial_o,     // [num_q_heads, num_tiles, head_dim]
+    float* __restrict__ partial_lse,   // [num_q_heads, num_tiles, 2] (max, sum_exp)
+    const float* __restrict__ q,       // [num_q_heads * head_dim]
+    const __nv_fp8_e4m3* __restrict__ k_cache,  // [max_seq, kv_stride] FP8
+    const __nv_fp8_e4m3* __restrict__ v_cache,  // [max_seq, kv_stride] FP8
+    float sm_scale,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int tile_size
+) {
+    int qh = blockIdx.x;
+    int tile_idx = blockIdx.y;
+    int num_tiles = (seq_len + tile_size - 1) / tile_size;
+    if (qh >= num_q_heads || tile_idx >= num_tiles) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    int heads_per_kv = num_q_heads / num_kv_heads;
+    int kv_head = qh / heads_per_kv;
+    int kv_stride = num_kv_heads * head_dim;
+
+    const float* q_head = q + qh * head_dim;
+
+    int tile_start = tile_idx * tile_size;
+    int tile_end = tile_start + tile_size;
+    if (tile_end > seq_len) tile_end = seq_len;
+    int tile_len = tile_end - tile_start;
+
+    // Dynamic shared memory: [tile_size] scores + [32] warp scratch
+    extern __shared__ float smem[];
+    float* smem_reduce = smem + tile_size;
+
+    int warp_id = tid / warpSize;
+    int lane_id = tid % warpSize;
+    int num_warps = (num_threads + warpSize - 1) / warpSize;
+
+    // ── Step 1: Q·K dot products for this tile ──
+    for (int i = tid; i < tile_len; i += num_threads) {
+        int pos = tile_start + i;
+        float score = 0.0f;
+        const __nv_fp8_e4m3* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
+        for (int d = 0; d < head_dim; d++) {
+            score += q_head[d] * fp8e4m3_to_f32(k_vec[d]);
+        }
+        smem[i] = score * sm_scale;
+    }
+    __syncthreads();
+
+    // ── Step 2: Local max (parallel reduction) ──
+    float local_max = -1e30f;
+    for (int i = tid; i < tile_len; i += num_threads) {
+        local_max = fmaxf(local_max, smem[i]);
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_max;
+    __syncthreads();
+    if (tid == 0) {
+        float gmax = smem_reduce[0];
+        for (int w = 1; w < num_warps; w++) gmax = fmaxf(gmax, smem_reduce[w]);
+        smem_reduce[0] = gmax;
+    }
+    __syncthreads();
+    float tile_max = smem_reduce[0];
+
+    // ── Step 3: exp(score - max) in-place, compute local sum ──
+    float local_sum = 0.0f;
+    for (int i = tid; i < tile_len; i += num_threads) {
+        float w = expf(smem[i] - tile_max);
+        smem[i] = w;
+        local_sum += w;
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_sum;
+    __syncthreads();
+    if (tid == 0) {
+        float gsum = 0.0f;
+        for (int w = 0; w < num_warps; w++) gsum += smem_reduce[w];
+        smem_reduce[0] = gsum;
+    }
+    __syncthreads();
+    float tile_sum = smem_reduce[0];
+
+    // ── Step 4: Unnormalised weighted V sum ──
+    float* out_partial = partial_o + (qh * num_tiles + tile_idx) * head_dim;
+    for (int d = tid; d < head_dim; d += num_threads) {
+        float acc = 0.0f;
+        for (int i = 0; i < tile_len; i++) {
+            acc += smem[i] * fp8e4m3_to_f32(
+                v_cache[(tile_start + i) * kv_stride + kv_head * head_dim + d]);
+        }
+        out_partial[d] = acc;
+    }
+
+    // ── Step 5: Store tile statistics ──
+    if (tid == 0) {
+        float* lse = partial_lse + (qh * num_tiles + tile_idx) * 2;
+        lse[0] = tile_max;
+        lse[1] = tile_sum;
+    }
+}
+
+// Merge tiled attention partials using log-sum-exp rescaling.
+// One block per Q head, 256 threads cooperate on head_dim output dims.
+//
+// Grid: (num_q_heads, 1, 1)   Block: (256, 1, 1)
+// Shared memory: num_tiles * 4 bytes (correction weights)
+
+extern "C" __global__ void gqa_attention_reduce(
+    float* __restrict__ output,            // [num_q_heads * head_dim]
+    const float* __restrict__ partial_o,   // [num_q_heads, num_tiles, head_dim]
+    const float* __restrict__ partial_lse, // [num_q_heads, num_tiles, 2]
+    int num_q_heads,
+    int head_dim,
+    int num_tiles
+) {
+    int qh = blockIdx.x;
+    if (qh >= num_q_heads) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    extern __shared__ float smem[];
+    // smem[0..num_tiles-1] = per-tile normalised correction weight
+
+    const float* lse = partial_lse + qh * num_tiles * 2;
+
+    // Thread 0 computes correction weights (num_tiles is small, ~O(100))
+    if (tid == 0) {
+        float global_max = -1e30f;
+        for (int t = 0; t < num_tiles; t++) {
+            global_max = fmaxf(global_max, lse[t * 2]);
+        }
+        // global_sum = sum_t(exp(tile_max_t - global_max) * tile_sum_t)
+        //            = sum_all(exp(score_i - global_max))
+        float global_sum = 0.0f;
+        for (int t = 0; t < num_tiles; t++) {
+            float correction = expf(lse[t * 2] - global_max);
+            global_sum += correction * lse[t * 2 + 1];
+            smem[t] = correction;  // just the rescaling factor, NOT multiplied by tile_sum
+        }
+        // Normalize: smem[t] = exp(tile_max_t - global_max) / global_sum
+        float inv_sum = 1.0f / global_sum;
+        for (int t = 0; t < num_tiles; t++) {
+            smem[t] *= inv_sum;
+        }
+    }
+    __syncthreads();
+
+    // All threads cooperate on output dimensions
+    const float* po = partial_o + qh * num_tiles * head_dim;
+    float* out = output + qh * head_dim;
+    for (int d = tid; d < head_dim; d += num_threads) {
+        float acc = 0.0f;
+        for (int t = 0; t < num_tiles; t++) {
+            acc += smem[t] * po[t * head_dim + d];
+        }
+        out[d] = acc;
+    }
+}
+
 // ── Gated Attention Helpers ────────────────────────────────────────────
 
 // Split gated Q projection output into Q and gate.

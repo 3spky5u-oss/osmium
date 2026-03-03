@@ -49,6 +49,8 @@ const KERNEL_NAMES: &[&str] = &[
     "apply_rope",
     "kv_cache_write",
     "gqa_attention",
+    "gqa_attention_tiled",
+    "gqa_attention_reduce",
     "split_gated_q",
     "apply_gated_attn",
     "bf16_to_fp32",
@@ -658,6 +660,14 @@ struct GpuDecodeGraph {
     d_gqa_v: cudarc::driver::CudaSlice<f32>,
     d_gqa_out: cudarc::driver::CudaSlice<f32>,
 
+    // FlashDecoding tiled attention partial buffers (allocated lazily after kv_max_seq is known)
+    d_gqa_tiled_o: Option<cudarc::driver::CudaSlice<f32>>,   // [num_q_heads, max_tiles, head_dim]
+    d_gqa_tiled_lse: Option<cudarc::driver::CudaSlice<f32>>, // [num_q_heads, max_tiles, 2]
+    gqa_tile_size: usize,
+    gqa_max_tiles: usize,
+    gqa_num_q_heads: usize,
+    gqa_head_dim: usize,
+
     // Linear attention scratch (FP32)
     d_la_qkvz: cudarc::driver::CudaSlice<f32>,
     d_la_ba: cudarc::driver::CudaSlice<f32>,
@@ -1063,6 +1073,12 @@ impl GpuDecodeStore {
             d_gqa_k,
             d_gqa_v,
             d_gqa_out,
+            d_gqa_tiled_o: None,
+            d_gqa_tiled_lse: None,
+            gqa_tile_size: 0,
+            gqa_max_tiles: 0,
+            gqa_num_q_heads: 0,
+            gqa_head_dim: 0,
             d_la_qkvz,
             d_la_ba,
             d_la_conv_out,
@@ -2505,6 +2521,39 @@ impl GpuDecodeStore {
         }
         log::info!("GpuDecodeStore: KV cache shared FP8 pointers set ({} GQA layers, max_seq={})",
             registered, max_seq);
+
+        // Allocate FlashDecoding tiled attention buffers.
+        // Find max num_q_heads and head_dim across all GQA layers.
+        let mut max_nh: usize = 0;
+        let mut max_hd: usize = 0;
+        for layer in &graph.layers {
+            if let GpuAttnConfig::GQA { num_heads, head_dim, .. } = &layer.attn {
+                max_nh = max_nh.max(*num_heads);
+                max_hd = max_hd.max(*head_dim);
+            }
+        }
+        if max_nh > 0 && max_hd > 0 {
+            let tile_size: usize = 256;
+            let max_tiles = (max_seq + tile_size - 1) / tile_size;
+            let partial_o_size = max_nh * max_tiles * max_hd;  // floats
+            let partial_lse_size = max_nh * max_tiles * 2;     // floats
+            let d_tiled_o = self.device.alloc_zeros::<f32>(partial_o_size)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
+            let d_tiled_lse = self.device.alloc_zeros::<f32>(partial_lse_size)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
+            let o_mb = (partial_o_size * 4) as f64 / (1024.0 * 1024.0);
+            let lse_kb = (partial_lse_size * 4) as f64 / 1024.0;
+            log::info!("GpuDecodeStore: tiled GQA buffers allocated (tile_size={}, max_tiles={}, \
+                        partial_o={:.1} MB, partial_lse={:.1} KB)",
+                       tile_size, max_tiles, o_mb, lse_kb);
+            graph.d_gqa_tiled_o = Some(d_tiled_o);
+            graph.d_gqa_tiled_lse = Some(d_tiled_lse);
+            graph.gqa_tile_size = tile_size;
+            graph.gqa_max_tiles = max_tiles;
+            graph.gqa_num_q_heads = max_nh;
+            graph.gqa_head_dim = max_hd;
+        }
+
         Ok(())
     }
 
@@ -3208,41 +3257,103 @@ impl GpuDecodeStore {
                     }
 
                     // ── GQA: Attention compute ──
-                    // Hybrid kernel: uses shared memory for scores when seq_len
-                    // fits in available shared memory (48KB default, up to 99KB with
-                    // opt-in on Blackwell+), falls back to 2-pass for longer sequences.
+                    // For short sequences: single-block shared-memory kernel (one block per Q head).
+                    // For long sequences: FlashDecoding tiled kernel (splits seq across blocks)
+                    //   + lightweight reduce kernel. Threshold: use tiled when seq_len > tile_size.
                     {
                         let threads = 256u32;
                         let seq_len = (position + 1) as u32;
-                        // Use the opt-in max shared memory (set during PTX load)
-                        let smem_threshold = (graph.gqa_max_smem_bytes - 128) / 4;
-                        let use_smem = seq_len <= smem_threshold;
-                        let shared_mem_bytes = if use_smem {
-                            (seq_len as u32) * 4 + 128 // scores + warp scratch
+                        let tile_size = graph.gqa_tile_size;
+                        let num_tiles_candidate = if tile_size > 0 {
+                            ((seq_len as usize) + tile_size - 1) / tile_size
+                        } else { 0 };
+                        // Use tiled when total blocks (tiles * heads) >= num_sms.
+                        // Below that, the original single-block-per-head kernel is faster
+                        // because the per-tile overhead isn't worth it.
+                        let use_tiled = tile_size > 0
+                            && graph.d_gqa_tiled_o.is_some()
+                            && (num_tiles_candidate * nh) >= graph.num_sms;
+
+                        if use_tiled {
+                            // FlashDecoding: tiled attention + reduce
+                            let num_tiles = ((seq_len as usize) + tile_size - 1) / tile_size;
+                            let tile_smem = (tile_size as u32) * 4 + 128;
+                            let tiled_o = graph.d_gqa_tiled_o.as_ref().unwrap();
+                            let tiled_lse = graph.d_gqa_tiled_lse.as_ref().unwrap();
+                            unsafe {
+                                let tiled_fn = self.device.get_func(MODULE_NAME, "gqa_attention_tiled")
+                                    .ok_or_else(|| "gqa_attention_tiled not found".to_string())?;
+                                tiled_fn.launch(
+                                    LaunchConfig {
+                                        grid_dim: (nh as u32, num_tiles as u32, 1),
+                                        block_dim: (threads, 1, 1),
+                                        shared_mem_bytes: tile_smem,
+                                    },
+                                    (
+                                        *tiled_o.device_ptr(),
+                                        *tiled_lse.device_ptr(),
+                                        *graph.d_gqa_q.device_ptr(),
+                                        graph.kv_k_ptrs[layer_idx],
+                                        graph.kv_v_ptrs[layer_idx],
+                                        *sm_scale,
+                                        nh as i32,
+                                        nkv as i32,
+                                        hd as i32,
+                                        seq_len as i32,
+                                        tile_size as i32,
+                                    ),
+                                ).map_err(|e| format!("gqa_attention_tiled[{}]: {:?}", layer_idx, e))?;
+
+                                let reduce_fn = self.device.get_func(MODULE_NAME, "gqa_attention_reduce")
+                                    .ok_or_else(|| "gqa_attention_reduce not found".to_string())?;
+                                let reduce_smem = (num_tiles as u32) * 4;
+                                reduce_fn.launch(
+                                    LaunchConfig {
+                                        grid_dim: (nh as u32, 1, 1),
+                                        block_dim: (threads, 1, 1),
+                                        shared_mem_bytes: reduce_smem,
+                                    },
+                                    (
+                                        *graph.d_gqa_out.device_ptr(),
+                                        *tiled_o.device_ptr(),
+                                        *tiled_lse.device_ptr(),
+                                        nh as i32,
+                                        hd as i32,
+                                        num_tiles as i32,
+                                    ),
+                                ).map_err(|e| format!("gqa_attention_reduce[{}]: {:?}", layer_idx, e))?;
+                            }
                         } else {
-                            128 // just warp scratch for 2-pass fallback
-                        };
-                        let cfg = LaunchConfig {
-                            grid_dim: (nh as u32, 1, 1),
-                            block_dim: (threads, 1, 1),
-                            shared_mem_bytes,
-                        };
-                        unsafe {
-                            let attn_fn = self.device.get_func(MODULE_NAME, "gqa_attention")
-                                .ok_or_else(|| "gqa_attention not found".to_string())?;
-                            attn_fn.launch(cfg, (
-                                *graph.d_gqa_out.device_ptr(),
-                                *graph.d_gqa_q.device_ptr(),
-                                graph.kv_k_ptrs[layer_idx],
-                                graph.kv_v_ptrs[layer_idx],
-                                *sm_scale,
-                                nh as i32,
-                                nkv as i32,
-                                hd as i32,
-                                seq_len as i32,
-                                graph.kv_max_seq as i32,
-                                if use_smem { 1i32 } else { 0i32 },
-                            )).map_err(|e| format!("gqa_attention[{}]: {:?}", layer_idx, e))?;
+                            // Original single-block kernel for short sequences
+                            let smem_threshold = (graph.gqa_max_smem_bytes - 128) / 4;
+                            let use_smem = seq_len <= smem_threshold;
+                            let shared_mem_bytes = if use_smem {
+                                seq_len * 4 + 128
+                            } else {
+                                128
+                            };
+                            let cfg = LaunchConfig {
+                                grid_dim: (nh as u32, 1, 1),
+                                block_dim: (threads, 1, 1),
+                                shared_mem_bytes,
+                            };
+                            unsafe {
+                                let attn_fn = self.device.get_func(MODULE_NAME, "gqa_attention")
+                                    .ok_or_else(|| "gqa_attention not found".to_string())?;
+                                attn_fn.launch(cfg, (
+                                    *graph.d_gqa_out.device_ptr(),
+                                    *graph.d_gqa_q.device_ptr(),
+                                    graph.kv_k_ptrs[layer_idx],
+                                    graph.kv_v_ptrs[layer_idx],
+                                    *sm_scale,
+                                    nh as i32,
+                                    nkv as i32,
+                                    hd as i32,
+                                    seq_len as i32,
+                                    graph.kv_max_seq as i32,
+                                    if use_smem { 1i32 } else { 0i32 },
+                                )).map_err(|e| format!("gqa_attention[{}]: {:?}", layer_idx, e))?;
+                            }
                         }
                     }
 
