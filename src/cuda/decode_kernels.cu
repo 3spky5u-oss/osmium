@@ -4,6 +4,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -13,6 +14,14 @@ __device__ __forceinline__ float bf16_to_f32(__nv_bfloat16 x) {
 
 __device__ __forceinline__ __nv_bfloat16 f32_to_bf16(float x) {
     return __float2bfloat16(x);
+}
+
+__device__ __forceinline__ float fp8e4m3_to_f32(__nv_fp8_e4m3 x) {
+    return float(x);
+}
+
+__device__ __forceinline__ __nv_fp8_e4m3 f32_to_fp8e4m3(float x) {
+    return __nv_fp8_e4m3(x);
 }
 
 __device__ __forceinline__ float silu(float x) {
@@ -887,10 +896,10 @@ extern "C" __global__ void apply_rope(
     data[half_dim + i] = x2 * cos_val + x1 * sin_val;
 }
 
-// Write K,V to FP16 KV cache at given position
+// Write K,V to FP8 E4M3 KV cache at given position
 extern "C" __global__ void kv_cache_write(
-    __nv_bfloat16* __restrict__ k_cache,   // [max_seq, kv_stride] BF16
-    __nv_bfloat16* __restrict__ v_cache,   // [max_seq, kv_stride] BF16
+    __nv_fp8_e4m3* __restrict__ k_cache,   // [max_seq, kv_stride] FP8
+    __nv_fp8_e4m3* __restrict__ v_cache,   // [max_seq, kv_stride] FP8
     const float* __restrict__ k,     // [kv_stride]
     const float* __restrict__ v,     // [kv_stride]
     int position,
@@ -898,18 +907,19 @@ extern "C" __global__ void kv_cache_write(
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < kv_stride) {
-        k_cache[position * kv_stride + i] = f32_to_bf16(k[i]);
-        v_cache[position * kv_stride + i] = f32_to_bf16(v[i]);
+        k_cache[position * kv_stride + i] = f32_to_fp8e4m3(k[i]);
+        v_cache[position * kv_stride + i] = f32_to_fp8e4m3(v[i]);
     }
 }
 
-// Single-query GQA attention: scores over all cached K, softmax, weighted V sum
-// One block per Q head. Uses shared memory for scores.
+// Single-query GQA attention: scores over all cached K, softmax, weighted V sum.
+// One block per Q head. Uses shared memory for attention scores.
+// KV cache is FP8 E4M3 — dequantized to FP32 on the fly.
 extern "C" __global__ void gqa_attention(
     float* __restrict__ output,          // [num_q_heads * head_dim]
     const float* __restrict__ q,          // [num_q_heads * head_dim]
-    const __nv_bfloat16* __restrict__ k_cache,   // [max_seq, kv_stride] BF16
-    const __nv_bfloat16* __restrict__ v_cache,   // [max_seq, kv_stride] BF16
+    const __nv_fp8_e4m3* __restrict__ k_cache,   // [max_seq, kv_stride] FP8
+    const __nv_fp8_e4m3* __restrict__ v_cache,   // [max_seq, kv_stride] FP8
     float sm_scale,
     int num_q_heads,
     int num_kv_heads,
@@ -923,7 +933,6 @@ extern "C" __global__ void gqa_attention(
     int tid = threadIdx.x;
     int num_threads = blockDim.x;
 
-    // Which KV head does this Q head attend to?
     int heads_per_kv = num_q_heads / num_kv_heads;
     int kv_head = qh / heads_per_kv;
     int kv_stride = num_kv_heads * head_dim;
@@ -931,14 +940,13 @@ extern "C" __global__ void gqa_attention(
     const float* q_head = q + qh * head_dim;
 
     // Step 1: Compute attention scores (Q @ K^T) for all positions
-    extern __shared__ float smem[];  // [seq_len] for scores, then reused
-    // Each thread computes scores for a subset of positions
+    extern __shared__ float smem[];  // [seq_len] for scores
     float max_score = -1e30f;
     for (int pos = tid; pos < seq_len; pos += num_threads) {
         float score = 0.0f;
-        const __nv_bfloat16* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
+        const __nv_fp8_e4m3* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
         for (int d = 0; d < head_dim; d++) {
-            score += q_head[d] * bf16_to_f32(k_vec[d]);
+            score += q_head[d] * fp8e4m3_to_f32(k_vec[d]);
         }
         score *= sm_scale;
         smem[pos] = score;
@@ -999,7 +1007,7 @@ extern "C" __global__ void gqa_attention(
     for (int d = tid; d < head_dim; d += num_threads) {
         float acc = 0.0f;
         for (int pos = 0; pos < seq_len; pos++) {
-            acc += smem[pos] * bf16_to_f32(v_cache[pos * kv_stride + kv_head * head_dim + d]);
+            acc += smem[pos] * fp8e4m3_to_f32(v_cache[pos * kv_stride + kv_head * head_dim + d]);
         }
         out_head[d] = acc;
     }

@@ -6,7 +6,7 @@ Dev machine setup for building and testing Krasis from source.
 
 - CPU: AMD EPYC 7742 (64 cores, AVX2, NO AVX-512/AMX)
 - RAM: 995 GB DDR4
-- GPUs: 3x NVIDIA RTX 2000 Ada (16 GB each)
+- GPUs: 1x NVIDIA RTX 5090 (32 GB, PCIe 4.0 x16) + 1x NVIDIA RTX 2000 Ada (16 GB, PCIe 4.0 x8)
 - OS: Ubuntu, Linux 6.17
 
 ## Dev Environment

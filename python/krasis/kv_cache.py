@@ -157,8 +157,15 @@ class PagedKVCache:
         return pages
 
     def free_pages(self, pages: List[int]):
-        """Return pages to the free pool."""
+        """Return pages to the free pool.
+
+        Re-sorts in descending order so pop() always gives sequential
+        page indices (0, 1, 2, ...). This is required because Rust decode
+        reads the KV cache contiguously — the paged layout must match the
+        contiguous layout, which only works when pages are in order.
+        """
         self._free_pages.extend(pages)
+        self._free_pages.sort(reverse=True)
 
     # ── MLA cache access ──
 

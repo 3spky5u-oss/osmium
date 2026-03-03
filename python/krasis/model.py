@@ -3957,13 +3957,23 @@ class KrasisModel:
                 logger.info("Registered shared_expert_gate for layer %d: wid=%d shape=%s",
                             layer_idx, sg_wid, sg.shape)
 
-        # Allocate KV cache for Rust decode (only need current context, not full capacity)
-        # We use 8K as default max sequence for the Rust KV cache -- enough for typical decode
-        # after prefill. The FlashInfer KV cache handles the full capacity.
-        rust_kv_max_seq = 8192
-        logger.info("Allocating Rust KV cache: max_seq=%d", rust_kv_max_seq)
-        store.allocate_kv_cache(rust_kv_max_seq)
-        logger.info("Rust KV cache allocated")
+        # Register shared FP8 KV cache pointers — Rust decode reads/writes the
+        # same GPU buffers that FlashInfer uses during prefill. No separate
+        # allocation, no D2D export copy between prefill and decode.
+        cache = self.kv_caches[0]
+        if cache is not None and cache.k_cache is not None:
+            kv_ptrs = []
+            gqa_cache_idx = 0
+            for layer_idx, layer in enumerate(self.layers):
+                if layer.layer_type != "linear_attention":
+                    k_layer = cache.k_cache[gqa_cache_idx]  # [max_pages, page_size, nkv, hd]
+                    v_layer = cache.v_cache[gqa_cache_idx]
+                    gqa_cache_idx += 1
+                    kv_ptrs.append((layer_idx, k_layer.data_ptr(), v_layer.data_ptr()))
+            max_seq = cache.max_pages * cache.page_size
+            store.set_kv_cache_ptrs(kv_ptrs, max_seq)
+            logger.info("Shared FP8 KV cache: %d GQA layers, max_seq=%d (%d pages × %d)",
+                        len(kv_ptrs), max_seq, cache.max_pages, cache.page_size)
 
         self._gpu_decode_store = store
 
@@ -3977,56 +3987,23 @@ class KrasisModel:
         return store
 
     def _export_kv_to_rust(self, seq_states, prompt_len: int):
-        """Export KV cache from FlashInfer paged layout to Rust contiguous layout."""
+        """Set KV cache position for Rust decode after prefill.
+
+        The KV cache is shared — FlashInfer already wrote FP8 data into the
+        same GPU buffers that Rust decode reads. No data copy needed, just
+        tell Rust how many tokens are valid.
+        """
         store = self._gpu_decode_store
-        cache = self.kv_caches[0]
-        if cache is None or cache.k_cache is None:
-            return
 
-        seq_state = seq_states[0]
-        if seq_state is None:
-            return
-
-        kv_data = []
-        self._rust_kv_refs = []
-        pages = seq_state.pages
-        page_size = cache.page_size
-        gqa_cache_idx = 0  # KV cache is indexed by GQA layer count, not absolute layer
-
-        for layer_idx, layer in enumerate(self.layers):
-            if layer.layer_type != "linear_attention":
-                attn = layer.attention
-                nkv = attn.num_kv_heads
-                hd = attn.head_dim
-                kv_stride = nkv * hd
-
-                # k_cache: [num_gqa_layers, max_pages, page_size, num_kv_heads, head_dim]
-                k_pages = cache.k_cache[gqa_cache_idx, pages]
-                v_pages = cache.v_cache[gqa_cache_idx, pages]
-                gqa_cache_idx += 1
-
-                # Reshape to [n_pages * page_size, nkv * hd], trim to seq_len
-                k_cont = k_pages.reshape(-1, nkv * hd)[:prompt_len].contiguous()
-                v_cont = v_pages.reshape(-1, nkv * hd)[:prompt_len].contiguous()
-
-                # Convert to BF16 if needed (KV cache may be FP8)
-                if k_cont.dtype != torch.bfloat16:
-                    k_cont = k_cont.to(torch.bfloat16)
-                    v_cont = v_cont.to(torch.bfloat16)
-
-                kv_data.append((layer_idx, k_cont.data_ptr(), v_cont.data_ptr(), kv_stride))
-                self._rust_kv_refs.extend([k_cont, v_cont])
-
-        # Guard: don't overflow Rust KV buffer (benchmark warmup may use > max_seq tokens)
+        # Guard: don't overflow shared KV buffer
         rust_max_seq = getattr(store, 'kv_max_seq', 0)
         if rust_max_seq > 0 and prompt_len > rust_max_seq:
-            import logging
-            logging.getLogger("krasis.model").warning(
-                f"Prompt length {prompt_len} exceeds Rust KV cache ({rust_max_seq}), "
-                f"skipping KV export (decode will not run for this request)")
+            logger.warning(
+                "Prompt length %d exceeds KV cache max_seq (%d), "
+                "skipping decode for this request", prompt_len, rust_max_seq)
             return
 
-        store.import_kv_cache(kv_data, prompt_len)
+        store.set_kv_position(prompt_len)
 
     def _update_la_state_ptrs(self):
         """Re-register LA state pointers after prefill (states may have been reallocated).

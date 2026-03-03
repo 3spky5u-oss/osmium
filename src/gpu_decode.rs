@@ -606,11 +606,12 @@ struct GpuDecodeGraph {
     /// Whether model norms use (1+w)*x instead of w*x.
     norm_bias_one: bool,
 
-    /// GQA KV cache: contiguous FP16 [max_seq_len, kv_stride] per layer.
-    /// Allocated by Rust, populated from FlashInfer after prefill, then
-    /// written to by CUDA kernels during decode.
-    kv_k_cache: Vec<cudarc::driver::CudaSlice<u16>>,
-    kv_v_cache: Vec<cudarc::driver::CudaSlice<u16>>,
+    /// GQA KV cache: raw device pointers to FP8 E4M3 [max_seq, kv_stride] per layer.
+    /// Memory is owned by Python (PagedKVCache tensors). Prefill writes FP8 via
+    /// FlashInfer, decode writes FP8 via kv_cache_write kernel. Shared buffer,
+    /// no export copy needed.
+    kv_k_ptrs: Vec<u64>,  // device pointers, one per layer (indexed by layer_idx)
+    kv_v_ptrs: Vec<u64>,
     kv_max_seq: usize,
     kv_current_pos: usize,
 
@@ -742,6 +743,42 @@ impl GpuDecodeStore {
             ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                 format!("Failed to load decode kernels PTX: {:?}", e)))?;
             log::info!("GpuDecodeStore: loaded {} CUDA decode kernels", KERNEL_NAMES.len());
+
+            // Set max dynamic shared memory for gqa_attention kernel.
+            // Required for long sequences (>12K tokens) where shared memory
+            // exceeds the 48KB default limit. RTX 5090 supports up to 228KB.
+            let attn_found = device.has_func(MODULE_NAME, "gqa_attention");
+            log::info!("GpuDecodeStore: gqa_attention function found: {}", attn_found);
+            if let Some(attn_fn) = device.get_func(MODULE_NAME, "gqa_attention") {
+                let mut max_smem_per_block: i32 = 0;
+                unsafe {
+                    let mut dev: i32 = 0;
+                    cuda_sys::lib().cuCtxGetDevice(&mut dev);
+                    cuda_sys::lib().cuDeviceGetAttribute(
+                        &mut max_smem_per_block,
+                        cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+                        dev,
+                    );
+                }
+                if max_smem_per_block > 0 {
+                    // Extract raw CUfunction from CudaFunction via transmute.
+                    // CudaFunction layout: { cu_function: CUfunction, device: Arc<CudaDevice> }
+                    let raw_func: cuda_sys::CUfunction = unsafe {
+                        std::ptr::read((&attn_fn as *const _ as *const cuda_sys::CUfunction))
+                    };
+                    if !raw_func.is_null() {
+                        let r = unsafe {
+                            cuda_sys::lib().cuFuncSetAttribute(
+                                raw_func,
+                                cuda_sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                max_smem_per_block,
+                            )
+                        };
+                        log::info!("GpuDecodeStore: gqa_attention max dynamic shared memory set to {} KB (result={:?})",
+                            max_smem_per_block / 1024, r);
+                    }
+                }
+            }
         }
 
         #[cfg(not(has_decode_kernels))]
@@ -929,8 +966,8 @@ impl GpuDecodeStore {
             kernels: None,
             pre_events: None,
             norm_bias_one: false,
-            kv_k_cache: Vec::new(),
-            kv_v_cache: Vec::new(),
+            kv_k_ptrs: Vec::new(),
+            kv_v_ptrs: Vec::new(),
             kv_max_seq: 0,
             kv_current_pos: 0,
             d_rope_cos: None,
@@ -2288,81 +2325,48 @@ impl GpuDecodeStore {
         Ok(())
     }
 
-    /// Allocate KV cache for GPU decode. Called once during setup.
-    /// For each GQA layer, allocates [max_seq, num_kv_heads * head_dim] FP16 for K and V.
-    #[pyo3(signature = (max_seq))]
-    fn allocate_kv_cache(&mut self, max_seq: usize) -> PyResult<()> {
-        let graph = self.graph.as_mut()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
-        graph.kv_max_seq = max_seq;
-        graph.kv_k_cache.clear();
-        graph.kv_v_cache.clear();
-        let mut total_mb = 0.0f64;
-        for layer in graph.layers.iter() {
-            if let GpuAttnConfig::GQA { num_kv_heads, head_dim, .. } = &layer.attn {
-                let stride = num_kv_heads * head_dim;
-                let size = max_seq * stride;
-                let k_cache = self.device.alloc_zeros::<u16>(size)
-                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
-                let v_cache = self.device.alloc_zeros::<u16>(size)
-                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
-                total_mb += (size * 2 * 2) as f64 / (1024.0 * 1024.0); // 2 bytes * K + V
-                graph.kv_k_cache.push(k_cache);
-                graph.kv_v_cache.push(v_cache);
-            } else {
-                // LA layers don't need KV cache (they use conv/recur state)
-                // Push dummy zero-size allocs to keep indices aligned
-                let dummy = self.device.alloc_zeros::<u16>(1)
-                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
-                let dummy2 = self.device.alloc_zeros::<u16>(1)
-                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
-                graph.kv_k_cache.push(dummy);
-                graph.kv_v_cache.push(dummy2);
-            }
-        }
-        log::info!("GpuDecodeStore: KV cache allocated {:.1} MB ({} layers, max_seq={})",
-            total_mb, graph.layers.len(), max_seq);
-        Ok(())
-    }
-
-    /// Copy KV cache data from FlashInfer paged layout to our contiguous layout.
-    /// Called once per request after Python prefill completes.
+    /// Register shared FP8 KV cache pointers from Python's PagedKVCache.
+    /// Python owns the memory (FP8 E4M3 contiguous tensors). Both FlashInfer
+    /// prefill and Rust decode read/write the same buffers — no export copy.
     ///
-    /// For each GQA layer, copies the KV data produced during prefill into the
-    /// contiguous Rust-managed KV cache.
-    ///
-    /// kv_data: list of (layer_idx, k_data_ptr, v_data_ptr, seq_len, kv_stride)
-    /// where k_data_ptr/v_data_ptr point to contiguous FP16 [seq_len, kv_stride] on GPU.
-    #[pyo3(signature = (kv_data, seq_len))]
-    fn import_kv_cache(
+    /// kv_ptrs: list of (layer_idx, k_data_ptr, v_data_ptr) device pointers.
+    /// max_seq: maximum sequence length the buffers can hold.
+    #[pyo3(signature = (kv_ptrs, max_seq))]
+    fn set_kv_cache_ptrs(
         &mut self,
-        kv_data: Vec<(usize, usize, usize, usize)>,
-        seq_len: usize,
+        kv_ptrs: Vec<(usize, usize, usize)>,
+        max_seq: usize,
     ) -> PyResult<()> {
         let graph = self.graph.as_mut()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
-        for (layer_idx, k_ptr, v_ptr, kv_stride) in kv_data {
-            if layer_idx >= graph.kv_k_cache.len() {
+        let num_layers = graph.layers.len();
+        graph.kv_k_ptrs = vec![0u64; num_layers];
+        graph.kv_v_ptrs = vec![0u64; num_layers];
+        graph.kv_max_seq = max_seq;
+        let mut registered = 0usize;
+        for (layer_idx, k_ptr, v_ptr) in kv_ptrs {
+            if layer_idx >= num_layers {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    format!("Layer {} out of range for KV cache", layer_idx)));
+                    format!("Layer {} out of range ({})", layer_idx, num_layers)));
             }
-            let bytes = seq_len * kv_stride * 2; // FP16
-            unsafe {
-                let err = cuda_sys::lib().cuMemcpyDtoD_v2(
-                    *graph.kv_k_cache[layer_idx].device_ptr(),
-                    k_ptr as u64, bytes);
-                if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                        format!("D2D KV import K[{}]: {:?}", layer_idx, err)));
-                }
-                let err = cuda_sys::lib().cuMemcpyDtoD_v2(
-                    *graph.kv_v_cache[layer_idx].device_ptr(),
-                    v_ptr as u64, bytes);
-                if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                        format!("D2D KV import V[{}]: {:?}", layer_idx, err)));
-                }
-            }
+            graph.kv_k_ptrs[layer_idx] = k_ptr as u64;
+            graph.kv_v_ptrs[layer_idx] = v_ptr as u64;
+            registered += 1;
+        }
+        log::info!("GpuDecodeStore: KV cache shared FP8 pointers set ({} GQA layers, max_seq={})",
+            registered, max_seq);
+        Ok(())
+    }
+
+    /// Set KV cache position after prefill. Called once per request.
+    /// No data copy needed — prefill already wrote into the shared buffer.
+    #[pyo3(signature = (seq_len))]
+    fn set_kv_position(&mut self, seq_len: usize) -> PyResult<()> {
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        if seq_len > graph.kv_max_seq {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                format!("seq_len {} exceeds KV max_seq {}", seq_len, graph.kv_max_seq)));
         }
         graph.kv_current_pos = seq_len;
         Ok(())
@@ -2513,6 +2517,13 @@ impl GpuDecodeStore {
         let hs = graph.hidden_size;
         let eps = graph.eps;
         let timing = graph.timing_enabled;
+
+        // Validate position doesn't exceed KV cache
+        if position >= graph.kv_max_seq {
+            return Err(format!(
+                "position {} exceeds kv_max_seq {} — KV cache too small for this decode",
+                position, graph.kv_max_seq));
+        }
 
         // Timing: sync and take initial timestamp
         let t0 = if timing {
@@ -3027,12 +3038,17 @@ impl GpuDecodeStore {
                             block_dim: (threads, 1, 1),
                             shared_mem_bytes: 0,
                         };
+                        if graph.kv_k_ptrs[layer_idx] == 0 || graph.kv_v_ptrs[layer_idx] == 0 {
+                            return Err(format!(
+                                "kv_cache_write[{}]: null KV pointer (k={:#x}, v={:#x})",
+                                layer_idx, graph.kv_k_ptrs[layer_idx], graph.kv_v_ptrs[layer_idx]));
+                        }
                         unsafe {
                             let kv_write_fn = self.device.get_func(MODULE_NAME, "kv_cache_write")
                                 .ok_or_else(|| "kv_cache_write not found".to_string())?;
                             kv_write_fn.launch(cfg, (
-                                *graph.kv_k_cache[layer_idx].device_ptr(),
-                                *graph.kv_v_cache[layer_idx].device_ptr(),
+                                graph.kv_k_ptrs[layer_idx],
+                                graph.kv_v_ptrs[layer_idx],
                                 *graph.d_gqa_k.device_ptr(),
                                 *graph.d_gqa_v.device_ptr(),
                                 position as i32,
@@ -3057,8 +3073,8 @@ impl GpuDecodeStore {
                             attn_fn.launch(cfg, (
                                 *graph.d_gqa_out.device_ptr(),
                                 *graph.d_gqa_q.device_ptr(),
-                                *graph.kv_k_cache[layer_idx].device_ptr(),
-                                *graph.kv_v_cache[layer_idx].device_ptr(),
+                                graph.kv_k_ptrs[layer_idx],
+                                graph.kv_v_ptrs[layer_idx],
                                 *sm_scale,
                                 nh as i32,
                                 nkv as i32,
@@ -3435,6 +3451,13 @@ impl GpuDecodeStore {
         F: FnMut(usize, &str, Option<&str>) -> bool,
     {
         use std::time::Instant;
+
+        // Bind CUDA context to this thread. Required when called from
+        // the server thread (which differs from the setup thread).
+        if let Err(e) = self.device.bind_to_thread() {
+            log::error!("gpu_generate_stream: failed to bind CUDA context: {:?}", e);
+            return 0;
+        }
 
         let vocab_size = match self.graph.as_ref() {
             Some(g) => g.vocab_size,

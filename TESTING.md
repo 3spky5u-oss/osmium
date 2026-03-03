@@ -6,7 +6,7 @@
 - Conda env: `/home/main/miniconda3/envs/krasis/` (Python 3.11)
 - Rust toolchain (maturin builds the PyO3 extension)
 - Models stored in `~/.krasis/models/<ModelName>/` (safetensors + config.json)
-- 3x NVIDIA RTX 2000 Ada (16 GB each), AMD EPYC 7742 (AVX2, 64 cores, 995 GB RAM)
+- 1x NVIDIA RTX 5090 (32 GB) + 1x NVIDIA RTX 2000 Ada (16 GB), AMD EPYC 7742 (AVX2, 64 cores, 995 GB RAM)
 
 Build the Rust extension:
 

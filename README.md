@@ -107,6 +107,17 @@ Benchmark uses 10K–50K token prompts (prefill) and 64-token generation runs (d
 | **Qwen3.5-35B-A3B**  | INT4 GPU + INT4 CPU | 2,295 | 7.11 | 140 | (Windows via WSL) |
 | **DeepSeek V2-Lite** | INT4 GPU + INT4 CPU | - | - | - | - |
 
+## Benchmark: EPYC 7742 + 1x RTX 5090 32 GB (GPU Decode)
+
+- **Hardware:** AMD EPYC 7742 (64 cores, 4 NUMA nodes), DDR4-2666 8-channel, 1x NVIDIA RTX 5090 32 GB, PCIe 4.0 x16.
+- **Config:** BF16 attention, FP8 KV cache, INT8 shared/MLP/lm_head, LGS=2, GPU decode (Rust, zero GIL), HCS expert pinning, pinned DMA.
+
+GPU decode streams MoE experts over PCIe while compute runs on VRAM-resident weights. The 5090's 32 GB VRAM holds attention, embeddings, norms, and ~40% of experts permanently.
+
+| Model | Expert Quant | Prefill (tok/s) | Decode (tok/s) | ms/tok | Notes |
+|-------|:------------:|:---------------:|:--------------:|:------:|:-----:|
+| **Qwen3-Coder-Next** | INT4 GPU + INT4 CPU | 2,022–3,636 | 30.4 | 33 | HCS 40%, ~5s layer streaming TTFT |
+
 ## Benchmark: EPYC 7742 + 1x RTX 2000 Ada 16 GB
 
 - **Hardware:** AMD EPYC 7742 (64 cores, 4 NUMA nodes), DDR4-2666 8-channel, 1x NVIDIA RTX 2000 Ada 16 GB, PCIe 4.0 x8.
