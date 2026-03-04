@@ -3104,6 +3104,19 @@ impl GpuDecodeStore {
     fn kv_max_seq(&self) -> usize {
         self.graph.as_ref().map_or(0, |g| g.kv_max_seq)
     }
+
+    /// Evict soft-tier HCS experts before prefill (PyO3 wrapper).
+    /// Returns (evicted_count, freed_mb).
+    #[pyo3(signature = (estimated_tokens))]
+    fn py_hcs_evict_for_prefill(&mut self, estimated_tokens: usize) -> (usize, f64) {
+        self.hcs_evict_for_prefill(estimated_tokens)
+    }
+
+    /// Reload soft-tier HCS experts after prefill (PyO3 wrapper).
+    /// Returns (loaded_count, reload_ms).
+    fn py_hcs_reload_after_prefill(&mut self) -> (usize, f64) {
+        self.hcs_reload_after_prefill()
+    }
 }
 
 // ── Pure-Rust methods for GPU decode (no PyO3, used by Rust HTTP server) ──

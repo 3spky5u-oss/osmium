@@ -197,9 +197,10 @@ def _warmup_prefill(model: KrasisModel):
             pass
 
 
-def _capture_prefill(model: KrasisModel, num_repeats: int) -> Optional[int]:
-    """Run a prefill and return prompt_len, WITHOUT cleanup.
+def _capture_prefill(model: KrasisModel, num_repeats: int):
+    """Run a prefill and return (prompt_len, prefill_result), WITHOUT cleanup.
     Leaves the model in prefilled state so decode can follow.
+    Returns (None, None) on failure.
     """
     import json as _json
     base_text = (
@@ -211,45 +212,38 @@ def _capture_prefill(model: KrasisModel, num_repeats: int) -> Optional[int]:
     messages_json = _json.dumps([{"role": "user", "content": warmup_text}])
     try:
         result = model.server_prefill(
-            messages_json, max_new_tokens=5, temperature=0.6, top_k=50,
+            messages_json, max_new_tokens=10, temperature=0.6, top_k=50,
             top_p=0.95, presence_penalty=0.0,
             enable_thinking=False, extra_stop_tokens=[],
             decode_mode="gpu",
         )
-        return result.prompt_len
+        return result.prompt_len, result
     except Exception as e:
         logger.warning("Capture prefill failed: %s", e)
         try:
             model.server_cleanup()
         except Exception:
             pass
-        return None
+        return None, None
 
 
-def _capture_decode(model: KrasisModel, num_steps: int = 4):
-    """Run decode steps on an already-prefilled prompt, then cleanup."""
+def _capture_decode_only(model: KrasisModel, prefill_result, num_steps: int = 4):
+    """Run decode steps using an existing prefill result, then cleanup.
+    The prefill must already have been done (model is in prefilled state).
+    """
     try:
         gpu_store = getattr(model, '_gpu_decode_store', None)
         if gpu_store is None:
             raise RuntimeError("GPU decode store not configured")
-        # Use a dummy prefill to get first_token and prompt_len for the decode
-        import json as _json
-        messages_json = _json.dumps([{"role": "user", "content": "Hi"}])
-        result = model.server_prefill(
-            messages_json, max_new_tokens=num_steps + 1, temperature=0.6, top_k=50,
-            top_p=0.95, presence_penalty=0.0,
-            enable_thinking=False, extra_stop_tokens=[],
-            decode_mode="gpu",
-        )
-        if result.first_token not in result.stop_ids:
+        if prefill_result.first_token not in prefill_result.stop_ids:
             gpu_store.gpu_generate_batch(
-                first_token=result.first_token,
-                start_position=result.prompt_len,
+                first_token=prefill_result.first_token,
+                start_position=prefill_result.prompt_len,
                 max_tokens=num_steps,
                 temperature=0.6,
                 top_k=50,
                 top_p=0.95,
-                stop_ids=result.stop_ids,
+                stop_ids=prefill_result.stop_ids,
                 presence_penalty=0.0,
             )
         model.server_cleanup()
@@ -488,8 +482,8 @@ def main():
                         help="Pin HCS experts across ALL GPUs (more capacity, but cross-device transfer)")
     parser.add_argument("--hcs-headroom-mb", type=int, default=1024,
                         help="VRAM headroom to reserve after warmup before HCS allocation (default: 1024 MB)")
-    parser.add_argument("--vram-safety-margin", type=int, default=1500,
-                        help="VRAM safety margin in MB — reserved free VRAM below which warnings fire (default: 1500)")
+    parser.add_argument("--vram-safety-margin", type=int, default=1000,
+                        help="VRAM safety margin in MB — reserved free VRAM below which warnings fire (default: 1000)")
     parser.add_argument("--stream-attention", action="store_true",
                         help="Stream attention weights from CPU instead of keeping resident on GPU. "
                              "Use when attention weights don't fit in VRAM (e.g. very large models).")
@@ -724,44 +718,52 @@ def main():
     SHORT_REPEATS = 17   # ~500 tokens
     LONG_REPEATS = 1700  # ~51K tokens
 
+    # ── 2a: Short prompt — prefill then decode (measured separately) ──
     vram_monitor.reset_min_free()
     _dim("Capture: short prompt prefill (~500 tokens)")
-    short_prompt_len = _capture_prefill(_model, SHORT_REPEATS)
+    short_prompt_len, short_result = _capture_prefill(_model, SHORT_REPEATS)
     torch.cuda.synchronize()
     time.sleep(0.1)  # let monitor poll
     prefill_short_free = vram_monitor.min_free_mb(dev_idx)
     short_tokens = short_prompt_len or 500
-    _model.server_cleanup()
+    logger.info("VRAM capture: short prefill: %d tokens, min_free=%d MB", short_tokens, prefill_short_free)
     _dim(f"  short prefill: {short_tokens} tokens, min_free={prefill_short_free:,} MB")
 
-    # ── 2b: Short prompt decode ──
+    # Now measure decode-only (prefill temporaries already freed, model in prefilled state)
     vram_monitor.reset_min_free()
-    _dim("Capture: short prompt decode")
-    _capture_decode(_model, num_steps=8)
+    _dim("Capture: short prompt decode (decode-only, no prefill)")
+    if short_result is not None:
+        _capture_decode_only(_model, short_result, num_steps=8)
+    else:
+        _model.server_cleanup()
     torch.cuda.synchronize()
     time.sleep(0.1)
     decode_short_free = vram_monitor.min_free_mb(dev_idx)
+    logger.info("VRAM capture: short decode-only: min_free=%d MB", decode_short_free)
     _dim(f"  short decode: min_free={decode_short_free:,} MB")
 
-    # ── 2c: Long prompt prefill ──
+    # ── 2b: Long prompt — prefill then decode (measured separately) ──
     vram_monitor.reset_min_free()
     _dim("Capture: long prompt prefill (~50K tokens)")
-    long_prompt_len = _capture_prefill(_model, LONG_REPEATS)
+    long_prompt_len, long_result = _capture_prefill(_model, LONG_REPEATS)
     torch.cuda.synchronize()
     time.sleep(0.1)
     prefill_long_free = vram_monitor.min_free_mb(dev_idx)
     long_tokens = long_prompt_len or 51000
-    _model.server_cleanup()
+    logger.info("VRAM capture: long prefill: %d tokens, min_free=%d MB", long_tokens, prefill_long_free)
     _dim(f"  long prefill: {long_tokens} tokens, min_free={prefill_long_free:,} MB")
 
-    # ── 2d: Long prompt decode ──
+    # Now measure decode-only after long prefill
     vram_monitor.reset_min_free()
-    _dim("Capture: long prompt decode")
-    _capture_decode(_model, num_steps=8)
+    _dim("Capture: long prompt decode (decode-only, no prefill)")
+    if long_result is not None:
+        _capture_decode_only(_model, long_result, num_steps=8)
+    else:
+        _model.server_cleanup()
     torch.cuda.synchronize()
     time.sleep(0.1)
     decode_long_free = vram_monitor.min_free_mb(dev_idx)
-    _dim(f"  long decode: min_free={decode_long_free:,} MB")
+    logger.info("VRAM capture: long decode-only: min_free=%d MB", decode_long_free)
 
     # ── Compute calibration ──
     if long_tokens > short_tokens:
@@ -779,6 +781,12 @@ def main():
     _detail(f"Prefill: {prefill_kb_per_tok:.1f} KB/token ({prefill_short_free:,} MB @ {short_tokens} tok → {prefill_long_free:,} MB @ {long_tokens} tok)")
     _detail(f"Decode:  {decode_kb_per_tok:.1f} KB/token ({decode_short_free:,} MB @ short → {decode_long_free:,} MB @ long)")
     _detail(f"Hard HCS budget: {hard_budget:,} MB  |  Soft HCS budget: {soft_budget:,} MB  |  Total: {hard_budget + soft_budget:,} MB")
+    logger.info("VRAM budget: hard=%d MB (prefill_long_free=%d - safety=%d), "
+                "decode_budget=%d MB (decode_short_free=%d - safety=%d), "
+                "soft=%d MB (decode_budget - hard)",
+                hard_budget, prefill_long_free, SAFETY_MARGIN_MB,
+                decode_budget, decode_short_free, SAFETY_MARGIN_MB,
+                soft_budget)
 
     if not args.hcs:
         _status("GPU decode (no HCS)")
@@ -835,10 +843,19 @@ def main():
             logger.info("HCS pool: %s (%.1fs)", result, hcs_elapsed)
 
     # ── Decode validation (after HCS) ──
-    # CUDA decode allocations already happened in pre-HCS warmup.
-    # This validates HCS + decode works and gives the monitor a realistic sample.
+    # Must evict soft HCS before running prefill (layer groups need VRAM).
     _status("Validating decode" + (" with HCS" if args.hcs else ""))
+    if hasattr(_model, '_gpu_decode_store'):
+        store = _model._gpu_decode_store
+        evicted, freed = store.py_hcs_evict_for_prefill(500)  # short warmup prompt
+        if evicted > 0:
+            _dim(f"Evicted {evicted} soft experts ({freed:.0f} MB) for warmup prefill")
     _warmup_decode(_model, num_steps=4)
+    if hasattr(_model, '_gpu_decode_store'):
+        store = _model._gpu_decode_store
+        reloaded, reload_ms = store.py_hcs_reload_after_prefill()
+        if reloaded > 0:
+            _dim(f"Reloaded {reloaded} soft experts in {reload_ms:.0f}ms")
     _detail("Decode validation passed")
 
     # ── Enable VRAM monitor runtime warnings ──
