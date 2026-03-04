@@ -62,6 +62,8 @@ const KERNEL_NAMES: &[&str] = &[
     "marlin_gemv_int4_fused_silu_accum_v2",
     "reduce_ksplits_weighted_accum_bf16",
     "sigmoid_gate_inplace_bf16",
+    "simple_int4_gemv_f32",
+    "simple_int4_gemv_bf16",
     // "fused_gate_topk" exists in .cu but is not loaded (single-block = slow on multi-SM GPUs)
 ];
 
@@ -276,6 +278,61 @@ impl HcsCacheEntry {
     }
 }
 
+/// VRAM calibration from four-point startup measurement.
+/// Enables proportional soft-tier HCS eviction based on prompt length.
+#[derive(Clone, Debug)]
+struct VramCalibration {
+    short_tokens: usize,
+    long_tokens: usize,
+    /// min_free VRAM (MB) during short prompt prefill (no HCS loaded)
+    prefill_short_free_mb: u64,
+    /// min_free VRAM (MB) during long prompt prefill (no HCS loaded)
+    prefill_long_free_mb: u64,
+    /// min_free VRAM (MB) during short prompt decode (no HCS loaded)
+    decode_short_free_mb: u64,
+    /// min_free VRAM (MB) during long prompt decode (no HCS loaded)
+    decode_long_free_mb: u64,
+    safety_margin_mb: u64,
+}
+
+impl VramCalibration {
+    /// Interpolate expected min_free VRAM (MB) during prefill for a given prompt length.
+    fn prefill_free_mb(&self, tokens: usize) -> u64 {
+        if self.long_tokens <= self.short_tokens {
+            return self.prefill_long_free_mb; // fallback
+        }
+        let t = (tokens.saturating_sub(self.short_tokens) as f64)
+            / (self.long_tokens - self.short_tokens) as f64;
+        let t = t.clamp(0.0, 1.5); // allow slight extrapolation
+        let free = self.prefill_short_free_mb as f64
+            - t * (self.prefill_short_free_mb as f64 - self.prefill_long_free_mb as f64);
+        (free.max(0.0)) as u64
+    }
+
+    /// Interpolate expected min_free VRAM (MB) during decode for a given prompt length.
+    fn decode_free_mb(&self, tokens: usize) -> u64 {
+        if self.long_tokens <= self.short_tokens {
+            return self.decode_long_free_mb;
+        }
+        let t = (tokens.saturating_sub(self.short_tokens) as f64)
+            / (self.long_tokens - self.short_tokens) as f64;
+        let t = t.clamp(0.0, 1.5);
+        let free = self.decode_short_free_mb as f64
+            - t * (self.decode_short_free_mb as f64 - self.decode_long_free_mb as f64);
+        (free.max(0.0)) as u64
+    }
+
+    /// Max HCS budget for prefill of N tokens (what survives prefill).
+    fn prefill_hcs_budget_mb(&self, tokens: usize) -> u64 {
+        self.prefill_free_mb(tokens).saturating_sub(self.safety_margin_mb)
+    }
+
+    /// Max HCS budget for decode after prefill of N tokens.
+    fn decode_hcs_budget_mb(&self, tokens: usize) -> u64 {
+        self.decode_free_mb(tokens).saturating_sub(self.safety_margin_mb)
+    }
+}
+
 /// HCS state: resident expert cache + activation heatmap + dynamic eviction.
 struct HcsState {
     /// (layer_idx, expert_idx) → cache entry.
@@ -305,6 +362,23 @@ struct HcsState {
     pool_free_slots: Vec<usize>,
     /// Reverse mapping: slot index → (layer, expert) currently occupying it.
     pool_slot_to_expert: Vec<Option<(usize, usize)>>,
+
+    // ── Soft-tier HCS (evicted during prefill, reloaded before decode) ──
+    /// Separate VRAM allocation for soft-tier experts.
+    soft_buf: Option<cudarc::driver::CudaSlice<u8>>,
+    /// Number of slots in the soft pool.
+    soft_num_slots: usize,
+    /// Bytes per soft slot (same as pool_slot_size).
+    soft_slot_size: usize,
+    /// Reverse mapping: soft slot index → (layer, expert).
+    soft_slot_to_expert: Vec<Option<(usize, usize)>>,
+    /// Ordered list of experts in the soft tier (for reload after eviction).
+    /// Stored in ranking order so reload is deterministic.
+    soft_ranking: Vec<(usize, usize)>,
+    /// Number of soft experts currently loaded.
+    soft_num_cached: usize,
+    /// Whether soft tier is currently loaded (false during prefill).
+    soft_loaded: bool,
 
     // ── Dynamic eviction: sliding window activation tracking ──
     /// Bitset for current prompt: 1 bit per (layer_idx * num_experts + expert_idx).
@@ -341,6 +415,13 @@ impl HcsState {
             pool_num_slots: 0,
             pool_free_slots: Vec::new(),
             pool_slot_to_expert: Vec::new(),
+            soft_buf: None,
+            soft_num_slots: 0,
+            soft_slot_size: 0,
+            soft_slot_to_expert: Vec::new(),
+            soft_ranking: Vec::new(),
+            soft_num_cached: 0,
+            soft_loaded: false,
             current_activations: Vec::new(),
             num_experts_per_layer: 0,
             prompt_history: std::collections::VecDeque::new(),
@@ -736,6 +817,59 @@ struct GpuDecodeGraph {
     dma_call_count: u64,     // number of cuMemcpyHtoDAsync calls
     dma_cold_experts: u64,   // number of cold (DMA'd) experts
     dma_hcs_experts: u64,    // number of HCS-hit experts
+
+    // ── Speculative decode batch buffers (allocated when draft model loaded) ──
+    /// Max batch size for speculative decode (draft_k + 1).
+    batch_max: usize,
+    /// [batch_max * hidden_size] BF16 — per-token hidden states during batch decode.
+    d_batch_hidden: Option<cudarc::driver::CudaSlice<u16>>,
+    /// [batch_max * hidden_size] BF16 — per-token residual states during batch decode.
+    d_batch_residual: Option<cudarc::driver::CudaSlice<u16>>,
+    /// [batch_max * hidden_size] BF16 — per-token MoE output accumulator.
+    d_batch_moe_out: Option<cudarc::driver::CudaSlice<u16>>,
+    /// [batch_max * vocab_size] FP32 — per-token logits from LM head.
+    d_batch_logits: Option<cudarc::driver::CudaSlice<f32>>,
+    /// Host-side copy of batch logits.
+    h_batch_logits: Vec<f32>,
+    /// Per-token routing results: [batch_max * max_topk] on host.
+    h_batch_topk_ids: Vec<i32>,
+    h_batch_topk_weights: Vec<f32>,
+    /// Per-token routing results on GPU: [batch_max * max_topk].
+    d_batch_topk_ids: Option<cudarc::driver::CudaSlice<i32>>,
+    d_batch_topk_wts: Option<cudarc::driver::CudaSlice<f32>>,
+    /// Per-token gate logits on GPU: [batch_max * num_experts] FP32.
+    d_batch_gate_logits: Option<cudarc::driver::CudaSlice<f32>>,
+
+    /// LA state backup for rollback after rejected draft tokens.
+    /// Each entry: (conv_state_backup, recur_state_backup) for one LA layer.
+    /// Allocated once when batch buffers are allocated.
+    la_backup: Vec<LaStateBackup>,
+    /// Hidden states saved at each LA layer entry for each batch token,
+    /// used during LA replay after rollback. [num_la_layers * batch_max * hidden_size] BF16.
+    d_la_hidden_stack: Option<cudarc::driver::CudaSlice<u16>>,
+
+    // ── Batched GEMM projection buffers (allocated with batch buffers) ──
+    /// [batch_max * max_proj_dim] FP32 — primary batch projection output (qkvz / fused_qkv / Q).
+    d_batch_proj_a: Option<cudarc::driver::CudaSlice<f32>>,
+    /// [batch_max * max_proj_dim] FP32 — secondary batch projection output (ba / K / V).
+    d_batch_proj_b: Option<cudarc::driver::CudaSlice<f32>>,
+    /// [batch_max * max_attn_out_dim] BF16 — gathered attention outputs for batched O projection.
+    d_batch_attn_out: Option<cudarc::driver::CudaSlice<u16>>,
+    /// Maximum projection output dimension across all layers.
+    batch_max_proj_dim: usize,
+    /// Maximum attention output dimension across all layers (for O projection input).
+    batch_max_attn_out_dim: usize,
+}
+
+/// Backup storage for one LA layer's mutable state.
+/// Pointers are NOT cached — they're read dynamically from the graph's layer config
+/// because prefill re-registers LA layers with new tensor pointers.
+struct LaStateBackup {
+    layer_idx: usize,
+    conv_state_bytes: usize,
+    recur_state_bytes: usize,
+    d_conv_backup: cudarc::driver::CudaSlice<u8>,
+    d_recur_backup: cudarc::driver::CudaSlice<u8>,
 }
 
 // ── Thread-safe CUDA wrappers ──────────────────────────────────────────
@@ -764,6 +898,21 @@ pub struct GpuDecodeStore {
     /// Max opt-in shared memory for GQA attention (bytes). Set during PTX load.
     gqa_max_smem_bytes: u32,
     last_decode_elapsed: f64,
+    /// Draft model for speculative decoding (None = disabled).
+    draft: Option<crate::draft_model::DraftModel>,
+    /// Number of tokens to draft per speculative round.
+    draft_k: usize,
+    /// Context window for draft model warmup (last N tokens of prompt).
+    draft_context_window: usize,
+    /// Jaccard similarity threshold for fail-fast expert divergence detection.
+    /// At each MoE layer during batched verification, if a draft token's expert
+    /// routing has Jaccard similarity < this threshold vs token[0], that token
+    /// and all subsequent draft tokens are dropped from the batch.
+    /// Lower = more lenient (fewer bailouts), higher = stricter (more bailouts).
+    /// Default 0.15 ≈ at least 2-3 shared experts out of topk=10.
+    spec_jaccard_threshold: f32,
+    /// Four-point VRAM calibration for proportional soft-tier HCS.
+    vram_calibration: Option<VramCalibration>,
     #[cfg(feature = "gpu-debug")]
     debug_stop_layer: usize,
     #[cfg(feature = "gpu-debug")]
@@ -917,6 +1066,11 @@ impl GpuDecodeStore {
             kernels_loaded,
             gqa_max_smem_bytes: gqa_smem_limit,
             last_decode_elapsed: 0.0,
+            draft: None,
+            draft_k: 3,
+            draft_context_window: 512,
+            spec_jaccard_threshold: 0.15,
+            vram_calibration: None,
             #[cfg(feature = "gpu-debug")]
             debug_stop_layer: 0,
             #[cfg(feature = "gpu-debug")]
@@ -1119,6 +1273,24 @@ impl GpuDecodeStore {
             dma_call_count: 0,
             dma_cold_experts: 0,
             dma_hcs_experts: 0,
+            batch_max: 0,
+            d_batch_hidden: None,
+            d_batch_residual: None,
+            d_batch_moe_out: None,
+            d_batch_logits: None,
+            h_batch_logits: Vec::new(),
+            h_batch_topk_ids: Vec::new(),
+            h_batch_topk_weights: Vec::new(),
+            d_batch_topk_ids: None,
+            d_batch_topk_wts: None,
+            d_batch_gate_logits: None,
+            d_batch_proj_a: None,
+            d_batch_proj_b: None,
+            d_batch_attn_out: None,
+            batch_max_proj_dim: 0,
+            batch_max_attn_out_dim: 0,
+            la_backup: Vec::new(),
+            d_la_hidden_stack: None,
         }));
 
         // Cache kernel function handles (avoid HashMap lookup per call)
@@ -2259,6 +2431,214 @@ impl GpuDecodeStore {
         self.hcs_pool_init_internal(ranking, budget_mb, headroom_mb, window_size, replacement_pct)
     }
 
+    /// Store four-point VRAM calibration data from startup measurement.
+    /// Called once during server init, before hcs_pool_init.
+    #[pyo3(signature = (short_tokens, long_tokens,
+                        prefill_short_free_mb, prefill_long_free_mb,
+                        decode_short_free_mb, decode_long_free_mb,
+                        safety_margin_mb))]
+    fn set_vram_calibration(
+        &mut self,
+        short_tokens: usize,
+        long_tokens: usize,
+        prefill_short_free_mb: u64,
+        prefill_long_free_mb: u64,
+        decode_short_free_mb: u64,
+        decode_long_free_mb: u64,
+        safety_margin_mb: u64,
+    ) -> PyResult<String> {
+        let cal = VramCalibration {
+            short_tokens,
+            long_tokens,
+            prefill_short_free_mb,
+            prefill_long_free_mb,
+            decode_short_free_mb,
+            decode_long_free_mb,
+            safety_margin_mb,
+        };
+        let prefill_kb_per_tok = if long_tokens > short_tokens {
+            ((prefill_short_free_mb as f64 - prefill_long_free_mb as f64)
+                / (long_tokens - short_tokens) as f64) * 1024.0
+        } else { 0.0 };
+        let decode_kb_per_tok = if long_tokens > short_tokens {
+            ((decode_short_free_mb as f64 - decode_long_free_mb as f64)
+                / (long_tokens - short_tokens) as f64) * 1024.0
+        } else { 0.0 };
+
+        let hard_budget = cal.prefill_hcs_budget_mb(long_tokens);
+        let max_decode_budget = cal.decode_hcs_budget_mb(short_tokens);
+        let soft_budget = max_decode_budget.saturating_sub(hard_budget);
+
+        let msg = format!(
+            "VRAM calibration: prefill {:.1} KB/tok, decode {:.1} KB/tok | \
+             hard HCS: {} MB, soft HCS: {} MB, total: {} MB",
+            prefill_kb_per_tok, decode_kb_per_tok,
+            hard_budget, soft_budget, hard_budget + soft_budget,
+        );
+        log::info!("{}", msg);
+        log::info!("  prefill: short={}tok/{}MB, long={}tok/{}MB",
+            short_tokens, prefill_short_free_mb, long_tokens, prefill_long_free_mb);
+        log::info!("  decode:  short={}tok/{}MB, long={}tok/{}MB",
+            short_tokens, decode_short_free_mb, long_tokens, decode_long_free_mb);
+
+        self.vram_calibration = Some(cal);
+        Ok(msg)
+    }
+
+    /// Initialize HCS with hard + soft tiers based on VRAM calibration.
+    /// hard_budget_mb: experts that survive worst-case prefill
+    /// soft_budget_mb: additional experts loaded during decode, evicted for prefill
+    #[pyo3(signature = (ranking, hard_budget_mb, soft_budget_mb,
+                        window_size=10, replacement_pct=25))]
+    fn hcs_pool_init_tiered(
+        &mut self,
+        ranking: Vec<(usize, usize)>,
+        hard_budget_mb: usize,
+        soft_budget_mb: usize,
+        window_size: usize,
+        replacement_pct: usize,
+    ) -> PyResult<String> {
+        // First, init the hard pool using existing logic
+        let result = self.hcs_pool_init_internal(
+            ranking.clone(), hard_budget_mb, 0, window_size, replacement_pct,
+        )?;
+
+        if soft_budget_mb == 0 {
+            return Ok(result);
+        }
+
+        // Now allocate and fill the soft tier
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let hcs = graph.hcs.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("HCS not initialized"))?;
+
+        let slot_size = hcs.pool_slot_size;
+        if slot_size == 0 {
+            return Ok(result);
+        }
+
+        let soft_budget_bytes = soft_budget_mb * 1024 * 1024;
+        let soft_num_slots = soft_budget_bytes / slot_size;
+        if soft_num_slots == 0 {
+            return Ok(format!("{} | soft: 0 slots (budget too small)", result));
+        }
+
+        let soft_alloc_bytes = soft_num_slots * slot_size;
+        log::info!("HCS soft tier: allocating {:.1} MB ({} slots)",
+            soft_alloc_bytes as f64 / (1024.0 * 1024.0), soft_num_slots);
+
+        let soft_buf = self.device.alloc_zeros::<u8>(soft_alloc_bytes)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("HCS soft pool alloc ({} MB): {:?}",
+                    soft_alloc_bytes / (1024 * 1024), e)))?;
+        let soft_base = *soft_buf.device_ptr();
+
+        let mut soft_slot_to_expert: Vec<Option<(usize, usize)>> = vec![None; soft_num_slots];
+        let mut soft_ranking: Vec<(usize, usize)> = Vec::new();
+        let mut soft_loaded = 0usize;
+        let mut soft_slot = 0usize;
+
+        // Fill soft slots with experts not already in hard pool
+        let t0 = std::time::Instant::now();
+        for &(layer_idx, expert_idx) in &ranking {
+            if soft_slot >= soft_num_slots {
+                break;
+            }
+            // Skip if already in hard pool
+            if hcs.cache.contains_key(&(layer_idx, expert_idx)) {
+                continue;
+            }
+            // Validate
+            let moe = match graph.moe_layers.get(layer_idx).and_then(|m| m.as_ref()) {
+                Some(m) => m,
+                None => continue,
+            };
+            if expert_idx >= moe.experts.len() {
+                continue;
+            }
+
+            let expert = &moe.experts[expert_idx];
+            let dst = soft_base + (soft_slot as u64 * slot_size as u64);
+
+            let w13p_off = 0u64;
+            let w13s_off = expert.w13_packed_bytes as u64;
+            let w2p_off = w13s_off + expert.w13_scales_bytes as u64;
+            let w2s_off = w2p_off + expert.w2_packed_bytes as u64;
+
+            let mut ok = true;
+            unsafe {
+                for &(off, src_ptr, bytes) in &[
+                    (w13p_off, expert.w13_packed_ptr, expert.w13_packed_bytes),
+                    (w13s_off, expert.w13_scales_ptr, expert.w13_scales_bytes),
+                    (w2p_off, expert.w2_packed_ptr, expert.w2_packed_bytes),
+                    (w2s_off, expert.w2_scales_ptr, expert.w2_scales_bytes),
+                ] {
+                    let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                        dst + off,
+                        src_ptr as *const std::ffi::c_void,
+                        bytes,
+                    );
+                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+
+            let entry = HcsCacheEntry {
+                d_buf: None,
+                w13_packed_offset: 0, w13_packed_size: 0,
+                w13_scales_offset: 0, w13_scales_size: 0,
+                w2_packed_offset: 0, w2_packed_size: 0,
+                w2_scales_offset: 0, w2_scales_size: 0,
+                ext_w13_packed: dst + w13p_off,
+                ext_w13_scales: dst + w13s_off,
+                ext_w2_packed: dst + w2p_off,
+                ext_w2_scales: dst + w2s_off,
+                pool_slot: None, // Not in hard pool
+            };
+            hcs.cache.insert((layer_idx, expert_idx), entry);
+            soft_slot_to_expert[soft_slot] = Some((layer_idx, expert_idx));
+            soft_ranking.push((layer_idx, expert_idx));
+            soft_slot += 1;
+            soft_loaded += 1;
+        }
+        let load_elapsed = t0.elapsed().as_secs_f64();
+
+        hcs.soft_buf = Some(soft_buf);
+        hcs.soft_num_slots = soft_num_slots;
+        hcs.soft_slot_size = slot_size;
+        hcs.soft_slot_to_expert = soft_slot_to_expert;
+        hcs.soft_ranking = soft_ranking;
+        hcs.soft_num_cached = soft_loaded;
+        hcs.soft_loaded = true;
+        hcs.num_cached += soft_loaded;
+        hcs.vram_bytes += soft_alloc_bytes;
+
+        let total_experts: usize = graph.moe_layers.iter()
+            .filter_map(|m| m.as_ref())
+            .map(|m| m.num_experts)
+            .sum();
+        let total_cached = hcs.num_cached;
+        let total_pct = if total_experts > 0 {
+            total_cached as f64 / total_experts as f64 * 100.0
+        } else { 0.0 };
+
+        let msg = format!(
+            "{} | soft: {} experts in {:.2}s ({:.1} MB) | \
+             total: {}/{} ({:.1}%) coverage",
+            result, soft_loaded, load_elapsed,
+            soft_alloc_bytes as f64 / (1024.0 * 1024.0),
+            total_cached, total_experts, total_pct,
+        );
+        log::info!("{}", msg);
+        Ok(msg)
+    }
+
     /// Get dynamic HCS eviction statistics.
     fn hcs_dynamic_stats(&self) -> PyResult<String> {
         let graph = self.graph.as_ref()
@@ -2580,6 +2960,52 @@ impl GpuDecodeStore {
         Ok(())
     }
 
+    /// Load a draft model for speculative decoding.
+    /// model_dir: path to the model directory (e.g. ~/.krasis/models/Qwen3-0.6B)
+    /// max_seq: max KV cache length for draft model (default 4096)
+    /// draft_k: number of tokens to draft per round (default 8)
+    /// context_window: how many prompt tokens to feed the draft model for warmup (default 512)
+    #[pyo3(signature = (model_dir, max_seq=4096, draft_k=3, context_window=512))]
+    fn load_draft_model(
+        &mut self,
+        model_dir: &str,
+        max_seq: usize,
+        draft_k: usize,
+        context_window: usize,
+    ) -> PyResult<()> {
+        if !self.kernels_loaded {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Decode kernels must be loaded before draft model"));
+        }
+        let draft = crate::draft_model::DraftModel::load(&self.device, model_dir, max_seq)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        log::info!("Draft model loaded: {:.1} MB VRAM, draft_k={}, context_window={}",
+            draft.vram_bytes as f64 / 1e6, draft_k, context_window);
+        self.draft = Some(draft);
+        self.draft_k = draft_k;
+        self.draft_context_window = context_window;
+
+        // Allocate batch buffers for batched speculative verification
+        self.allocate_batch_buffers(draft_k + 1)?;
+
+        Ok(())
+    }
+
+    /// Check if a draft model is loaded.
+    #[getter]
+    fn has_draft_model(&self) -> bool {
+        self.draft.is_some()
+    }
+
+    /// Set the Jaccard similarity threshold for fail-fast expert divergence.
+    /// Lower = more lenient (fewer bailouts), higher = stricter (more bailouts).
+    /// Default 0.15. Set to 0.0 to disable fail-fast.
+    #[pyo3(signature = (threshold=0.15))]
+    fn set_spec_jaccard_threshold(&mut self, threshold: f32) {
+        self.spec_jaccard_threshold = threshold.clamp(0.0, 1.0);
+        log::info!("Speculative Jaccard threshold set to {:.3}", self.spec_jaccard_threshold);
+    }
+
     /// Get self pointer for Rust-side access (same pattern as CpuDecodeStore).
     fn gpu_store_addr(&self) -> usize {
         self as *const GpuDecodeStore as usize
@@ -2683,6 +3109,421 @@ impl GpuDecodeStore {
 // ── Pure-Rust methods for GPU decode (no PyO3, used by Rust HTTP server) ──
 
 impl GpuDecodeStore {
+    /// Allocate batch buffers for speculative decode batched verification.
+    /// Called when draft model is loaded. batch_max = draft_k + 1.
+    fn allocate_batch_buffers(&mut self, batch_max: usize) -> pyo3::PyResult<()> {
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("graph not configured"))?;
+
+        let hs = graph.hidden_size;
+        let vs = graph.vocab_size;
+        let mut vram_total: usize = 0;
+
+        // Per-token hidden/residual/moe_out: [batch_max * hidden_size] BF16
+        let bh = self.device.alloc_zeros::<u16>(batch_max * hs)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("batch_hidden: {:?}", e)))?;
+        let br = self.device.alloc_zeros::<u16>(batch_max * hs)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("batch_residual: {:?}", e)))?;
+        let bmo = self.device.alloc_zeros::<u16>(batch_max * hs)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("batch_moe_out: {:?}", e)))?;
+        vram_total += batch_max * hs * 2 * 3;
+
+        // Per-token logits: [batch_max * vocab_size] FP32
+        let bl = self.device.alloc_zeros::<f32>(batch_max * vs)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("batch_logits: {:?}", e)))?;
+        vram_total += batch_max * vs * 4;
+
+        // Host logits + routing buffers
+        let h_bl = vec![0.0f32; batch_max * vs];
+        // Find max topk across all MoE layers
+        let max_topk = graph.moe_layers.iter()
+            .filter_map(|m| m.as_ref())
+            .map(|m| m.topk)
+            .max()
+            .unwrap_or(16);
+        let h_bt_ids = vec![0i32; batch_max * max_topk];
+        let h_bt_wts = vec![0.0f32; batch_max * max_topk];
+
+        // GPU topk routing buffers (for batched MoE routing without per-token sync)
+        let d_bt_ids = self.device.alloc_zeros::<i32>(batch_max * max_topk)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("d_batch_topk_ids: {:?}", e)))?;
+        let d_bt_wts = self.device.alloc_zeros::<f32>(batch_max * max_topk)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("d_batch_topk_wts: {:?}", e)))?;
+        vram_total += batch_max * max_topk * 4 * 2;
+
+        // GPU gate logits buffer (batch_max * max_num_experts)
+        let max_num_experts = graph.moe_layers.iter()
+            .filter_map(|m| m.as_ref())
+            .map(|m| m.num_experts)
+            .max()
+            .unwrap_or(256);
+        let d_gate_logits = self.device.alloc_zeros::<f32>(batch_max * max_num_experts)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("d_batch_gate_logits: {:?}", e)))?;
+        vram_total += batch_max * max_num_experts * 4;
+
+        // LA state backups: one backup per LA layer
+        let mut la_backup = Vec::new();
+        let mut num_la_layers = 0usize;
+        for (li, layer) in graph.layers.iter().enumerate() {
+            if let GpuAttnConfig::LinearAttention {
+                conv_state_ptr, recur_state_ptr,
+                nk: _, nv, dk, dv, conv_dim, kernel_dim, ..
+            } = &layer.attn {
+                let conv_bytes = *conv_dim * *kernel_dim * 4;  // FP32
+                let recur_bytes = *nv * *dk * *dv * 4;         // FP32
+                let d_conv = self.device.alloc_zeros::<u8>(conv_bytes)
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("la_conv_backup: {:?}", e)))?;
+                let d_recur = self.device.alloc_zeros::<u8>(recur_bytes)
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("la_recur_backup: {:?}", e)))?;
+                vram_total += conv_bytes + recur_bytes;
+                la_backup.push(LaStateBackup {
+                    layer_idx: li,
+                    conv_state_bytes: conv_bytes,
+                    recur_state_bytes: recur_bytes,
+                    d_conv_backup: d_conv,
+                    d_recur_backup: d_recur,
+                });
+                num_la_layers += 1;
+            }
+        }
+
+        // Hidden state stack for LA replay: [num_la_layers * batch_max * hidden_size] BF16
+        let stack_size = num_la_layers * batch_max * hs;
+        let d_stack = if stack_size > 0 {
+            let s = self.device.alloc_zeros::<u16>(stack_size)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("la_hidden_stack: {:?}", e)))?;
+            vram_total += stack_size * 2;
+            Some(s)
+        } else {
+            None
+        };
+
+        // ── Compute max projection dimensions across all layers ──
+        let mut max_proj_dim: usize = 0;
+        let mut max_attn_out_dim: usize = 0;
+        for layer in graph.layers.iter() {
+            match &layer.attn {
+                GpuAttnConfig::LinearAttention { in_proj_qkvz, in_proj_ba, nv, dv, .. } => {
+                    let qkvz_w = &graph.weights[*in_proj_qkvz];
+                    let ba_w = &graph.weights[*in_proj_ba];
+                    max_proj_dim = max_proj_dim.max(qkvz_w.rows).max(ba_w.rows);
+                    max_attn_out_dim = max_attn_out_dim.max(nv * dv); // gated_size for output proj
+                }
+                GpuAttnConfig::GQA { q_proj, fused_qkv, num_heads, head_dim, .. } => {
+                    if let Some(fid) = fused_qkv {
+                        let fw = &graph.weights[*fid];
+                        max_proj_dim = max_proj_dim.max(fw.rows);
+                    } else {
+                        let qw = &graph.weights[*q_proj];
+                        max_proj_dim = max_proj_dim.max(qw.rows);
+                    }
+                    max_attn_out_dim = max_attn_out_dim.max(num_heads * head_dim);
+                }
+                _ => {}
+            }
+        }
+
+        // Allocate batch projection buffers
+        let proj_a_size = batch_max * max_proj_dim;
+        let proj_b_size = batch_max * max_proj_dim;
+        let attn_out_size = batch_max * max_attn_out_dim;
+
+        let d_proj_a = if proj_a_size > 0 {
+            let buf = self.device.alloc_zeros::<f32>(proj_a_size)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("batch_proj_a: {:?}", e)))?;
+            vram_total += proj_a_size * 4;
+            Some(buf)
+        } else { None };
+
+        let d_proj_b = if proj_b_size > 0 {
+            let buf = self.device.alloc_zeros::<f32>(proj_b_size)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("batch_proj_b: {:?}", e)))?;
+            vram_total += proj_b_size * 4;
+            Some(buf)
+        } else { None };
+
+        let d_attn_out = if attn_out_size > 0 {
+            let buf = self.device.alloc_zeros::<u16>(attn_out_size)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("batch_attn_out: {:?}", e)))?;
+            vram_total += attn_out_size * 2;
+            Some(buf)
+        } else { None };
+
+        log::info!("Batch GEMM buffers: max_proj_dim={}, max_attn_out_dim={}, {:.1} MB VRAM",
+            max_proj_dim, max_attn_out_dim,
+            (proj_a_size * 4 + proj_b_size * 4 + attn_out_size * 2) as f64 / 1e6);
+
+        graph.batch_max = batch_max;
+        graph.d_batch_hidden = Some(bh);
+        graph.d_batch_residual = Some(br);
+        graph.d_batch_moe_out = Some(bmo);
+        graph.d_batch_logits = Some(bl);
+        graph.h_batch_logits = h_bl;
+        graph.h_batch_topk_ids = h_bt_ids;
+        graph.h_batch_topk_weights = h_bt_wts;
+        graph.d_batch_topk_ids = Some(d_bt_ids);
+        graph.d_batch_topk_wts = Some(d_bt_wts);
+        graph.d_batch_gate_logits = Some(d_gate_logits);
+        graph.la_backup = la_backup;
+        graph.d_la_hidden_stack = d_stack;
+        graph.d_batch_proj_a = d_proj_a;
+        graph.d_batch_proj_b = d_proj_b;
+        graph.d_batch_attn_out = d_attn_out;
+        graph.batch_max_proj_dim = max_proj_dim;
+        graph.batch_max_attn_out_dim = max_attn_out_dim;
+
+        log::info!("Batch buffers allocated: batch_max={}, {:.1} MB VRAM ({} LA layers backed up)",
+            batch_max, vram_total as f64 / 1e6, num_la_layers);
+        Ok(())
+    }
+
+    /// Save all LA layer states to backup buffers (D2D copy in VRAM).
+    fn save_la_states(&self) -> Result<(), String> {
+        let graph = self.graph.as_ref().ok_or("graph not configured")?;
+        for backup in &graph.la_backup {
+            // Read current pointers from graph's layer config (may change after prefill)
+            let (conv_ptr, recur_ptr) = match &graph.layers[backup.layer_idx].attn {
+                GpuAttnConfig::LinearAttention { conv_state_ptr, recur_state_ptr, .. } => {
+                    (*conv_state_ptr, *recur_state_ptr)
+                }
+                _ => return Err(format!("LA backup[{}]: layer is not LA", backup.layer_idx)),
+            };
+            unsafe {
+                let err = cuda_sys::lib().cuMemcpyDtoD_v2(
+                    *backup.d_conv_backup.device_ptr(),
+                    conv_ptr,
+                    backup.conv_state_bytes);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("save LA conv[{}]: {:?}", backup.layer_idx, err));
+                }
+                let err = cuda_sys::lib().cuMemcpyDtoD_v2(
+                    *backup.d_recur_backup.device_ptr(),
+                    recur_ptr,
+                    backup.recur_state_bytes);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("save LA recur[{}]: {:?}", backup.layer_idx, err));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Restore all LA layer states from backup buffers.
+    fn restore_la_states(&self) -> Result<(), String> {
+        let graph = self.graph.as_ref().ok_or("graph not configured")?;
+        for backup in &graph.la_backup {
+            let (conv_ptr, recur_ptr) = match &graph.layers[backup.layer_idx].attn {
+                GpuAttnConfig::LinearAttention { conv_state_ptr, recur_state_ptr, .. } => {
+                    (*conv_state_ptr, *recur_state_ptr)
+                }
+                _ => return Err(format!("LA backup[{}]: layer is not LA", backup.layer_idx)),
+            };
+            unsafe {
+                let err = cuda_sys::lib().cuMemcpyDtoD_v2(
+                    conv_ptr,
+                    *backup.d_conv_backup.device_ptr(),
+                    backup.conv_state_bytes);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("restore LA conv[{}]: {:?}", backup.layer_idx, err));
+                }
+                let err = cuda_sys::lib().cuMemcpyDtoD_v2(
+                    recur_ptr,
+                    *backup.d_recur_backup.device_ptr(),
+                    backup.recur_state_bytes);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("restore LA recur[{}]: {:?}", backup.layer_idx, err));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Replay LA layers for tokens 0..num_tokens using saved hidden states from the stack.
+    /// This correctly updates conv_state and recur_state for the accepted tokens.
+    fn replay_la_states(
+        &mut self,
+        num_tokens: usize,
+        positions: &[usize],
+    ) -> Result<(), String> {
+        let mut graph = self.graph.take().ok_or("graph not configured")?;
+        let result = self.replay_la_states_inner(&mut graph, num_tokens, positions);
+        self.graph = Some(graph);
+        result
+    }
+
+    fn replay_la_states_inner(
+        &self,
+        graph: &mut GpuDecodeGraph,
+        num_tokens: usize,
+        positions: &[usize],
+    ) -> Result<(), String> {
+        let hs = graph.hidden_size;
+        let eps = graph.eps;
+        let d_stack_ptr = graph.d_la_hidden_stack.as_ref()
+            .ok_or("LA hidden stack not allocated")?.device_ptr();
+        let batch_max = graph.batch_max;
+        let k = graph.kernels.as_ref().ok_or("kernels not cached")?.clone();
+
+        // For each LA layer, replay tokens in order
+        let mut la_idx = 0usize;
+        for layer_idx in 0..graph.layers.len() {
+            let is_la = matches!(&graph.layers[layer_idx].attn, GpuAttnConfig::LinearAttention { .. });
+            if !is_la { continue; }
+
+            for t in 0..num_tokens {
+                // Load saved hidden state for this token at this LA layer
+                let stack_offset = (la_idx * batch_max + t) * hs;
+                unsafe {
+                    let err = cuda_sys::lib().cuMemcpyDtoD_v2(
+                        *graph.d_hidden.device_ptr(),
+                        (*d_stack_ptr as *const u16).add(stack_offset) as u64,
+                        hs * 2);
+                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                        return Err(format!("replay LA load hidden[{}][{}]: {:?}", layer_idx, t, err));
+                    }
+                }
+
+                // Run the LA forward pass (this updates conv_state and recur_state)
+                // We reuse the full attention code path - it writes output to d_hidden
+                // which we don't need, but the side effects on conv/recur state are what matter.
+                let layer = &graph.layers[layer_idx];
+                match &layer.attn {
+                    GpuAttnConfig::LinearAttention {
+                        in_proj_qkvz, in_proj_ba, out_proj: _,
+                        conv_weight_ptr, a_log_ptr, dt_bias_ptr, norm_weight_ptr: _,
+                        nk, nv, dk, dv, hr, kernel_dim, conv_dim, scale,
+                        conv_state_ptr, recur_state_ptr,
+                    } => {
+                        let nk_ = *nk; let nv_ = *nv; let dk_ = *dk; let dv_ = *dv;
+                        let hr_ = *hr; let cd = *conv_dim; let kd = *kernel_dim;
+                        let key_dim = nk_ * dk_;
+
+                        // Projections
+                        let qkvz_w = &graph.weights[*in_proj_qkvz];
+                        let ba_w = &graph.weights[*in_proj_ba];
+                        self.gemv_bf16_to_f32(qkvz_w, *graph.d_hidden.device_ptr(), *graph.d_la_qkvz.device_ptr())?;
+                        self.gemv_bf16_to_f32(ba_w, *graph.d_hidden.device_ptr(), *graph.d_la_ba.device_ptr())?;
+
+                        // Uninterleave
+                        {
+                            let group_dim = 2 * dk_ + 2 * hr_ * dv_;
+                            let total = nk_ * group_dim;
+                            let threads = 256u32;
+                            let blocks = ((total as u32) + threads - 1) / threads;
+                            let unint_fn = self.device.get_func(MODULE_NAME, "uninterleave_qkvz")
+                                .ok_or_else(|| "uninterleave_qkvz not found".to_string())?;
+                            unsafe {
+                                unint_fn.launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (*graph.d_la_conv_out.device_ptr(), *graph.d_la_recur_out.device_ptr(),
+                                     *graph.d_la_qkvz.device_ptr(), nk_ as i32, dk_ as i32, hr_ as i32, dv_ as i32),
+                                ).map_err(|e| format!("replay uninterleave[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+
+                        // Conv1d (updates conv_state)
+                        {
+                            let threads = 256u32;
+                            let blocks = ((cd as u32) + threads - 1) / threads;
+                            let la_conv1d_fn = self.device.get_func(MODULE_NAME, "la_conv1d")
+                                .ok_or_else(|| "la_conv1d kernel not found".to_string())?;
+                            unsafe {
+                                la_conv1d_fn.launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (*conv_state_ptr, *graph.d_la_conv_out.device_ptr(),
+                                     *graph.d_la_qkvz.device_ptr(), *conv_weight_ptr, cd as i32, kd as i32),
+                                ).map_err(|e| format!("replay la_conv1d[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+
+                        // Gate/beta
+                        let gate_ptr_local = *graph.d_la_conv_out.device_ptr();
+                        let beta_ptr_local = unsafe { (*graph.d_la_conv_out.device_ptr() as *const f32).add(nv_) as u64 };
+                        {
+                            let threads = 256u32;
+                            let blocks = ((nv_ as u32) + threads - 1) / threads;
+                            let gb_fn = self.device.get_func(MODULE_NAME, "compute_gate_beta")
+                                .ok_or_else(|| "compute_gate_beta not found".to_string())?;
+                            unsafe {
+                                gb_fn.launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (gate_ptr_local, beta_ptr_local, *graph.d_la_ba.device_ptr(),
+                                     *a_log_ptr, *dt_bias_ptr, nv_ as i32, hr_ as i32),
+                                ).map_err(|e| format!("replay gate_beta[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+
+                        // Head repeat-interleave
+                        let q_ptr_for_recur: u64;
+                        let k_ptr_for_recur: u64;
+                        if hr_ > 1 {
+                            let total_q = (nv_ * dk_) as u32;
+                            let threads = 256u32;
+                            let blocks = (total_q + threads - 1) / threads;
+                            let ri_fn = self.device.get_func(MODULE_NAME, "repeat_interleave_heads")
+                                .ok_or_else(|| "repeat_interleave_heads not found".to_string())?;
+                            unsafe {
+                                ri_fn.clone().launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (*graph.d_la_recur_out.device_ptr(), *graph.d_la_qkvz.device_ptr(),
+                                     nk_ as i32, dk_ as i32, hr_ as i32),
+                                ).map_err(|e| format!("replay repeat_interleave q[{}]: {:?}", layer_idx, e))?;
+                                let k_in = (*graph.d_la_qkvz.device_ptr() as *const f32).add(key_dim) as u64;
+                                let k_out = (*graph.d_la_recur_out.device_ptr() as *const f32).add(nv_ * dk_) as u64;
+                                ri_fn.launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (k_out, k_in, nk_ as i32, dk_ as i32, hr_ as i32),
+                                ).map_err(|e| format!("replay repeat_interleave k[{}]: {:?}", layer_idx, e))?;
+                            }
+                            q_ptr_for_recur = *graph.d_la_recur_out.device_ptr();
+                            k_ptr_for_recur = unsafe { (*graph.d_la_recur_out.device_ptr() as *const f32).add(nv_ * dk_) as u64 };
+                        } else {
+                            q_ptr_for_recur = *graph.d_la_qkvz.device_ptr();
+                            k_ptr_for_recur = unsafe { (*graph.d_la_qkvz.device_ptr() as *const f32).add(key_dim) as u64 };
+                        }
+
+                        // L2 norm + scale
+                        {
+                            let threads = 256u32;
+                            let l2_fn = self.device.get_func(MODULE_NAME, "l2norm_scale_per_head")
+                                .ok_or_else(|| "l2norm_scale_per_head not found".to_string())?;
+                            unsafe {
+                                l2_fn.clone().launch(
+                                    LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (q_ptr_for_recur, *scale, nv_ as i32, dk_ as i32),
+                                ).map_err(|e| format!("replay l2norm q[{}]: {:?}", layer_idx, e))?;
+                                l2_fn.launch(
+                                    LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (k_ptr_for_recur, 1.0f32, nv_ as i32, dk_ as i32),
+                                ).map_err(|e| format!("replay l2norm k[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+
+                        // Recurrence (updates recur_state — the key side effect we need)
+                        let v_ptr = unsafe { (*graph.d_la_qkvz.device_ptr() as *const f32).add(2 * key_dim) as u64 };
+                        {
+                            let threads = 256u32;
+                            let delta_fn = self.device.get_func(MODULE_NAME, "gated_delta_net_step")
+                                .ok_or_else(|| "gated_delta_net_step not found".to_string())?;
+                            unsafe {
+                                delta_fn.launch(
+                                    LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (*recur_state_ptr, q_ptr_for_recur, k_ptr_for_recur, v_ptr,
+                                     gate_ptr_local, beta_ptr_local, *graph.d_la_ba.device_ptr(),
+                                     nv_ as i32, dk_ as i32, dv_ as i32),
+                                ).map_err(|e| format!("replay gated_delta_net[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+                        // Skip steps 8-9 (gated_rmsnorm_silu, output projection) — not needed for state replay
+                    }
+                    _ => {} // Not LA layer — shouldn't happen due to is_la check
+                }
+            }
+            la_idx += 1;
+        }
+        Ok(())
+    }
+
     /// Full GPU decode step: embedding → layer loop → final norm → LM head → logits.
     ///
     /// All computation on GPU via CUDA kernels. Zero Python, zero GIL.
@@ -3258,7 +4099,6 @@ impl GpuDecodeStore {
                     }
 
                     // ── GQA: Attention compute ──
-                    // For short sequences: single-block shared-memory kernel (one block per Q head).
                     // For long sequences: FlashDecoding tiled kernel (splits seq across blocks)
                     //   + lightweight reduce kernel. Threshold: use tiled when seq_len > tile_size.
                     {
@@ -3656,6 +4496,1292 @@ impl GpuDecodeStore {
         Ok(())
     }
 
+    /// Batched GPU decode step: process multiple tokens through all layers.
+    /// Used for speculative decode verification: tokens[0] is the real token,
+    /// tokens[1..] are draft tokens verified alongside.
+    ///
+    /// At MoE layers, routes all tokens, takes the expert union, and DMAs each
+    /// expert once — the key optimization over sequential verification.
+    ///
+    /// Returns the number of valid logit positions in h_batch_logits.
+    /// May be less than tokens.len() if fail-fast expert divergence detected.
+    /// Position 0 always has valid logits (the real token).
+    pub fn gpu_decode_step_batched(
+        &mut self,
+        tokens: &[usize],
+        positions: &[usize],
+    ) -> Result<usize, String> {
+        let batch_size = tokens.len();
+        if batch_size == 0 { return Ok(0); }
+        if batch_size == 1 {
+            self.gpu_decode_step(tokens[0], positions[0])?;
+            return Ok(1);
+        }
+
+        let mut graph = self.graph.take()
+            .ok_or_else(|| "Call configure first".to_string())?;
+
+        let result = self.gpu_decode_step_batched_inner(&mut graph, tokens, positions);
+
+        self.graph = Some(graph);
+        result
+    }
+
+    fn gpu_decode_step_batched_inner(
+        &mut self,
+        graph: &mut GpuDecodeGraph,
+        tokens: &[usize],
+        positions: &[usize],
+    ) -> Result<usize, String> {
+        use cudarc::driver::LaunchConfig;
+
+        let mut batch_size = tokens.len();
+        let orig_batch_size = batch_size;
+        let hs = graph.hidden_size;
+        let eps = graph.eps;
+        let do_timing = std::env::var("KRASIS_SPEC_DEBUG").is_ok();
+        let mut tt_norm: f64 = 0.0;
+        let mut tt_proj: f64 = 0.0;
+        let mut tt_attn: f64 = 0.0;
+        let mut tt_moe: f64 = 0.0;
+        let mut tt_lmhead: f64 = 0.0;
+
+        if batch_size > graph.batch_max {
+            return Err(format!("batch_size {} > batch_max {}", batch_size, graph.batch_max));
+        }
+
+        let d_bh_ptr = *graph.d_batch_hidden.as_ref()
+            .ok_or("batch buffers not allocated")?.device_ptr();
+        let d_br_ptr = *graph.d_batch_residual.as_ref()
+            .ok_or("batch buffers not allocated")?.device_ptr();
+        let d_bmo_ptr = *graph.d_batch_moe_out.as_ref()
+            .ok_or("batch buffers not allocated")?.device_ptr();
+        let d_bpa_ptr = *graph.d_batch_proj_a.as_ref()
+            .ok_or("batch proj buffers not allocated")?.device_ptr();
+        let d_bpb_ptr = *graph.d_batch_proj_b.as_ref()
+            .ok_or("batch proj buffers not allocated")?.device_ptr();
+        let d_bao_ptr = *graph.d_batch_attn_out.as_ref()
+            .ok_or("batch attn_out buffers not allocated")?.device_ptr();
+
+        let k = graph.kernels.as_ref()
+            .ok_or_else(|| "Kernels not cached".to_string())?
+            .clone();
+
+        // ── 1. Embedding lookup for all tokens → d_batch_hidden ──
+        for t in 0..batch_size {
+            let out_ptr = d_bh_ptr + (t * hs * 2) as u64;
+            let threads = 256u32;
+            let blocks = ((hs as u32) + threads - 1) / threads;
+            unsafe {
+                k.embedding_lookup.clone().launch(
+                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                    (out_ptr, graph.embedding_ptr, tokens[t] as i32, hs as i32),
+                ).map_err(|e| format!("batch embedding[{}]: {:?}", t, e))?;
+            }
+        }
+
+        let num_layers = graph.layers.len();
+        let mut la_stack_idx = 0usize;
+
+        // ── 2. Layer loop — batched GEMM for projections, per-token for attention ──
+        for layer_idx in 0..num_layers {
+            let is_la = matches!(&graph.layers[layer_idx].attn, GpuAttnConfig::LinearAttention { .. });
+            let has_moe = layer_idx < graph.moe_layers.len()
+                && graph.moe_layers[layer_idx].is_some();
+            let first_residual = layer_idx == 0;
+
+            let t_norm_start = std::time::Instant::now();
+
+            // ── A. Pre-attention norm (in-place on batch arrays, no D2D swap) ──
+            {
+                let smem = (hs as u32) * 4;
+                let threads = 256u32.min(hs as u32);
+                for t in 0..batch_size {
+                    let h_ptr = d_bh_ptr + (t * hs * 2) as u64;
+                    let r_ptr = d_br_ptr + (t * hs * 2) as u64;
+                    unsafe {
+                        k.fused_add_rmsnorm.clone().launch(
+                            LaunchConfig { grid_dim: (1, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: smem },
+                            (h_ptr, r_ptr, graph.layers[layer_idx].input_norm_ptr, eps, hs as i32,
+                             if first_residual { 1i32 } else { 0i32 }),
+                        ).map_err(|e| format!("batch norm[{}][{}]: {:?}", layer_idx, t, e))?;
+                    }
+                }
+            }
+
+            // ── B. Save LA hidden stack (after norm, before projection) ──
+            if is_la {
+                if let Some(ref d_stack) = graph.d_la_hidden_stack {
+                    for t in 0..batch_size {
+                        let stack_offset = (la_stack_idx * graph.batch_max + t) * hs;
+                        unsafe {
+                            cuda_sys::lib().cuMemcpyDtoD_v2(
+                                (*d_stack.device_ptr() as *const u16).add(stack_offset) as u64,
+                                d_bh_ptr + (t * hs * 2) as u64,
+                                hs * 2);
+                        }
+                    }
+                }
+            }
+
+            if do_timing {
+                self.device.synchronize().map_err(|e| format!("timing: {:?}", e))?;
+                tt_norm += t_norm_start.elapsed().as_secs_f64();
+            }
+            let t_attn_start = std::time::Instant::now();
+
+            // ── C. Batch input projection GEMM + D. per-token attention + E. batch output GEMM ──
+            match &graph.layers[layer_idx].attn {
+                GpuAttnConfig::LinearAttention {
+                    in_proj_qkvz, in_proj_ba, out_proj,
+                    conv_weight_ptr, a_log_ptr, dt_bias_ptr, norm_weight_ptr,
+                    nk, nv, dk, dv, hr, kernel_dim, conv_dim, scale,
+                    conv_state_ptr, recur_state_ptr,
+                } => {
+                    let nk_ = *nk; let nv_ = *nv; let dk_ = *dk; let dv_ = *dv;
+                    let hr_ = *hr; let cd = *conv_dim; let kd = *kernel_dim;
+                    let key_dim = nk_ * dk_;
+                    let gated_size = nv_ * dv_;
+
+                    // C1. Batch GEMM: qkvz_w × batch_hidden → batch_proj_a (weights loaded ONCE)
+                    let qkvz_w = &graph.weights[*in_proj_qkvz];
+                    let qkvz_dim = qkvz_w.rows;
+                    self.gemm_bf16_to_f32_batch(
+                        qkvz_w, d_bh_ptr, d_bpa_ptr,
+                        batch_size, hs, qkvz_dim)?;
+
+                    // C2. Batch GEMM: ba_w × batch_hidden → batch_proj_b (weights loaded ONCE)
+                    let ba_w = &graph.weights[*in_proj_ba];
+                    let ba_dim = ba_w.rows;
+                    self.gemm_bf16_to_f32_batch(
+                        ba_w, d_bh_ptr, d_bpb_ptr,
+                        batch_size, hs, ba_dim)?;
+
+                    // D. Per-token LA processing (reads from batch_proj, tiny compute)
+                    for t in 0..batch_size {
+                        // Copy this token's projection outputs to single-token scratch
+                        unsafe {
+                            cuda_sys::lib().cuMemcpyDtoD_v2(
+                                *graph.d_la_qkvz.device_ptr(),
+                                d_bpa_ptr + (t * qkvz_dim) as u64 * 4,
+                                qkvz_dim * 4);
+                            cuda_sys::lib().cuMemcpyDtoD_v2(
+                                *graph.d_la_ba.device_ptr(),
+                                d_bpb_ptr + (t * ba_dim) as u64 * 4,
+                                ba_dim * 4);
+                        }
+
+                        // Uninterleave
+                        {
+                            let group_dim = 2 * dk_ + 2 * hr_ * dv_;
+                            let total = nk_ * group_dim;
+                            let threads = 256u32;
+                            let blocks = ((total as u32) + threads - 1) / threads;
+                            unsafe {
+                                let f = self.device.get_func(MODULE_NAME, "uninterleave_qkvz")
+                                    .ok_or_else(|| "uninterleave_qkvz not found".to_string())?;
+                                f.launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (*graph.d_la_conv_out.device_ptr(), *graph.d_la_recur_out.device_ptr(),
+                                     *graph.d_la_qkvz.device_ptr(), nk_ as i32, dk_ as i32, hr_ as i32, dv_ as i32),
+                                ).map_err(|e| format!("batch uninterleave[{}][{}]: {:?}", layer_idx, t, e))?;
+                            }
+                        }
+
+                        // Save z
+                        {
+                            let z_size = nv_ * dv_;
+                            unsafe {
+                                cuda_sys::lib().cuMemcpyDtoD_v2(
+                                    *graph.d_la_gated_out.device_ptr(),
+                                    *graph.d_la_recur_out.device_ptr(),
+                                    z_size * 4);
+                            }
+                        }
+
+                        // Conv1d
+                        {
+                            let threads = 256u32;
+                            let blocks = ((cd as u32) + threads - 1) / threads;
+                            unsafe {
+                                let f = self.device.get_func(MODULE_NAME, "la_conv1d")
+                                    .ok_or_else(|| "la_conv1d kernel not found".to_string())?;
+                                f.launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (*conv_state_ptr, *graph.d_la_conv_out.device_ptr(),
+                                     *graph.d_la_qkvz.device_ptr(), *conv_weight_ptr, cd as i32, kd as i32),
+                                ).map_err(|e| format!("batch la_conv1d[{}][{}]: {:?}", layer_idx, t, e))?;
+                            }
+                        }
+
+                        // Gate/beta
+                        let gate_ptr_local = *graph.d_la_conv_out.device_ptr();
+                        let beta_ptr_local = unsafe { (*graph.d_la_conv_out.device_ptr() as *const f32).add(nv_) as u64 };
+                        {
+                            let threads = 256u32;
+                            let blocks = ((nv_ as u32) + threads - 1) / threads;
+                            unsafe {
+                                let f = self.device.get_func(MODULE_NAME, "compute_gate_beta")
+                                    .ok_or_else(|| "compute_gate_beta not found".to_string())?;
+                                f.launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (gate_ptr_local, beta_ptr_local, *graph.d_la_ba.device_ptr(),
+                                     *a_log_ptr, *dt_bias_ptr, nv_ as i32, hr_ as i32),
+                                ).map_err(|e| format!("batch gate_beta[{}][{}]: {:?}", layer_idx, t, e))?;
+                            }
+                        }
+
+                        // Head repeat-interleave
+                        let q_ptr_for_recur: u64;
+                        let k_ptr_for_recur: u64;
+                        if hr_ > 1 {
+                            let total_q = (nv_ * dk_) as u32;
+                            let threads = 256u32;
+                            let blocks = (total_q + threads - 1) / threads;
+                            unsafe {
+                                let ri_fn = self.device.get_func(MODULE_NAME, "repeat_interleave_heads")
+                                    .ok_or_else(|| "repeat_interleave_heads not found".to_string())?;
+                                ri_fn.clone().launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (*graph.d_la_recur_out.device_ptr(), *graph.d_la_qkvz.device_ptr(),
+                                     nk_ as i32, dk_ as i32, hr_ as i32),
+                                ).map_err(|e| format!("batch ri_q[{}][{}]: {:?}", layer_idx, t, e))?;
+                                let k_in = (*graph.d_la_qkvz.device_ptr() as *const f32).add(key_dim) as u64;
+                                let k_out = (*graph.d_la_recur_out.device_ptr() as *const f32).add(nv_ * dk_) as u64;
+                                ri_fn.launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (k_out, k_in, nk_ as i32, dk_ as i32, hr_ as i32),
+                                ).map_err(|e| format!("batch ri_k[{}][{}]: {:?}", layer_idx, t, e))?;
+                            }
+                            q_ptr_for_recur = *graph.d_la_recur_out.device_ptr();
+                            k_ptr_for_recur = unsafe { (*graph.d_la_recur_out.device_ptr() as *const f32).add(nv_ * dk_) as u64 };
+                        } else {
+                            q_ptr_for_recur = *graph.d_la_qkvz.device_ptr();
+                            k_ptr_for_recur = unsafe { (*graph.d_la_qkvz.device_ptr() as *const f32).add(key_dim) as u64 };
+                        }
+
+                        // L2 norm
+                        {
+                            let threads = 256u32;
+                            let l2_fn = self.device.get_func(MODULE_NAME, "l2norm_scale_per_head")
+                                .ok_or_else(|| "l2norm_scale_per_head not found".to_string())?;
+                            unsafe {
+                                l2_fn.clone().launch(
+                                    LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (q_ptr_for_recur, *scale, nv_ as i32, dk_ as i32),
+                                ).map_err(|e| format!("batch l2_q[{}][{}]: {:?}", layer_idx, t, e))?;
+                                l2_fn.launch(
+                                    LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (k_ptr_for_recur, 1.0f32, nv_ as i32, dk_ as i32),
+                                ).map_err(|e| format!("batch l2_k[{}][{}]: {:?}", layer_idx, t, e))?;
+                            }
+                        }
+
+                        // Recurrence
+                        let v_ptr = unsafe { (*graph.d_la_qkvz.device_ptr() as *const f32).add(2 * key_dim) as u64 };
+                        {
+                            let threads = 256u32;
+                            let delta_fn = self.device.get_func(MODULE_NAME, "gated_delta_net_step")
+                                .ok_or_else(|| "gated_delta_net_step not found".to_string())?;
+                            unsafe {
+                                delta_fn.launch(
+                                    LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (*recur_state_ptr, q_ptr_for_recur, k_ptr_for_recur, v_ptr,
+                                     gate_ptr_local, beta_ptr_local, *graph.d_la_ba.device_ptr(),
+                                     nv_ as i32, dk_ as i32, dv_ as i32),
+                                ).map_err(|e| format!("batch recur[{}][{}]: {:?}", layer_idx, t, e))?;
+                            }
+                        }
+
+                        // Gated RMSNorm + SiLU
+                        {
+                            let threads = 256u32;
+                            let smem = (dv_ as u32 + 32) * 4;
+                            let f = self.device.get_func(MODULE_NAME, "gated_rmsnorm_silu")
+                                .ok_or_else(|| "gated_rmsnorm_silu not found".to_string())?;
+                            unsafe {
+                                f.launch(
+                                    LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: smem },
+                                    (*graph.d_la_conv_out.device_ptr(), *graph.d_la_ba.device_ptr(),
+                                     *graph.d_la_gated_out.device_ptr(), *norm_weight_ptr, eps,
+                                     nv_ as i32, dv_ as i32),
+                                ).map_err(|e| format!("batch gated_norm[{}][{}]: {:?}", layer_idx, t, e))?;
+                            }
+                        }
+
+                        // Convert attention output to BF16 → batch_attn_out[t]
+                        {
+                            let out_ptr = d_bao_ptr + (t * gated_size * 2) as u64;
+                            unsafe {
+                                k.fp32_to_bf16.clone().launch(
+                                    LaunchConfig::for_num_elems(gated_size as u32),
+                                    (out_ptr, *graph.d_la_conv_out.device_ptr(), gated_size as i32),
+                                ).map_err(|e| format!("batch fp32_to_bf16[{}][{}]: {:?}", layer_idx, t, e))?;
+                            }
+                        }
+                    } // end per-token LA loop
+
+                    // E. Batch output projection GEMM (weights loaded ONCE)
+                    let out_w = &graph.weights[*out_proj];
+                    self.gemm_bf16_batch(
+                        out_w, d_bao_ptr, d_bh_ptr,
+                        batch_size, gated_size, hs)?;
+                }
+
+                GpuAttnConfig::GQA {
+                    q_proj, k_proj, v_proj, o_proj,
+                    fused_qkv,
+                    num_heads, num_kv_heads, head_dim, sm_scale,
+                    q_norm_ptr, k_norm_ptr, gated,
+                } => {
+                    let nh = *num_heads;
+                    let nkv = *num_kv_heads;
+                    let hd = *head_dim;
+                    let kv_stride = nkv * hd;
+                    let o_size = nh * hd;
+                    let is_gated = *gated;
+                    let qnp = *q_norm_ptr;
+                    let knp = *k_norm_ptr;
+                    let sm_sc = *sm_scale;
+
+                    // C. Batch input projection GEMM (weights loaded ONCE)
+                    if let Some(fid) = fused_qkv {
+                        let fw = &graph.weights[*fid];
+                        let fqkv_dim = fw.rows;
+                        self.gemm_bf16_to_f32_batch(
+                            fw, d_bh_ptr, d_bpa_ptr,
+                            batch_size, hs, fqkv_dim)?;
+
+                        let q_size = if is_gated { nh * hd * 2 } else { nh * hd };
+                        let k_offset = q_size;
+                        let v_offset = k_offset + kv_stride;
+
+                        // D. Per-token GQA processing
+                        for t in 0..batch_size {
+                            let position = positions[t];
+                            let proj_ptr = d_bpa_ptr + (t * fqkv_dim) as u64 * 4;
+
+                            // Copy fused QKV output to single-token scratch, extract K/V
+                            unsafe {
+                                cuda_sys::lib().cuMemcpyDtoD_v2(
+                                    *graph.d_gqa_q.device_ptr(), proj_ptr, q_size * 4);
+                                cuda_sys::lib().cuMemcpyDtoD_v2(
+                                    *graph.d_gqa_k.device_ptr(),
+                                    proj_ptr + (k_offset * 4) as u64,
+                                    kv_stride * 4);
+                                cuda_sys::lib().cuMemcpyDtoD_v2(
+                                    *graph.d_gqa_v.device_ptr(),
+                                    proj_ptr + (v_offset * 4) as u64,
+                                    kv_stride * 4);
+                            }
+
+                            // Split gated Q
+                            if is_gated {
+                                let total = (nh * hd) as u32;
+                                let threads = 256u32;
+                                let blocks = (total + threads - 1) / threads;
+                                unsafe {
+                                    let split_fn = self.device.get_func(MODULE_NAME, "split_gated_q")
+                                        .ok_or_else(|| "split_gated_q not found".to_string())?;
+                                    split_fn.launch(
+                                        LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                        (*graph.d_gqa_q.device_ptr(), *graph.d_la_qkvz.device_ptr(),
+                                         *graph.d_gqa_q.device_ptr(), nh as i32, hd as i32),
+                                    ).map_err(|e| format!("batch split_gated_q[{}][{}]: {:?}", layer_idx, t, e))?;
+                                }
+                            }
+
+                            // QK norm
+                            if qnp != 0 {
+                                let threads = 256u32;
+                                let norm_fn = self.device.get_func(MODULE_NAME, "per_head_rmsnorm")
+                                    .ok_or_else(|| "per_head_rmsnorm not found".to_string())?;
+                                unsafe {
+                                    norm_fn.clone().launch(
+                                        LaunchConfig { grid_dim: (nh as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                        (*graph.d_gqa_q.device_ptr(), qnp, eps, nh as i32, hd as i32, 0i32),
+                                    ).map_err(|e| format!("batch qnorm[{}][{}]: {:?}", layer_idx, t, e))?;
+                                    norm_fn.launch(
+                                        LaunchConfig { grid_dim: (nkv as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                        (*graph.d_gqa_k.device_ptr(), knp, eps, nkv as i32, hd as i32, 0i32),
+                                    ).map_err(|e| format!("batch knorm[{}][{}]: {:?}", layer_idx, t, e))?;
+                                }
+                            }
+
+                            // RoPE
+                            if let Some(ref d_cos) = graph.d_rope_cos {
+                                let half_dim = graph.rope_half_dim;
+                                let total_heads = nh + nkv;
+                                let total_work = total_heads * half_dim;
+                                let threads = 256u32;
+                                let blocks = ((total_work as u32) + threads - 1) / threads;
+                                let rope_fn = self.device.get_func(MODULE_NAME, "apply_rope")
+                                    .ok_or_else(|| "apply_rope not found".to_string())?;
+                                unsafe {
+                                    rope_fn.launch(
+                                        LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                        (*graph.d_gqa_q.device_ptr(), *graph.d_gqa_k.device_ptr(),
+                                         *d_cos.device_ptr(), *graph.d_rope_sin.as_ref().unwrap().device_ptr(),
+                                         position as i32, nh as i32, nkv as i32, hd as i32, half_dim as i32),
+                                    ).map_err(|e| format!("batch rope[{}][{}]: {:?}", layer_idx, t, e))?;
+                                }
+                            }
+
+                            // KV cache write
+                            if layer_idx < graph.kv_k_ptrs.len()
+                                && graph.kv_k_ptrs[layer_idx] != 0 {
+                                let threads = 256u32;
+                                let blocks = ((kv_stride as u32) + threads - 1) / threads;
+                                let kv_fn = self.device.get_func(MODULE_NAME, "kv_cache_write")
+                                    .ok_or_else(|| "kv_cache_write not found".to_string())?;
+                                unsafe {
+                                    kv_fn.launch(
+                                        LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                        (graph.kv_k_ptrs[layer_idx], graph.kv_v_ptrs[layer_idx],
+                                         *graph.d_gqa_k.device_ptr(), *graph.d_gqa_v.device_ptr(),
+                                         position as i32, kv_stride as i32),
+                                    ).map_err(|e| format!("batch kv_write[{}][{}]: {:?}", layer_idx, t, e))?;
+                                }
+                            }
+
+                            // GQA attention
+                            {
+                                let seq_len = (position + 1) as u32;
+                                let threads = 256u32;
+                                let q_smem = (hd as u32) * 4;
+                                let use_tiled = graph.d_gqa_tiled_o.is_some()
+                                    && seq_len > (graph.gqa_tile_size * graph.gqa_num_q_heads) as u32;
+                                if use_tiled {
+                                    let tile_size = graph.gqa_tile_size;
+                                    let num_tiles = ((seq_len as usize) + tile_size - 1) / tile_size;
+                                    let tiled_fn = self.device.get_func(MODULE_NAME, "gqa_attention_tiled")
+                                        .ok_or_else(|| "gqa_attention_tiled not found".to_string())?;
+                                    let smem = q_smem + (tile_size as u32) * 4 + 128;
+                                    unsafe {
+                                        tiled_fn.launch(
+                                            LaunchConfig {
+                                                grid_dim: (nh as u32, num_tiles as u32, 1),
+                                                block_dim: (threads, 1, 1),
+                                                shared_mem_bytes: smem,
+                                            },
+                                            (*graph.d_gqa_tiled_o.as_ref().unwrap().device_ptr(),
+                                             *graph.d_gqa_tiled_lse.as_ref().unwrap().device_ptr(),
+                                             *graph.d_gqa_q.device_ptr(),
+                                             graph.kv_k_ptrs[layer_idx],
+                                             graph.kv_v_ptrs[layer_idx],
+                                             sm_sc, nh as i32, nkv as i32, hd as i32,
+                                             seq_len as i32, graph.kv_max_seq as i32,
+                                             tile_size as i32),
+                                        ).map_err(|e| format!("batch gqa_tiled[{}][{}]: {:?}", layer_idx, t, e))?;
+                                    }
+                                    let reduce_fn = self.device.get_func(MODULE_NAME, "gqa_attention_reduce")
+                                        .ok_or_else(|| "gqa_attention_reduce not found".to_string())?;
+                                    unsafe {
+                                        reduce_fn.launch(
+                                            LaunchConfig { grid_dim: (nh as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                            (*graph.d_gqa_out.device_ptr(),
+                                             *graph.d_gqa_tiled_o.as_ref().unwrap().device_ptr(),
+                                             *graph.d_gqa_tiled_lse.as_ref().unwrap().device_ptr(),
+                                             nh as i32, hd as i32, num_tiles as i32),
+                                        ).map_err(|e| format!("batch gqa_reduce[{}][{}]: {:?}", layer_idx, t, e))?;
+                                    }
+                                } else {
+                                    let shared_mem_bytes = q_smem + seq_len * 4 + 128;
+                                    let attn_fn = self.device.get_func(MODULE_NAME, "gqa_attention")
+                                        .ok_or_else(|| "gqa_attention not found".to_string())?;
+                                    unsafe {
+                                        attn_fn.launch(
+                                            LaunchConfig {
+                                                grid_dim: (nh as u32, 1, 1),
+                                                block_dim: (threads, 1, 1),
+                                                shared_mem_bytes,
+                                            },
+                                            (*graph.d_gqa_out.device_ptr(), *graph.d_gqa_q.device_ptr(),
+                                             graph.kv_k_ptrs[layer_idx], graph.kv_v_ptrs[layer_idx],
+                                             sm_sc, nh as i32, nkv as i32, hd as i32,
+                                             seq_len as i32, graph.kv_max_seq as i32, 1i32),
+                                        ).map_err(|e| format!("batch gqa[{}][{}]: {:?}", layer_idx, t, e))?;
+                                    }
+                                }
+                            }
+
+                            // Gated attention
+                            if is_gated {
+                                let total = (nh * hd) as u32;
+                                let threads = 256u32;
+                                let blocks = (total + threads - 1) / threads;
+                                let gate_fn = self.device.get_func(MODULE_NAME, "apply_gated_attn")
+                                    .ok_or_else(|| "apply_gated_attn not found".to_string())?;
+                                unsafe {
+                                    gate_fn.launch(
+                                        LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                        (*graph.d_gqa_out.device_ptr(), *graph.d_la_qkvz.device_ptr(), (nh * hd) as i32),
+                                    ).map_err(|e| format!("batch gated_attn[{}][{}]: {:?}", layer_idx, t, e))?;
+                                }
+                            }
+
+                            // Convert attention output to BF16 → batch_attn_out[t]
+                            {
+                                let out_ptr = d_bao_ptr + (t * o_size * 2) as u64;
+                                unsafe {
+                                    k.fp32_to_bf16.clone().launch(
+                                        LaunchConfig::for_num_elems(o_size as u32),
+                                        (out_ptr, *graph.d_gqa_out.device_ptr(), o_size as i32),
+                                    ).map_err(|e| format!("batch fp32_to_bf16_o[{}][{}]: {:?}", layer_idx, t, e))?;
+                                }
+                            }
+                        } // end per-token GQA loop
+
+                        // E. Batch output projection GEMM (weights loaded ONCE)
+                        let ow = &graph.weights[*o_proj];
+                        self.gemm_bf16_batch(
+                            ow, d_bao_ptr, d_bh_ptr,
+                            batch_size, o_size, hs)?;
+                    } else {
+                        // Non-fused Q/K/V: fall back to per-token GEMV
+                        let qw = &graph.weights[*q_proj];
+                        let kw = &graph.weights[*k_proj];
+                        let vw = &graph.weights[*v_proj];
+
+                        for t in 0..batch_size {
+                            let position = positions[t];
+                            let hidden_ptr = d_bh_ptr + (t * hs * 2) as u64;
+
+                            self.gemv_bf16_to_f32(qw, hidden_ptr, *graph.d_gqa_q.device_ptr())?;
+                            self.gemv_bf16_to_f32(kw, hidden_ptr, *graph.d_gqa_k.device_ptr())?;
+                            self.gemv_bf16_to_f32(vw, hidden_ptr, *graph.d_gqa_v.device_ptr())?;
+
+                            // Split gated Q (same as fused path)
+                            if is_gated {
+                                let total = (nh * hd) as u32;
+                                let threads = 256u32;
+                                let blocks = (total + threads - 1) / threads;
+                                unsafe {
+                                    let split_fn = self.device.get_func(MODULE_NAME, "split_gated_q")
+                                        .ok_or_else(|| "split_gated_q not found".to_string())?;
+                                    split_fn.launch(
+                                        LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                        (*graph.d_gqa_q.device_ptr(), *graph.d_la_qkvz.device_ptr(),
+                                         *graph.d_gqa_q.device_ptr(), nh as i32, hd as i32),
+                                    ).map_err(|e| format!("batch split_gated_q[{}][{}]: {:?}", layer_idx, t, e))?;
+                                }
+                            }
+
+                            // QK norm
+                            if qnp != 0 {
+                                let threads = 256u32;
+                                let norm_fn = self.device.get_func(MODULE_NAME, "per_head_rmsnorm")
+                                    .ok_or_else(|| "per_head_rmsnorm not found".to_string())?;
+                                unsafe {
+                                    norm_fn.clone().launch(
+                                        LaunchConfig { grid_dim: (nh as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                        (*graph.d_gqa_q.device_ptr(), qnp, eps, nh as i32, hd as i32, 0i32),
+                                    ).map_err(|e| format!("batch qnorm[{}][{}]: {:?}", layer_idx, t, e))?;
+                                    norm_fn.launch(
+                                        LaunchConfig { grid_dim: (nkv as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                        (*graph.d_gqa_k.device_ptr(), knp, eps, nkv as i32, hd as i32, 0i32),
+                                    ).map_err(|e| format!("batch knorm[{}][{}]: {:?}", layer_idx, t, e))?;
+                                }
+                            }
+
+                            // RoPE
+                            if let Some(ref d_cos) = graph.d_rope_cos {
+                                let half_dim = graph.rope_half_dim;
+                                let total_heads = nh + nkv;
+                                let total_work = total_heads * half_dim;
+                                let threads = 256u32;
+                                let blocks = ((total_work as u32) + threads - 1) / threads;
+                                let rope_fn = self.device.get_func(MODULE_NAME, "apply_rope")
+                                    .ok_or_else(|| "apply_rope not found".to_string())?;
+                                unsafe {
+                                    rope_fn.launch(
+                                        LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                        (*graph.d_gqa_q.device_ptr(), *graph.d_gqa_k.device_ptr(),
+                                         *d_cos.device_ptr(), *graph.d_rope_sin.as_ref().unwrap().device_ptr(),
+                                         position as i32, nh as i32, nkv as i32, hd as i32, half_dim as i32),
+                                    ).map_err(|e| format!("batch rope[{}][{}]: {:?}", layer_idx, t, e))?;
+                                }
+                            }
+
+                            // KV cache write
+                            if layer_idx < graph.kv_k_ptrs.len()
+                                && graph.kv_k_ptrs[layer_idx] != 0 {
+                                let threads = 256u32;
+                                let blocks = ((kv_stride as u32) + threads - 1) / threads;
+                                let kv_fn = self.device.get_func(MODULE_NAME, "kv_cache_write")
+                                    .ok_or_else(|| "kv_cache_write not found".to_string())?;
+                                unsafe {
+                                    kv_fn.launch(
+                                        LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                        (graph.kv_k_ptrs[layer_idx], graph.kv_v_ptrs[layer_idx],
+                                         *graph.d_gqa_k.device_ptr(), *graph.d_gqa_v.device_ptr(),
+                                         position as i32, kv_stride as i32),
+                                    ).map_err(|e| format!("batch kv_write[{}][{}]: {:?}", layer_idx, t, e))?;
+                                }
+                            }
+
+                            // GQA attention (same as fused path above)
+                            {
+                                let seq_len = (position + 1) as u32;
+                                let threads = 256u32;
+                                let q_smem = (hd as u32) * 4;
+                                let use_tiled = graph.d_gqa_tiled_o.is_some()
+                                    && seq_len > (graph.gqa_tile_size * graph.gqa_num_q_heads) as u32;
+                                if use_tiled {
+                                    let tile_size = graph.gqa_tile_size;
+                                    let num_tiles = ((seq_len as usize) + tile_size - 1) / tile_size;
+                                    let tiled_fn = self.device.get_func(MODULE_NAME, "gqa_attention_tiled")
+                                        .ok_or_else(|| "gqa_attention_tiled not found".to_string())?;
+                                    let smem = q_smem + (tile_size as u32) * 4 + 128;
+                                    unsafe {
+                                        tiled_fn.launch(
+                                            LaunchConfig {
+                                                grid_dim: (nh as u32, num_tiles as u32, 1),
+                                                block_dim: (threads, 1, 1),
+                                                shared_mem_bytes: smem,
+                                            },
+                                            (*graph.d_gqa_tiled_o.as_ref().unwrap().device_ptr(),
+                                             *graph.d_gqa_tiled_lse.as_ref().unwrap().device_ptr(),
+                                             *graph.d_gqa_q.device_ptr(),
+                                             graph.kv_k_ptrs[layer_idx],
+                                             graph.kv_v_ptrs[layer_idx],
+                                             sm_sc, nh as i32, nkv as i32, hd as i32,
+                                             seq_len as i32, graph.kv_max_seq as i32,
+                                             tile_size as i32),
+                                        ).map_err(|e| format!("batch gqa_tiled[{}][{}]: {:?}", layer_idx, t, e))?;
+                                    }
+                                    let reduce_fn = self.device.get_func(MODULE_NAME, "gqa_attention_reduce")
+                                        .ok_or_else(|| "gqa_attention_reduce not found".to_string())?;
+                                    unsafe {
+                                        reduce_fn.launch(
+                                            LaunchConfig { grid_dim: (nh as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                            (*graph.d_gqa_out.device_ptr(),
+                                             *graph.d_gqa_tiled_o.as_ref().unwrap().device_ptr(),
+                                             *graph.d_gqa_tiled_lse.as_ref().unwrap().device_ptr(),
+                                             nh as i32, hd as i32, num_tiles as i32),
+                                        ).map_err(|e| format!("batch gqa_reduce[{}][{}]: {:?}", layer_idx, t, e))?;
+                                    }
+                                } else {
+                                    let shared_mem_bytes = q_smem + seq_len * 4 + 128;
+                                    let attn_fn = self.device.get_func(MODULE_NAME, "gqa_attention")
+                                        .ok_or_else(|| "gqa_attention not found".to_string())?;
+                                    unsafe {
+                                        attn_fn.launch(
+                                            LaunchConfig {
+                                                grid_dim: (nh as u32, 1, 1),
+                                                block_dim: (threads, 1, 1),
+                                                shared_mem_bytes,
+                                            },
+                                            (*graph.d_gqa_out.device_ptr(), *graph.d_gqa_q.device_ptr(),
+                                             graph.kv_k_ptrs[layer_idx], graph.kv_v_ptrs[layer_idx],
+                                             sm_sc, nh as i32, nkv as i32, hd as i32,
+                                             seq_len as i32, graph.kv_max_seq as i32, 1i32),
+                                        ).map_err(|e| format!("batch gqa[{}][{}]: {:?}", layer_idx, t, e))?;
+                                    }
+                                }
+                            }
+
+                            // Gated attention (same as fused path)
+                            if is_gated {
+                                let total = (nh * hd) as u32;
+                                let threads = 256u32;
+                                let blocks = (total + threads - 1) / threads;
+                                let gate_fn = self.device.get_func(MODULE_NAME, "apply_gated_attn")
+                                    .ok_or_else(|| "apply_gated_attn not found".to_string())?;
+                                unsafe {
+                                    gate_fn.launch(
+                                        LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                        (*graph.d_gqa_out.device_ptr(), *graph.d_la_qkvz.device_ptr(), (nh * hd) as i32),
+                                    ).map_err(|e| format!("batch gated_attn[{}][{}]: {:?}", layer_idx, t, e))?;
+                                }
+                            }
+
+                            // O projection (per-token GEMV for non-fused path)
+                            {
+                                unsafe {
+                                    k.fp32_to_bf16.clone().launch(
+                                        LaunchConfig::for_num_elems(o_size as u32),
+                                        (*graph.d_scratch.device_ptr(), *graph.d_gqa_out.device_ptr(), o_size as i32),
+                                    ).map_err(|e| format!("batch fp32_to_bf16_o[{}][{}]: {:?}", layer_idx, t, e))?;
+                                }
+                                let ow = &graph.weights[*o_proj];
+                                self.gemv_bf16_internal(ow, *graph.d_scratch.device_ptr(), hidden_ptr)?;
+                            }
+                        } // end per-token non-fused GQA loop
+                    }
+                }
+
+                GpuAttnConfig::MLA { .. } => {
+                    return Err("MLA not implemented for batched decode".to_string());
+                }
+            }
+
+            if do_timing {
+                self.device.synchronize().map_err(|e| format!("timing: {:?}", e))?;
+                tt_attn += t_attn_start.elapsed().as_secs_f64();
+            }
+            let t_norm2_start = std::time::Instant::now();
+
+            // ── F. Post-attention norm (in-place on batch arrays) ──
+            {
+                let smem = (hs as u32) * 4;
+                let threads = 256u32.min(hs as u32);
+                for t in 0..batch_size {
+                    let h_ptr = d_bh_ptr + (t * hs * 2) as u64;
+                    let r_ptr = d_br_ptr + (t * hs * 2) as u64;
+                    unsafe {
+                        k.fused_add_rmsnorm.clone().launch(
+                            LaunchConfig { grid_dim: (1, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: smem },
+                            (h_ptr, r_ptr, graph.layers[layer_idx].post_attn_norm_ptr, eps, hs as i32, 0i32),
+                        ).map_err(|e| format!("batch post_norm[{}][{}]: {:?}", layer_idx, t, e))?;
+                    }
+                }
+            }
+
+            if is_la { la_stack_idx += 1; }
+
+            if do_timing {
+                self.device.synchronize().map_err(|e| format!("timing: {:?}", e))?;
+                tt_norm += t_norm2_start.elapsed().as_secs_f64();
+            }
+            let t_moe_start = std::time::Instant::now();
+
+            // ── G. MoE or Dense MLP ──
+            if has_moe {
+                // Batched MoE with fail-fast: route all tokens, check expert divergence,
+                // potentially truncate batch, then DMA expert union and compute.
+                batch_size = self.moe_forward_batched(graph, layer_idx, batch_size)?;
+
+                // Copy moe_out[t] → hidden[t] for each token
+                for t in 0..batch_size {
+                    let offset = (t * hs * 2) as u64;
+                    unsafe {
+                        cuda_sys::lib().cuMemcpyDtoD_v2(
+                            d_bh_ptr + offset, d_bmo_ptr + offset, hs * 2);
+                    }
+                }
+            } else if let GpuMlpConfig::Dense { gate_proj, up_proj, down_proj } = &graph.layers[layer_idx].mlp {
+                // Dense MLP: process each token separately (TODO: batch GEMM)
+                let gw = &graph.weights[*gate_proj];
+                let uw = &graph.weights[*up_proj];
+                let dw = &graph.weights[*down_proj];
+                let intermediate = gw.rows;
+
+                for t in 0..batch_size {
+                    let h_ptr = d_bh_ptr + (t * hs * 2) as u64;
+
+                    self.gemv_bf16_internal(gw, h_ptr,
+                        *graph.d_expert_gate_up.device_ptr())?;
+                    let up_out_ptr = unsafe {
+                        (*graph.d_expert_gate_up.device_ptr() as *const u16).add(intermediate) as u64
+                    };
+                    self.gemv_bf16_internal(uw, h_ptr, up_out_ptr)?;
+
+                    unsafe {
+                        k.silu_mul.clone().launch(
+                            LaunchConfig::for_num_elems(intermediate as u32),
+                            (*graph.d_expert_scratch.device_ptr(), *graph.d_expert_gate_up.device_ptr(), intermediate as i32),
+                        ).map_err(|e| format!("batch silu[{}][{}]: {:?}", layer_idx, t, e))?;
+                    }
+
+                    self.gemv_bf16_internal(dw, *graph.d_expert_scratch.device_ptr(), h_ptr)?;
+                }
+            }
+
+            if do_timing {
+                self.device.synchronize().map_err(|e| format!("timing: {:?}", e))?;
+                tt_moe += t_moe_start.elapsed().as_secs_f64();
+            }
+        } // end layer loop
+
+        let t_lm_start = std::time::Instant::now();
+
+        // ── 3. Final norm (in-place) + LM head (batch GEMM) ──
+        {
+            let smem = (hs as u32) * 4;
+            let threads = 256u32.min(hs as u32);
+            for t in 0..batch_size {
+                let h_ptr = d_bh_ptr + (t * hs * 2) as u64;
+                let r_ptr = d_br_ptr + (t * hs * 2) as u64;
+                unsafe {
+                    k.fused_add_rmsnorm.clone().launch(
+                        LaunchConfig { grid_dim: (1, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: smem },
+                        (h_ptr, r_ptr, graph.final_norm_ptr, eps, hs as i32, 0i32),
+                    ).map_err(|e| format!("batch final_norm[{}]: {:?}", t, e))?;
+                }
+            }
+        }
+
+        // Batch LM head GEMM: all tokens at once (weights loaded ONCE)
+        {
+            let lm_w = &graph.weights[graph.lm_head_wid];
+            let logits_ptr = *graph.d_batch_logits.as_ref().unwrap().device_ptr();
+            self.gemm_bf16_to_f32_batch(
+                lm_w, d_bh_ptr, logits_ptr,
+                batch_size, hs, graph.vocab_size)?;
+        }
+
+        // ── 4. Sync + D2H all batch logits ──
+        self.device.synchronize().map_err(|e| format!("batch sync: {:?}", e))?;
+        {
+            let total_logits = batch_size * graph.vocab_size;
+            unsafe {
+                let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+                    graph.h_batch_logits.as_mut_ptr() as *mut std::ffi::c_void,
+                    *graph.d_batch_logits.as_ref().unwrap().device_ptr(),
+                    total_logits * 4);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("batch D2H logits: {:?}", err));
+                }
+            }
+        }
+
+        if do_timing {
+            self.device.synchronize().map_err(|e| format!("timing: {:?}", e))?;
+            tt_lmhead += t_lm_start.elapsed().as_secs_f64();
+            eprintln!("  BATCH-TIMING batch={}/{}: norm={:.1}ms attn={:.1}ms moe={:.1}ms lmhead={:.1}ms total={:.1}ms",
+                batch_size, orig_batch_size,
+                tt_norm * 1000.0, tt_attn * 1000.0, tt_moe * 1000.0, tt_lmhead * 1000.0,
+                (tt_norm + tt_attn + tt_moe + tt_lmhead) * 1000.0);
+        }
+
+        Ok(batch_size)
+    }
+
+    /// Batched MoE forward: route all batch tokens through one MoE layer.
+    /// Takes expert union, DMAs each unique expert once, computes all tokens.
+    ///
+    /// Returns the (potentially reduced) batch size after fail-fast divergence check.
+    /// If draft tokens' expert routing diverges from token[0]'s routing
+    /// (Jaccard similarity below threshold), the batch is truncated to exclude
+    /// the divergent tokens and all subsequent ones.
+    fn moe_forward_batched(
+        &self,
+        graph: &mut GpuDecodeGraph,
+        layer_idx: usize,
+        batch_size: usize,
+    ) -> Result<usize, String> {
+        use std::collections::HashMap;
+
+        let device = &self.device;
+        let copy_stream = self.copy_stream.0;
+
+        let moe = graph.moe_layers.get(layer_idx)
+            .and_then(|m| m.as_ref())
+            .ok_or_else(|| format!("MoE layer {} not registered", layer_idx))?;
+
+        let hs = graph.hidden_size;
+        let intermediate = graph.intermediate_size;
+        let gs = graph.group_size;
+        let topk = moe.topk;
+        let ne = moe.num_experts;
+        let sf = moe.scoring_func;
+        let rsf = moe.routed_scaling_factor;
+        let gate_wid = moe.gate_wid;
+        let gate_bias_ptr = moe.gate_bias_ptr;
+        let e_score_corr_ptr = moe.e_score_corr_ptr;
+        let inv_wp = *graph.d_inv_weight_perm.device_ptr();
+        let inv_sp = *graph.d_inv_scale_perm.device_ptr();
+
+        let w13_n = 2 * intermediate;
+        let w13_k_tiles = hs / 16;
+        let w13_max_ksplits = w13_k_tiles / 16;
+        let w13_ksplits = if w13_max_ksplits > 1 {
+            let n_tiles = (w13_n + 15) / 16;
+            let target = graph.num_sms * 4;
+            let desired = (target + n_tiles - 1) / n_tiles;
+            desired.clamp(1, w13_max_ksplits.min(8))
+        } else { 1 };
+        let use_v2_w13 = w13_ksplits > 1;
+        let partial_ptr = *graph.d_v2_partial.device_ptr();
+
+        let k = graph.kernels.as_ref()
+            .ok_or_else(|| "Kernels not cached".to_string())?;
+
+        let d_bh_ptr = *graph.d_batch_hidden.as_ref()
+            .ok_or("batch buffers not allocated")?.device_ptr();
+        let d_bmo_ptr = *graph.d_batch_moe_out.as_ref()
+            .ok_or("batch buffers not allocated")?.device_ptr();
+
+        // Use pre-allocated events
+        let pre_ev = &graph.pre_events;
+        let ev_dma: [cuda_sys::CUevent; 2];
+        let ev_compute: [cuda_sys::CUevent; 2];
+        if let Some(ref pe) = pre_ev {
+            ev_dma = [pe[0].0, pe[1].0];
+            ev_compute = [pe[2].0, pe[3].0];
+        } else {
+            unsafe {
+                let flags = cuda_sys::CUevent_flags::CU_EVENT_DISABLE_TIMING as u32;
+                let mut events = [std::ptr::null_mut(); 4];
+                for e in events.iter_mut() { cuda_sys::lib().cuEventCreate(e, flags); }
+                ev_dma = [events[0], events[1]];
+                ev_compute = [events[2], events[3]];
+            }
+        }
+
+        let default_stream: cuda_sys::CUstream = std::ptr::null_mut();
+
+        // ── Step 1: Batched gate + TopK routing (single sync) ──
+        // All gate GEMVs + topk kernels launched without sync, then single sync + D2H.
+        let d_gate_ptr = *graph.d_batch_gate_logits.as_ref()
+            .ok_or("batch gate logits not allocated")?.device_ptr();
+        let d_btk_ids_ptr = *graph.d_batch_topk_ids.as_ref()
+            .ok_or("batch topk ids not allocated")?.device_ptr();
+        let d_btk_wts_ptr = *graph.d_batch_topk_wts.as_ref()
+            .ok_or("batch topk wts not allocated")?.device_ptr();
+
+        for t in 0..batch_size {
+            let hidden_ptr = d_bh_ptr + (t * hs * 2) as u64;
+            let logits_ptr = d_gate_ptr + (t * ne * 4) as u64;
+            let tk_ids_ptr = d_btk_ids_ptr + (t * topk * 4) as u64;
+            let tk_wts_ptr = d_btk_wts_ptr + (t * topk * 4) as u64;
+
+            // Gate GEMV → per-token gate logits buffer
+            {
+                let w = &graph.weights[gate_wid];
+                let alpha: f32 = 1.0;
+                let beta: f32 = 0.0;
+                unsafe {
+                    cublas_result::gemm_ex(
+                        *self.blas.handle(),
+                        cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                        cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                        w.rows as i32, 1, w.cols as i32,
+                        &alpha as *const f32 as *const std::ffi::c_void,
+                        w.ptr as *const std::ffi::c_void, cublas_sys::cudaDataType::CUDA_R_16BF, w.cols as i32,
+                        hidden_ptr as *const std::ffi::c_void, cublas_sys::cudaDataType::CUDA_R_16BF, hs as i32,
+                        &beta as *const f32 as *const std::ffi::c_void,
+                        logits_ptr as *mut std::ffi::c_void,
+                        cublas_sys::cudaDataType::CUDA_R_32F, w.rows as i32,
+                        cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                        cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                    ).map_err(|e| format!("batch gate GEMV[{}][{}]: {:?}", layer_idx, t, e))?;
+                }
+            }
+
+            // TopK → per-token topk buffer on GPU
+            {
+                let smem = (ne as u32) * 4;
+                let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: smem };
+                if sf == 1 {
+                    let bias_ptr = if gate_bias_ptr != 0 { gate_bias_ptr } else { 0u64 };
+                    let corr_ptr = if e_score_corr_ptr != 0 { e_score_corr_ptr } else { 0u64 };
+                    unsafe {
+                        k.sigmoid_topk.clone().launch(cfg, (
+                            logits_ptr, bias_ptr, corr_ptr,
+                            tk_ids_ptr, tk_wts_ptr,
+                            ne as i32, topk as i32,
+                        )).map_err(|e| format!("batch sigmoid_topk[{}][{}]: {:?}", layer_idx, t, e))?;
+                    }
+                } else {
+                    unsafe {
+                        k.softmax_topk.clone().launch(cfg, (
+                            logits_ptr,
+                            tk_ids_ptr, tk_wts_ptr,
+                            ne as i32, topk as i32,
+                        )).map_err(|e| format!("batch softmax_topk[{}][{}]: {:?}", layer_idx, t, e))?;
+                    }
+                }
+            }
+        }
+
+        // Single sync + D2H for all tokens' routing results
+        device.synchronize().map_err(|e| format!("batch route sync: {:?}", e))?;
+        unsafe {
+            cuda_sys::lib().cuMemcpyDtoH_v2(
+                graph.h_batch_topk_ids.as_mut_ptr() as *mut std::ffi::c_void,
+                d_btk_ids_ptr, batch_size * topk * 4);
+            cuda_sys::lib().cuMemcpyDtoH_v2(
+                graph.h_batch_topk_weights.as_mut_ptr() as *mut std::ffi::c_void,
+                d_btk_wts_ptr, batch_size * topk * 4);
+        }
+
+        // ── Step 1.5: Fail-fast expert divergence check (Jaccard similarity) ──
+        // Compare each draft token's expert routing against token[0]'s routing.
+        // If a draft token diverges, truncate the batch at that point.
+        let active_batch = if batch_size > 1 && self.spec_jaccard_threshold > 0.0 {
+            // Build token[0]'s expert set
+            let mut token0_experts = [false; 256]; // bitset (max 256 experts)
+            let mut token0_count = 0usize;
+            for j in 0..topk {
+                let eid = graph.h_batch_topk_ids[j];
+                if eid >= 0 && (eid as usize) < 256 {
+                    token0_experts[eid as usize] = true;
+                    token0_count += 1;
+                }
+            }
+
+            let mut new_batch = batch_size;
+            for t in 1..batch_size {
+                let mut intersection = 0usize;
+                let mut t_count = 0usize;
+                for j in 0..topk {
+                    let eid = graph.h_batch_topk_ids[t * topk + j];
+                    if eid >= 0 && (eid as usize) < 256 {
+                        t_count += 1;
+                        if token0_experts[eid as usize] {
+                            intersection += 1;
+                        }
+                    }
+                }
+                let union = token0_count + t_count - intersection;
+                let jaccard = if union > 0 { intersection as f32 / union as f32 } else { 0.0 };
+
+                if jaccard < self.spec_jaccard_threshold {
+                    new_batch = t; // Keep tokens 0..t-1, drop t and all after
+                    log::debug!("fail-fast: layer {} token {} Jaccard {:.3} < {:.3}, batch {} → {}",
+                        layer_idx, t, jaccard, self.spec_jaccard_threshold, batch_size, new_batch);
+                    break;
+                }
+            }
+            new_batch
+        } else {
+            batch_size
+        };
+
+        // ── Step 2: Compute expert union across active tokens ──
+        // expert_tokens: expert_id → Vec<(token_idx, weight)>
+        let mut expert_tokens: HashMap<usize, Vec<(usize, f32)>> = HashMap::new();
+        for t in 0..active_batch {
+            for j in 0..topk {
+                let eid = graph.h_batch_topk_ids[t * topk + j];
+                if eid < 0 { continue; }
+                let weight = graph.h_batch_topk_weights[t * topk + j];
+                expert_tokens.entry(eid as usize).or_default().push((t, weight));
+            }
+
+            // Record HCS activation for each token's experts
+            for j in 0..topk {
+                let eid = graph.h_batch_topk_ids[t * topk + j];
+                if eid < 0 { continue; }
+                if let Some(ref mut hcs) = graph.hcs {
+                    hcs.record_activation(layer_idx, eid as usize);
+                }
+            }
+        }
+
+        // ── Step 3: Zero batch moe_out accumulators ──
+        for t in 0..active_batch {
+            let out_ptr = d_bmo_ptr + (t * hs * 2) as u64;
+            unsafe {
+                k.zero_bf16.clone().launch(
+                    LaunchConfig::for_num_elems(hs as u32),
+                    (out_ptr, hs as i32),
+                ).map_err(|e| format!("batch zero_moe[{}][{}]: {:?}", layer_idx, t, e))?;
+            }
+        }
+
+        // ── Step 4: Expert loop — DMA each unique expert once, compute all tokens ──
+        let use_double_buf = graph.expert_buf_total_size > 0;
+        let buf_base = [
+            *graph.d_expert_buf[0].device_ptr(),
+            *graph.d_expert_buf[1].device_ptr(),
+        ];
+        let w13p_off = graph.expert_buf_w13p_offset;
+        let w13s_off = graph.expert_buf_w13s_offset;
+        let w2p_off = graph.expert_buf_w2p_offset;
+        let w2s_off = graph.expert_buf_w2s_offset;
+
+        let buf_w13_packed = *graph.d_expert_buf_a0.device_ptr();
+        let buf_w13_scales = *graph.d_expert_buf_b0.device_ptr();
+        let buf_w2_packed = *graph.d_expert_buf_a1.device_ptr();
+        let buf_w2_scales = *graph.d_expert_buf_b1.device_ptr();
+
+        let mut dma_expert_count = 0u32;
+
+        for (&eid, token_list) in &expert_tokens {
+            let expert = &moe.experts[eid];
+
+            // Check HCS first
+            let hcs_ptrs = if let Some(ref hcs) = graph.hcs {
+                hcs.get(layer_idx, eid).map(|entry| (
+                    entry.w13_packed_ptr(), entry.w13_scales_ptr(),
+                    entry.w2_packed_ptr(), entry.w2_scales_ptr(),
+                ))
+            } else { None };
+
+            let (w13p, w13s, w2p, w2s) = if let Some(ptrs) = hcs_ptrs {
+                // HCS hit — no DMA needed
+                ptrs
+            } else if use_double_buf {
+                // DMA to ping-pong buffer
+                let slot = (dma_expert_count % 2) as usize;
+                if dma_expert_count >= 2 {
+                    unsafe { cuda_sys::lib().cuStreamWaitEvent(copy_stream, ev_compute[slot], 0); }
+                }
+
+                unsafe {
+                    let base = buf_base[slot];
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        base + w13p_off as u64, expert.w13_packed_ptr as *const std::ffi::c_void,
+                        expert.w13_packed_bytes, copy_stream);
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        base + w13s_off as u64, expert.w13_scales_ptr as *const std::ffi::c_void,
+                        expert.w13_scales_bytes, copy_stream);
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        base + w2p_off as u64, expert.w2_packed_ptr as *const std::ffi::c_void,
+                        expert.w2_packed_bytes, copy_stream);
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        base + w2s_off as u64, expert.w2_scales_ptr as *const std::ffi::c_void,
+                        expert.w2_scales_bytes, copy_stream);
+                    cuda_sys::lib().cuEventRecord(ev_dma[slot], copy_stream);
+                    cuda_sys::lib().cuStreamWaitEvent(default_stream, ev_dma[slot], 0);
+                }
+
+                let base = buf_base[slot];
+                dma_expert_count += 1;
+
+                (base + w13p_off as u64, base + w13s_off as u64,
+                 base + w2p_off as u64, base + w2s_off as u64)
+            } else {
+                // Legacy single-buffer path
+                unsafe {
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        buf_w13_packed, expert.w13_packed_ptr as *const std::ffi::c_void,
+                        expert.w13_packed_bytes, copy_stream);
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        buf_w13_scales, expert.w13_scales_ptr as *const std::ffi::c_void,
+                        expert.w13_scales_bytes, copy_stream);
+                    cuda_sys::lib().cuEventRecord(ev_dma[0], copy_stream);
+                    cuda_sys::lib().cuStreamWaitEvent(default_stream, ev_dma[0], 0);
+                }
+                (buf_w13_packed, buf_w13_scales, buf_w2_packed, buf_w2_scales)
+            };
+
+            // Compute all tokens that route to this expert
+            for &(t, weight) in token_list {
+                let hidden_ptr = d_bh_ptr + (t * hs * 2) as u64;
+                let accum_ptr = d_bmo_ptr + (t * hs * 2) as u64;
+
+                // w13 GEMV
+                if use_v2_w13 {
+                    self.launch_marlin_gemv_v2(
+                        w13p, w13s, hidden_ptr, partial_ptr, inv_wp, inv_sp,
+                        hs, w13_n, gs, w13_ksplits, k).map_err(|e| format!("{}", e))?;
+                    self.launch_reduce_ksplits_bf16(
+                        *graph.d_expert_gate_up.device_ptr(), partial_ptr,
+                        w13_n, w13_ksplits, k).map_err(|e| format!("{}", e))?;
+                } else {
+                    self.launch_marlin_gemv_raw(
+                        w13p, w13s, hidden_ptr,
+                        *graph.d_expert_gate_up.device_ptr(),
+                        inv_wp, inv_sp, hs, w13_n, gs).map_err(|e| format!("{}", e))?;
+                }
+
+                // Fused silu + w2 + weighted accumulate
+                self.launch_fused_silu_accum(
+                    w2p, w2s,
+                    *graph.d_expert_gate_up.device_ptr(),
+                    accum_ptr, inv_wp, inv_sp,
+                    intermediate, hs, gs,
+                    weight, 0u64, k).map_err(|e| format!("{}", e))?;
+            }
+
+            // Signal compute done for ping-pong
+            if use_double_buf && hcs_ptrs.is_none() {
+                let slot = ((dma_expert_count - 1) % 2) as usize;
+                unsafe {
+                    cuda_sys::lib().cuEventRecord(ev_compute[slot], default_stream);
+                }
+            }
+
+            // Legacy path: DMA w2 after w13 compute
+            if !use_double_buf && hcs_ptrs.is_none() {
+                unsafe {
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        buf_w2_packed, expert.w2_packed_ptr as *const std::ffi::c_void,
+                        expert.w2_packed_bytes, copy_stream);
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        buf_w2_scales, expert.w2_scales_ptr as *const std::ffi::c_void,
+                        expert.w2_scales_bytes, copy_stream);
+                    cuda_sys::lib().cuEventRecord(ev_dma[1], copy_stream);
+                    cuda_sys::lib().cuStreamWaitEvent(default_stream, ev_dma[1], 0);
+                }
+            }
+        }
+
+        // ── Step 5: Shared expert for each token ──
+        if moe.shared.is_some() {
+            let se_vram = graph.shared_expert_vram.get(layer_idx).and_then(|e| e.as_ref());
+
+            let (w13p, w13s, w2p, w2s) = if let Some(entry) = se_vram {
+                (entry.w13_packed_ptr(), entry.w13_scales_ptr(),
+                 entry.w2_packed_ptr(), entry.w2_scales_ptr())
+            } else {
+                let shared = moe.shared.as_ref().unwrap();
+                unsafe {
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        buf_w13_packed, shared.w13_packed_ptr as *const std::ffi::c_void,
+                        shared.w13_packed_bytes, copy_stream);
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        buf_w13_scales, shared.w13_scales_ptr as *const std::ffi::c_void,
+                        shared.w13_scales_bytes, copy_stream);
+                    cuda_sys::lib().cuEventRecord(ev_dma[0], copy_stream);
+                    cuda_sys::lib().cuStreamWaitEvent(default_stream, ev_dma[0], 0);
+                }
+                (buf_w13_packed, buf_w13_scales, buf_w2_packed, buf_w2_scales)
+            };
+
+            for t in 0..active_batch {
+                let hidden_ptr = d_bh_ptr + (t * hs * 2) as u64;
+                let accum_ptr = d_bmo_ptr + (t * hs * 2) as u64;
+
+                // w13 GEMV
+                self.launch_marlin_gemv_raw(
+                    w13p, w13s, hidden_ptr,
+                    *graph.d_expert_gate_up.device_ptr(),
+                    inv_wp, inv_sp, hs, 2 * intermediate, gs).map_err(|e| format!("{}", e))?;
+
+                // w2 DMA (if not VRAM resident, first token only)
+                if se_vram.is_none() && t == 0 {
+                    let shared = moe.shared.as_ref().unwrap();
+                    unsafe {
+                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                            buf_w2_packed, shared.w2_packed_ptr as *const std::ffi::c_void,
+                            shared.w2_packed_bytes, copy_stream);
+                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                            buf_w2_scales, shared.w2_scales_ptr as *const std::ffi::c_void,
+                            shared.w2_scales_bytes, copy_stream);
+                        cuda_sys::lib().cuEventRecord(ev_dma[1], copy_stream);
+                        cuda_sys::lib().cuStreamWaitEvent(default_stream, ev_dma[1], 0);
+                    }
+                }
+
+                // Shared gate
+                let gate_weight_ptr = if let Some(sg_wid) = moe.shared_gate_wid {
+                    let sg_w = &graph.weights[sg_wid];
+                    self.gemv_bf16_to_f32(sg_w, hidden_ptr, *graph.d_scratch.device_ptr())
+                        .map_err(|e| format!("batch shared gate: {}", e))?;
+                    *graph.d_scratch.device_ptr()
+                } else { 0u64 };
+                let shared_weight = if gate_weight_ptr != 0 { 0.0f32 } else { 1.0f32 };
+
+                self.launch_fused_silu_accum(
+                    w2p, w2s,
+                    *graph.d_expert_gate_up.device_ptr(),
+                    accum_ptr, inv_wp, inv_sp,
+                    intermediate, hs, gs,
+                    shared_weight, gate_weight_ptr, k).map_err(|e| format!("{}", e))?;
+            }
+        }
+
+        // ── Step 6: Scale by routed_scaling_factor ──
+        if rsf != 1.0 {
+            for t in 0..active_batch {
+                let out_ptr = d_bmo_ptr + (t * hs * 2) as u64;
+                unsafe {
+                    k.scale_bf16.clone().launch(
+                        LaunchConfig::for_num_elems(hs as u32),
+                        (out_ptr, out_ptr, rsf, hs as i32),
+                    ).map_err(|e| format!("batch scale[{}][{}]: {:?}", layer_idx, t, e))?;
+                }
+            }
+        }
+
+        Ok(active_batch)
+    }
+
     /// BF16 GEMV: output_bf16[N] = weight_bf16[N,K] @ input_bf16[K]
     fn gemv_bf16_internal(&self, w: &GpuWeight, input_ptr: u64, output_ptr: u64) -> Result<(), String> {
         let alpha: f32 = 1.0;
@@ -3704,6 +5830,250 @@ impl GpuDecodeStore {
     /// Same as gemv_bf16_to_f32 but takes raw pointers (for use in decode_step_with_graph).
     fn gemv_bf16_to_f32_internal(&self, w: &GpuWeight, input_ptr: u64, output_ptr: u64) -> Result<(), String> {
         self.gemv_bf16_to_f32(w, input_ptr, output_ptr)
+    }
+
+    /// Batched GEMM: output_f32[M, N] = weight_bf16[M, K]^T @ input_bf16[K, N]
+    /// Weight is [K, M] in memory (column-major), transposed via OP_T to act as [M, K].
+    /// Input is [K, N] column-major (N hidden vectors of K elements each, stride = ldb).
+    /// Output is [M, N] column-major (N output vectors of M elements each, stride = ldc).
+    fn gemm_bf16_to_f32_batch(
+        &self, w: &GpuWeight, input_ptr: u64, output_ptr: u64,
+        n: usize, ldb: usize, ldc: usize,
+    ) -> Result<(), String> {
+        if n == 1 {
+            return self.gemv_bf16_to_f32(w, input_ptr, output_ptr);
+        }
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        unsafe {
+            cublas_result::gemm_ex(
+                *self.blas.handle(),
+                cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                w.rows as i32, n as i32, w.cols as i32,
+                &alpha as *const f32 as *const std::ffi::c_void,
+                w.ptr as *const std::ffi::c_void, w.cublas_data_type(), w.cols as i32,
+                input_ptr as *const std::ffi::c_void, w.cublas_data_type(), ldb as i32,
+                &beta as *const f32 as *const std::ffi::c_void,
+                output_ptr as *mut std::ffi::c_void,
+                cublas_sys::cudaDataType::CUDA_R_32F, ldc as i32,
+                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            ).map_err(|e| format!("cuBLAS gemm_bf16_to_f32_batch: {:?}", e))?;
+        }
+        Ok(())
+    }
+
+    /// Batched GEMM: output_bf16[M, N] = weight_bf16[M, K]^T @ input_bf16[K, N]
+    /// Same as gemm_bf16_to_f32_batch but output is BF16. Used for output projections.
+    fn gemm_bf16_batch(
+        &self, w: &GpuWeight, input_ptr: u64, output_ptr: u64,
+        n: usize, ldb: usize, ldc: usize,
+    ) -> Result<(), String> {
+        if n == 1 {
+            return self.gemv_bf16_internal(w, input_ptr, output_ptr);
+        }
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        unsafe {
+            cublas_result::gemm_ex(
+                *self.blas.handle(),
+                cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                w.rows as i32, n as i32, w.cols as i32,
+                &alpha as *const f32 as *const std::ffi::c_void,
+                w.ptr as *const std::ffi::c_void, w.cublas_data_type(), w.cols as i32,
+                input_ptr as *const std::ffi::c_void, w.cublas_data_type(), ldb as i32,
+                &beta as *const f32 as *const std::ffi::c_void,
+                output_ptr as *mut std::ffi::c_void,
+                w.cublas_data_type(), ldc as i32,
+                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            ).map_err(|e| format!("cuBLAS gemm_bf16_batch: {:?}", e))?;
+        }
+        Ok(())
+    }
+
+    /// Evict soft-tier HCS experts to free VRAM before prefill.
+    /// Uses calibration data to determine how many soft slots to evict
+    /// based on the estimated prompt length.
+    /// Returns (evicted_count, freed_mb).
+    pub fn hcs_evict_for_prefill(&mut self, estimated_tokens: usize) -> (usize, f64) {
+        let graph = match self.graph.as_mut() {
+            Some(g) => g,
+            None => return (0, 0.0),
+        };
+        let hcs = match graph.hcs.as_mut() {
+            Some(h) => h,
+            None => return (0, 0.0),
+        };
+
+        if !hcs.soft_loaded || hcs.soft_buf.is_none() || hcs.soft_num_cached == 0 {
+            return (0, 0.0);
+        }
+
+        // Calculate how much of the soft tier needs to be evicted
+        let evict_all = if let Some(ref cal) = self.vram_calibration {
+            // Available VRAM during prefill of this prompt (without HCS)
+            let prefill_free = cal.prefill_free_mb(estimated_tokens);
+            // Current total HCS VRAM
+            let total_hcs_mb = hcs.vram_bytes as u64 / (1024 * 1024);
+            // We need: total_hcs_mb <= prefill_free - safety
+            let safe_hcs = prefill_free.saturating_sub(cal.safety_margin_mb);
+            total_hcs_mb > safe_hcs
+        } else {
+            true // no calibration, evict everything to be safe
+        };
+
+        if !evict_all {
+            // Short prompt: soft tier survives prefill, no eviction needed
+            eprintln!("  \x1b[2mHCS soft: no eviction needed (~{} tokens)\x1b[0m", estimated_tokens);
+            return (0, 0.0);
+        }
+
+        let t0 = std::time::Instant::now();
+
+        // Remove all soft-tier entries from cache
+        let evicted = hcs.soft_num_cached;
+        for &(layer_idx, expert_idx) in &hcs.soft_ranking {
+            hcs.cache.remove(&(layer_idx, expert_idx));
+        }
+        hcs.num_cached -= evicted;
+
+        // Free the soft VRAM allocation
+        let freed_bytes = hcs.soft_num_slots * hcs.soft_slot_size;
+        hcs.soft_buf = None; // Drop frees VRAM
+        hcs.soft_loaded = false;
+        hcs.vram_bytes -= freed_bytes;
+
+        let freed_mb = freed_bytes as f64 / (1024.0 * 1024.0);
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("  \x1b[33mHCS soft: evicted {} experts ({:.1} MB freed) in {:.1}ms for prefill (~{} tokens)\x1b[0m",
+            evicted, freed_mb, elapsed_ms, estimated_tokens);
+        log::info!("HCS soft: evicted {} experts ({:.1} MB freed) in {:.1}ms for prefill (~{} tokens)",
+            evicted, freed_mb, elapsed_ms, estimated_tokens);
+
+        (evicted, freed_mb)
+    }
+
+    /// Reload soft-tier HCS experts after prefill completes.
+    /// Allocates VRAM and DMA copies experts from host mmap.
+    /// Returns (loaded_count, reload_ms).
+    pub fn hcs_reload_after_prefill(&mut self) -> (usize, f64) {
+        let graph = match self.graph.as_mut() {
+            Some(g) => g,
+            None => return (0, 0.0),
+        };
+        let hcs = match graph.hcs.as_mut() {
+            Some(h) => h,
+            None => return (0, 0.0),
+        };
+
+        if hcs.soft_loaded || hcs.soft_ranking.is_empty() {
+            return (0, 0.0); // already loaded or nothing to load
+        }
+
+        let slot_size = hcs.soft_slot_size;
+        let num_slots = hcs.soft_num_slots;
+        if slot_size == 0 || num_slots == 0 {
+            return (0, 0.0);
+        }
+
+        let t0 = std::time::Instant::now();
+        let alloc_bytes = num_slots * slot_size;
+
+        // Allocate fresh soft pool
+        let soft_buf = match self.device.alloc_zeros::<u8>(alloc_bytes) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::warn!("HCS soft reload: alloc failed ({:.1} MB): {:?}",
+                    alloc_bytes as f64 / (1024.0 * 1024.0), e);
+                return (0, 0.0);
+            }
+        };
+        let soft_base = *soft_buf.device_ptr();
+
+        // DMA each expert from host mmap
+        let ranking = hcs.soft_ranking.clone();
+        let mut loaded = 0usize;
+        let mut slot = 0usize;
+        let mut slot_to_expert: Vec<Option<(usize, usize)>> = vec![None; num_slots];
+
+        for &(layer_idx, expert_idx) in &ranking {
+            if slot >= num_slots {
+                break;
+            }
+            let moe = match graph.moe_layers.get(layer_idx).and_then(|m| m.as_ref()) {
+                Some(m) => m,
+                None => continue,
+            };
+            if expert_idx >= moe.experts.len() {
+                continue;
+            }
+
+            let expert = &moe.experts[expert_idx];
+            let dst = soft_base + (slot as u64 * slot_size as u64);
+
+            let w13p_off = 0u64;
+            let w13s_off = expert.w13_packed_bytes as u64;
+            let w2p_off = w13s_off + expert.w13_scales_bytes as u64;
+            let w2s_off = w2p_off + expert.w2_packed_bytes as u64;
+
+            let mut ok = true;
+            unsafe {
+                for &(off, src_ptr, bytes) in &[
+                    (w13p_off, expert.w13_packed_ptr, expert.w13_packed_bytes),
+                    (w13s_off, expert.w13_scales_ptr, expert.w13_scales_bytes),
+                    (w2p_off, expert.w2_packed_ptr, expert.w2_packed_bytes),
+                    (w2s_off, expert.w2_scales_ptr, expert.w2_scales_bytes),
+                ] {
+                    let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                        dst + off,
+                        src_ptr as *const std::ffi::c_void,
+                        bytes,
+                    );
+                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+
+            let entry = HcsCacheEntry {
+                d_buf: None,
+                w13_packed_offset: 0, w13_packed_size: 0,
+                w13_scales_offset: 0, w13_scales_size: 0,
+                w2_packed_offset: 0, w2_packed_size: 0,
+                w2_scales_offset: 0, w2_scales_size: 0,
+                ext_w13_packed: dst + w13p_off,
+                ext_w13_scales: dst + w13s_off,
+                ext_w2_packed: dst + w2p_off,
+                ext_w2_scales: dst + w2s_off,
+                pool_slot: None,
+            };
+            hcs.cache.insert((layer_idx, expert_idx), entry);
+            slot_to_expert[slot] = Some((layer_idx, expert_idx));
+            slot += 1;
+            loaded += 1;
+        }
+
+        hcs.soft_buf = Some(soft_buf);
+        hcs.soft_slot_to_expert = slot_to_expert;
+        hcs.soft_num_cached = loaded;
+        hcs.soft_loaded = true;
+        hcs.num_cached += loaded;
+        hcs.vram_bytes += alloc_bytes;
+
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("  \x1b[32mHCS soft: reloaded {} experts ({:.1} MB) in {:.1}ms\x1b[0m",
+            loaded, alloc_bytes as f64 / (1024.0 * 1024.0), elapsed_ms);
+        log::info!("HCS soft: reloaded {} experts ({:.1} MB) in {:.1}ms",
+            loaded, alloc_bytes as f64 / (1024.0 * 1024.0), elapsed_ms);
+
+        (loaded, elapsed_ms)
     }
 
     /// Generate tokens in a tight Rust loop via GPU decode.
@@ -3783,66 +6153,433 @@ impl GpuDecodeStore {
         let debug_logits = std::env::var("KRASIS_DEBUG_LOGITS").ok()
             .map(|v| v.parse::<usize>().unwrap_or(0)).unwrap_or(0);
 
-        for step in 0..max_tokens {
+        // ── Speculative decode state ──
+        let use_speculative = self.draft.is_some();
+        let draft_k = self.draft_k;
+        let draft_context_window = self.draft_context_window;
+        let mut spec_accepted: u64 = 0;
+        let mut spec_rejected: u64 = 0;
+        let mut spec_rounds: u64 = 0;
+        let mut spec_draft_time: f64 = 0.0;
+        let mut spec_verify_time: f64 = 0.0;
+        let mut spec_save_time: f64 = 0.0;
+        let mut spec_failfast_count: u64 = 0;
+        let mut spec_tokens_saved: u64 = 0;
+
+        // Warm up the draft model with tail of prompt context
+        if use_speculative && start_position > 0 {
+            // We don't have the prompt tokens here, but we can feed the first_token
+            // as a starting point. The draft model's context will improve as we generate.
+            // TODO: pass prompt tokens for full warmup
+            if let Some(ref mut draft) = self.draft {
+                draft.reset_kv();
+            }
+        }
+
+        // Track min VRAM free during decode
+        let mut min_vram_free_bytes: usize = usize::MAX;
+
+        let mut step = 0usize;
+        while step < max_tokens {
             let pos = start_position + step;
-            if let Err(e) = self.gpu_decode_step(next_token, pos) {
-                log::error!("gpu_generate_stream: decode_step error: {}", e);
-                break;
-            }
 
-            // Logits are now in graph.h_logits (host-side)
-            let logits = &mut self.graph.as_mut().unwrap().h_logits;
+            if use_speculative {
+                // ── Phase 2: Batched Speculative Decode ──
+                // Draft generates K tokens, then target verifies all in one batched pass.
+                // The "real" decode step is folded into the batch as position 0.
 
-            #[cfg(feature = "gpu-debug")]
-            if debug_logits > 0 && step < debug_logits {
-                let mut indexed: Vec<(usize, f32)> = logits.iter().copied()
-                    .enumerate().take(vocab_size).collect();
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                let top5: Vec<String> = indexed[..5.min(indexed.len())].iter()
-                    .map(|(idx, val)| {
-                        let tok_str = tokenizer.decode(&[*idx as u32], true).unwrap_or_default();
-                        format!("{}({:.3})\"{}\"", idx, val, tok_str.replace('\n', "\\n"))
-                    }).collect();
-                log::warn!("LOGITS step={} pos={} input_tok={} top5=[{}]",
-                    step, pos, next_token, top5.join(", "));
-            }
+                // 1. Generate draft tokens
+                let t_draft = Instant::now();
+                let (draft_tokens, draft_pos_before) = if let Some(ref mut draft) = self.draft {
+                    let dp = draft.kv_pos();
+                    if let Err(e) = draft.forward(&self.device, &self.blas, next_token, dp) {
+                        log::warn!("speculative: draft forward failed: {}", e);
+                        (Vec::new(), dp)
+                    } else {
+                        let mut draft_pred = 0usize;
+                        let mut best_val = f32::NEG_INFINITY;
+                        for j in 0..draft.h_logits.len() {
+                            if draft.h_logits[j] > best_val {
+                                best_val = draft.h_logits[j];
+                                draft_pred = j;
+                            }
+                        }
+                        let mut tokens = vec![draft_pred];
+                        if draft_k > 1 {
+                            match draft.generate_draft(&self.device, &self.blas, draft_pred, dp + 1, draft_k - 1) {
+                                Ok(more) => tokens.extend(more),
+                                Err(e) => log::warn!("speculative: draft gen failed: {}", e),
+                            }
+                        }
+                        (tokens, dp)
+                    }
+                } else {
+                    (Vec::new(), 0)
+                };
 
-            if presence_penalty != 0.0 {
-                for &tok in &seen_tokens {
-                    if tok < vocab_size {
-                        logits[tok] -= presence_penalty;
+                let draft_elapsed = t_draft.elapsed().as_secs_f64();
+                spec_draft_time += draft_elapsed;
+                spec_rounds += 1;
+
+                if spec_rounds <= 3 && !draft_tokens.is_empty()
+                    && std::env::var("KRASIS_SPEC_DEBUG").is_ok()
+                {
+                    let draft_strs: Vec<String> = draft_tokens.iter()
+                        .map(|&t| format!("{}", t)).collect();
+                    log::info!("spec round {}: next_token={}, draft=[{}], dp={}",
+                        spec_rounds, next_token, draft_strs.join(","), draft_pos_before);
+                }
+
+                // 2. If draft failed, fall back to single-token decode
+                if draft_tokens.is_empty() {
+                    if let Err(e) = self.gpu_decode_step(next_token, pos) {
+                        log::error!("gpu_generate_stream: decode_step error: {}", e);
+                        break;
+                    }
+                    let logits = &mut self.graph.as_mut().unwrap().h_logits;
+                    if presence_penalty != 0.0 {
+                        for &tok in &seen_tokens {
+                            if tok < vocab_size { logits[tok] -= presence_penalty; }
+                        }
+                    }
+                    let target_pred = crate::decode::sample_from_logits_pub(
+                        logits, vocab_size, temperature, top_k, top_p, &mut rng_next);
+                    seen_tokens.insert(target_pred);
+                    generated += 1;
+                    step += 1;
+                    next_token = target_pred;
+                    let text = tokenizer.decode(&[target_pred as u32], true).unwrap_or_default();
+                    let finish_reason = if stop_set.contains(&target_pred) { Some("stop") }
+                        else if generated >= max_tokens { Some("length") }
+                        else { None };
+                    let finished = finish_reason.is_some();
+                    let cont = on_token(target_pred, &text, finish_reason);
+                    if finished || !cont { break; }
+                    continue;
+                }
+
+                // 3. Build batch: [next_token, D0, D1, ..., D_{K-1}]
+                let batch_size = 1 + draft_tokens.len();
+                let mut batch_tokens: Vec<usize> = Vec::with_capacity(batch_size);
+                let mut batch_positions: Vec<usize> = Vec::with_capacity(batch_size);
+                batch_tokens.push(next_token);
+                batch_positions.push(pos);
+                for (i, &dt) in draft_tokens.iter().enumerate() {
+                    batch_tokens.push(dt);
+                    batch_positions.push(pos + 1 + i);
+                }
+
+                // 4. Save LA states before batched decode
+                let t_save = Instant::now();
+                if let Err(e) = self.save_la_states() {
+                    log::warn!("speculative: save_la_states failed: {}", e);
+                }
+                let save_ms = t_save.elapsed().as_secs_f64() * 1000.0;
+
+                // 5. Batched target model decode — all tokens through all layers,
+                //    expert union DMA'd once per MoE layer.
+                //    Returns valid_positions: may be < batch_size if fail-fast triggered.
+                let t_verify = Instant::now();
+                let valid_positions = match self.gpu_decode_step_batched(&batch_tokens, &batch_positions) {
+                    Ok(vp) => vp,
+                    Err(e) => {
+                        log::error!("speculative: batched decode error: {}", e);
+                        let _ = self.restore_la_states();
+                        break;
+                    }
+                };
+                let verify_ms = t_verify.elapsed().as_secs_f64() * 1000.0;
+                if valid_positions < batch_size {
+                    spec_failfast_count += 1;
+                    spec_tokens_saved += (batch_size - valid_positions) as u64;
+                }
+                spec_verify_time += verify_ms;
+                spec_save_time += save_ms;
+
+                // 6. Extract target's prediction from position 0 (always valid)
+                {
+                    let graph = self.graph.as_mut().unwrap();
+                    if presence_penalty != 0.0 {
+                        for &tok in &seen_tokens {
+                            if tok < vocab_size {
+                                graph.h_batch_logits[tok] -= presence_penalty;
+                            }
+                        }
                     }
                 }
-            }
+                let target_pred = crate::decode::sample_from_logits_pub(
+                    &mut self.graph.as_mut().unwrap().h_batch_logits[..vocab_size],
+                    vocab_size, temperature, top_k, top_p, &mut rng_next);
 
-            next_token = crate::decode::sample_from_logits_pub(
-                logits, vocab_size, temperature, top_k, top_p, &mut rng_next);
-            seen_tokens.insert(next_token);
-            generated += 1;
+                // 7. Emit target_pred (always produced — this is the "real" decode output)
+                seen_tokens.insert(target_pred);
+                generated += 1;
+                step += 1;
+                next_token = target_pred;
 
-            let text = tokenizer.decode(&[next_token as u32], true)
-                .unwrap_or_default();
+                let mut stopped = false;
+                {
+                    let text = tokenizer.decode(&[target_pred as u32], true).unwrap_or_default();
+                    let finish_reason = if stop_set.contains(&target_pred) { Some("stop") }
+                        else if generated >= max_tokens { Some("length") }
+                        else { None };
+                    let finished = finish_reason.is_some();
+                    let cont = on_token(target_pred, &text, finish_reason);
+                    if finished || !cont {
+                        let _ = self.restore_la_states();
+                        if let Some(ref mut draft) = self.draft {
+                            draft.rollback_kv(draft_pos_before + 1);
+                        }
+                        break;
+                    }
+                }
 
-            let finish_reason = if stop_set.contains(&next_token) {
-                Some("stop")
-            } else if generated >= max_tokens {
-                Some("length")
+                // 8. Check acceptance: does target_pred match D0?
+                //    valid_positions limits how many draft tokens we can verify.
+                //    Position 0 logits verify draft_tokens[0].
+                //    Position i logits (i < valid_positions) verify draft_tokens[i].
+                let max_verifiable = draft_tokens.len().min(valid_positions);
+                let mut accepted_in_round = 0usize;
+                if target_pred == draft_tokens[0] {
+                    accepted_in_round = 1;
+
+                    // Check subsequent draft tokens against target's predictions
+                    for i in 1..max_verifiable {
+                        if step >= max_tokens { break; }
+
+                        let logit_offset = i * vocab_size;
+                        let batch_logits = &self.graph.as_ref().unwrap().h_batch_logits;
+                        let mut target_argmax = 0usize;
+                        let mut best_val = f32::NEG_INFINITY;
+                        for j in 0..vocab_size {
+                            if batch_logits[logit_offset + j] > best_val {
+                                best_val = batch_logits[logit_offset + j];
+                                target_argmax = j;
+                            }
+                        }
+
+                        if target_argmax == draft_tokens[i] {
+                            accepted_in_round += 1;
+                            seen_tokens.insert(draft_tokens[i]);
+                            generated += 1;
+                            step += 1;
+                            next_token = draft_tokens[i];
+
+                            let text = tokenizer.decode(&[draft_tokens[i] as u32], true)
+                                .unwrap_or_default();
+                            let finish_reason = if stop_set.contains(&draft_tokens[i]) { Some("stop") }
+                                else if generated >= max_tokens { Some("length") }
+                                else { None };
+                            let finished = finish_reason.is_some();
+                            let cont = on_token(draft_tokens[i], &text, finish_reason);
+                            if finished || !cont { stopped = true; break; }
+                        } else {
+                            // Reject: use target's prediction at this position
+                            next_token = target_argmax;
+                            seen_tokens.insert(next_token);
+                            generated += 1;
+                            step += 1;
+
+                            let text = tokenizer.decode(&[next_token as u32], true)
+                                .unwrap_or_default();
+                            let finish_reason = if stop_set.contains(&next_token) { Some("stop") }
+                                else if generated >= max_tokens { Some("length") }
+                                else { None };
+                            let finished = finish_reason.is_some();
+                            let cont = on_token(next_token, &text, finish_reason);
+                            if finished || !cont { stopped = true; }
+                            break;
+                        }
+                    }
+
+                    // If all verifiable draft tokens accepted, get bonus token
+                    // (only if we had logits for the last position)
+                    if !stopped && accepted_in_round == max_verifiable
+                        && max_verifiable == draft_tokens.len()
+                        && valid_positions > draft_tokens.len()
+                        && step < max_tokens
+                    {
+                        let last_offset = draft_tokens.len() * vocab_size;
+                        let batch_logits = &self.graph.as_ref().unwrap().h_batch_logits;
+                        let mut last_argmax = 0usize;
+                        let mut best_val = f32::NEG_INFINITY;
+                        for j in 0..vocab_size {
+                            if batch_logits[last_offset + j] > best_val {
+                                best_val = batch_logits[last_offset + j];
+                                last_argmax = j;
+                            }
+                        }
+                        next_token = last_argmax;
+                        seen_tokens.insert(next_token);
+                        generated += 1;
+                        step += 1;
+
+                        let text = tokenizer.decode(&[next_token as u32], true)
+                            .unwrap_or_default();
+                        let finish_reason = if stop_set.contains(&next_token) { Some("stop") }
+                            else if generated >= max_tokens { Some("length") }
+                            else { None };
+                        let finished = finish_reason.is_some();
+                        let cont = on_token(next_token, &text, finish_reason);
+                        if finished || !cont { stopped = true; }
+                    }
+                }
+
+                spec_accepted += accepted_in_round as u64;
+                spec_rejected += (draft_tokens.len() - accepted_in_round) as u64;
+
+                // 9. Restore LA states and replay only accepted tokens
+                let t_restore = Instant::now();
+                let num_accepted_batch = 1 + accepted_in_round; // next_token + accepted drafts
+                if num_accepted_batch < batch_size {
+                    if let Err(e) = self.restore_la_states() {
+                        log::warn!("speculative: restore_la_states failed: {}", e);
+                    }
+                    if num_accepted_batch > 0 {
+                        if let Err(e) = self.replay_la_states(
+                            num_accepted_batch, &batch_positions[..num_accepted_batch])
+                        {
+                            log::warn!("speculative: replay_la_states failed: {}", e);
+                        }
+                    }
+                }
+                let restore_ms = t_restore.elapsed().as_secs_f64() * 1000.0;
+
+                // 10. Rollback draft KV cache to match accepted tokens
+                if let Some(ref mut draft) = self.draft {
+                    draft.rollback_kv(draft_pos_before + 1 + accepted_in_round);
+                }
+
+                // Timing breakdown for first 5 rounds
+                if spec_rounds <= 5 && std::env::var("KRASIS_SPEC_DEBUG").is_ok() {
+                    eprintln!("  spec round {}: draft={:.1}ms verify={:.1}ms save={:.1}ms restore={:.1}ms accepted={}/{} valid={}/{} total={:.1}ms target_pred={} draft[0]={}",
+                        spec_rounds, draft_elapsed * 1000.0, verify_ms, save_ms, restore_ms,
+                        accepted_in_round, draft_tokens.len(),
+                        valid_positions, batch_size,
+                        (draft_elapsed * 1000.0) + verify_ms + save_ms + restore_ms,
+                        target_pred, draft_tokens[0]);
+                    // Debug: show top logit values for position 0
+                    {
+                        let bl = &self.graph.as_ref().unwrap().h_batch_logits;
+                        let mut top5: Vec<(usize, f32)> = (0..vocab_size).map(|i| (i, bl[i])).collect();
+                        top5.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                        eprintln!("  pos0 top5: {:?}", &top5[..5]);
+                    }
+                }
+
+                if stopped { break; }
+
             } else {
-                None
-            };
+                // ── Normal (non-speculative) decode path ──
+                if let Err(e) = self.gpu_decode_step(next_token, pos) {
+                    log::error!("gpu_generate_stream: decode_step error: {}", e);
+                    break;
+                }
 
-            let finished = finish_reason.is_some();
-            let cont = on_token(next_token, &text, finish_reason);
-            if finished || !cont {
-                break;
+                // Track min VRAM free (after decode step, when expert buffers are at peak)
+                {
+                    let mut free: usize = 0;
+                    let mut _total: usize = 0;
+                    unsafe { let _ = cuda_sys::lib().cuMemGetInfo_v2(&mut free, &mut _total); }
+                    if free < min_vram_free_bytes {
+                        min_vram_free_bytes = free;
+                    }
+                }
+
+                let logits = &mut self.graph.as_mut().unwrap().h_logits;
+
+                #[cfg(feature = "gpu-debug")]
+                if debug_logits > 0 && step < debug_logits {
+                    let mut indexed: Vec<(usize, f32)> = logits.iter().copied()
+                        .enumerate().take(vocab_size).collect();
+                    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    let top5: Vec<String> = indexed[..5.min(indexed.len())].iter()
+                        .map(|(idx, val)| {
+                            let tok_str = tokenizer.decode(&[*idx as u32], true).unwrap_or_default();
+                            format!("{}({:.3})\"{}\"", idx, val, tok_str.replace('\n', "\\n"))
+                        }).collect();
+                    log::warn!("LOGITS step={} pos={} input_tok={} top5=[{}]",
+                        step, pos, next_token, top5.join(", "));
+                }
+
+                if presence_penalty != 0.0 {
+                    for &tok in &seen_tokens {
+                        if tok < vocab_size {
+                            logits[tok] -= presence_penalty;
+                        }
+                    }
+                }
+
+                let target_pred = crate::decode::sample_from_logits_pub(
+                    logits, vocab_size, temperature, top_k, top_p, &mut rng_next);
+
+                seen_tokens.insert(target_pred);
+                generated += 1;
+                step += 1;
+                next_token = target_pred;
+
+                let text = tokenizer.decode(&[target_pred as u32], true)
+                    .unwrap_or_default();
+                let finish_reason = if stop_set.contains(&target_pred) {
+                    Some("stop")
+                } else if generated >= max_tokens {
+                    Some("length")
+                } else {
+                    None
+                };
+                let finished = finish_reason.is_some();
+                let cont = on_token(target_pred, &text, finish_reason);
+                if finished || !cont { break; }
             }
         }
 
         let elapsed = decode_start.elapsed().as_secs_f64();
         if generated > 0 {
             let tps = generated as f64 / elapsed;
-            log::info!("gpu_generate_stream: {} tokens in {:.2}s ({:.1} tok/s)",
-                generated, elapsed, tps);
+            // Query current VRAM free to show safety margin headroom
+            let mut vram_free: usize = 0;
+            let mut vram_total: usize = 0;
+            unsafe {
+                let _ = cuda_sys::lib().cuMemGetInfo_v2(&mut vram_free, &mut vram_total);
+            }
+            let free_mb = vram_free / (1024 * 1024);
+            let total_mb = vram_total / (1024 * 1024);
+            let used_mb = total_mb - free_mb;
+            let min_free_mb = if min_vram_free_bytes < usize::MAX {
+                min_vram_free_bytes / (1024 * 1024)
+            } else {
+                free_mb
+            };
+            eprintln!("  \x1b[32mdecode: {} tokens in {:.2}s ({:.1} tok/s)  VRAM: {} MB free now, {} MB min free during decode\x1b[0m",
+                generated, elapsed, tps, free_mb, min_free_mb);
+        }
+
+        // Print speculative decode stats
+        if use_speculative && spec_rounds > 0 {
+            let total_drafted = spec_accepted + spec_rejected;
+            let acceptance_rate = if total_drafted > 0 {
+                spec_accepted as f64 / total_drafted as f64
+            } else { 0.0 };
+            let avg_draft_ms = spec_draft_time / spec_rounds as f64 * 1000.0;
+            let avg_accepted = spec_accepted as f64 / spec_rounds as f64;
+            eprintln!("  \x1b[36m┌─────────────────────────────────────────────────┐\x1b[0m");
+            eprintln!("  \x1b[36m│  SPECULATIVE DECODE STATS                       │\x1b[0m");
+            eprintln!("  \x1b[36m├─────────────────────────────────────────────────┤\x1b[0m");
+            eprintln!("  \x1b[36m│  Rounds:       {:>4}                             │\x1b[0m", spec_rounds);
+            eprintln!("  \x1b[36m│  Accepted:     {:>4} / {:>4} ({:.1}%){}│\x1b[0m",
+                spec_accepted, total_drafted, acceptance_rate * 100.0,
+                " ".repeat(20usize.saturating_sub(format!("{:.1}", acceptance_rate * 100.0).len())));
+            eprintln!("  \x1b[36m│  Avg accepted: {:.1}/round                       │\x1b[0m", avg_accepted);
+            let avg_verify_ms = spec_verify_time / spec_rounds as f64;
+            let avg_save_ms = spec_save_time / spec_rounds as f64;
+            eprintln!("  \x1b[36m│  Draft time:   {:.2} ms/round                  │\x1b[0m", avg_draft_ms);
+            eprintln!("  \x1b[36m│  Verify time:  {:.2} ms/round                  │\x1b[0m", avg_verify_ms);
+            eprintln!("  \x1b[36m│  Save/restore: {:.2} ms/round                  │\x1b[0m", avg_save_ms);
+            if spec_failfast_count > 0 {
+                eprintln!("  \x1b[36m│  Fail-fast:    {:>4} bailouts ({} tokens saved) │\x1b[0m",
+                    spec_failfast_count, spec_tokens_saved);
+            }
+            eprintln!("  \x1b[36m└─────────────────────────────────────────────────┘\x1b[0m");
         }
 
         // Print timing summary if enabled

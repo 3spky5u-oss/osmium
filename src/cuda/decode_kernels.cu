@@ -1889,3 +1889,115 @@ extern "C" __global__ void reduce_ksplits_weighted_accum_bf16(
     __nv_bfloat16 result = __float2bfloat16(existing + weight * sum);
     accum[n] = *reinterpret_cast<unsigned short*>(&result);
 }
+
+// ── Simple INT4 GEMV (for draft model) ───────────────────────────────
+//
+// Row-major packed INT4 weights: each byte holds 2 values (low nibble = even col, high nibble = odd col).
+// Unsigned 0..15, subtract 8 to get signed -8..+7.
+// Per-group FP32 scales: one scale per group_size elements per row.
+//
+// Launch: grid=(ceil(rows/8), 1, 1), block=(256, 1, 1)
+// 8 warps per block, each warp handles one output row.
+// Shared memory: cols * 2 bytes (BF16 input preloaded).
+
+extern "C" __global__ void simple_int4_gemv_f32(
+    const unsigned char* __restrict__ packed_w,  // [rows, cols/2] packed INT4
+    const float* __restrict__ scales,            // [rows, cols/group_size] FP32
+    const unsigned short* __restrict__ input,    // [cols] BF16
+    float* __restrict__ output,                  // [rows] FP32
+    int rows, int cols, int group_size
+) {
+    extern __shared__ unsigned short s_input[];
+    int tid = threadIdx.x;
+
+    // Cooperative load input to shared memory
+    for (int i = tid; i < cols; i += 256) {
+        s_input[i] = input[i];
+    }
+    __syncthreads();
+
+    int warp_id = tid / 32;
+    int lane = tid % 32;
+    int row = blockIdx.x * 8 + warp_id;
+
+    if (row >= rows) return;
+
+    int half_cols = cols / 2;
+    int n_groups = cols / group_size;
+    const unsigned char* w_row = packed_w + (long long)row * half_cols;
+    const float* s_row = scales + (long long)row * n_groups;
+
+    float acc = 0.0f;
+
+    for (int k = lane * 2; k < cols; k += 64) {
+        unsigned char packed = w_row[k / 2];
+        int lo = (int)(packed & 0xF) - 8;
+        int hi = (int)(packed >> 4) - 8;
+
+        float scale = s_row[k / group_size];
+        float x0 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
+        float x1 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k + 1]));
+
+        acc += scale * ((float)lo * x0 + (float)hi * x1);
+    }
+
+    // Warp reduction
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    if (lane == 0) {
+        output[row] = acc;
+    }
+}
+
+// Same as above but with BF16 output.
+extern "C" __global__ void simple_int4_gemv_bf16(
+    const unsigned char* __restrict__ packed_w,  // [rows, cols/2] packed INT4
+    const float* __restrict__ scales,            // [rows, cols/group_size] FP32
+    const unsigned short* __restrict__ input,    // [cols] BF16
+    unsigned short* __restrict__ output,         // [rows] BF16
+    int rows, int cols, int group_size
+) {
+    extern __shared__ unsigned short s_input[];
+    int tid = threadIdx.x;
+
+    for (int i = tid; i < cols; i += 256) {
+        s_input[i] = input[i];
+    }
+    __syncthreads();
+
+    int warp_id = tid / 32;
+    int lane = tid % 32;
+    int row = blockIdx.x * 8 + warp_id;
+
+    if (row >= rows) return;
+
+    int half_cols = cols / 2;
+    int n_groups = cols / group_size;
+    const unsigned char* w_row = packed_w + (long long)row * half_cols;
+    const float* s_row = scales + (long long)row * n_groups;
+
+    float acc = 0.0f;
+
+    for (int k = lane * 2; k < cols; k += 64) {
+        unsigned char packed = w_row[k / 2];
+        int lo = (int)(packed & 0xF) - 8;
+        int hi = (int)(packed >> 4) - 8;
+
+        float scale = s_row[k / group_size];
+        float x0 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
+        float x1 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k + 1]));
+
+        acc += scale * ((float)lo * x0 + (float)hi * x1);
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+    }
+
+    if (lane == 0) {
+        __nv_bfloat16 result = __float2bfloat16(acc);
+        output[row] = *reinterpret_cast<unsigned short*>(&result);
+    }
+}

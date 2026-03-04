@@ -306,6 +306,32 @@ fn handle_chat_completion(
         _ => vec![],
     };
 
+    // ── Estimate prompt tokens for soft-tier HCS eviction ──
+    let estimated_tokens = {
+        // Extract text from messages JSON and tokenize with Rust tokenizer
+        let mut text = String::new();
+        if let Ok(msgs) = serde_json::from_str::<Vec<serde_json::Value>>(&messages_json) {
+            for msg in &msgs {
+                if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                    text.push_str(content);
+                    text.push(' ');
+                }
+            }
+        }
+        let text_len = text.len();
+        let base_count = state.tokenizer.encode(text, false)
+            .map(|e| e.len())
+            .unwrap_or(text_len / 4); // fallback: ~4 chars/token
+        let est = base_count + 200; // approximate chat template overhead
+        log::info!("Soft HCS: estimated {} tokens (text_len={}, base_count={})",
+            est, text_len, base_count);
+        est
+    };
+
+    // ── Evict soft HCS before prefill to free VRAM ──
+    let store_for_evict = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
+    let (evicted, _freed_mb) = store_for_evict.hcs_evict_for_prefill(estimated_tokens);
+
     // ── Call Python for prefill (GIL required) ──
     let t_prefill_gil = Instant::now();
     let prefill_result = Python::with_gil(|py| -> PyResult<(usize, usize, Vec<usize>, bool)> {
@@ -396,8 +422,15 @@ fn handle_chat_completion(
 
     let tokenizer = &state.tokenizer;
 
-    // ── GPU decode: GIL-free Rust decode via GpuDecodeStore ──
+    // ── Reload soft HCS after prefill frees temporary VRAM ──
     let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
+    if evicted > 0 {
+        let (reloaded, reload_ms) = store.hcs_reload_after_prefill();
+        log::info!("Request {}: HCS soft reloaded {} experts in {:.1}ms (evicted {} for prefill)",
+            request_id, reloaded, reload_ms, evicted);
+    }
+
+    // ── GPU decode: GIL-free Rust decode via GpuDecodeStore ──
     handle_gpu_decode(
         stream, is_stream, state, store, tokenizer,
         first_token, prompt_len, max_tokens, temperature,

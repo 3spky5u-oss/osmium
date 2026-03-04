@@ -1,5 +1,6 @@
 pub mod chat_template;
 pub mod decode;
+pub mod draft_model;
 pub mod gguf;
 pub mod gguf_kernels;
 pub mod gpu_decode;

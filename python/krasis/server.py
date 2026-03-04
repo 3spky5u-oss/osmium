@@ -197,6 +197,70 @@ def _warmup_prefill(model: KrasisModel):
             pass
 
 
+def _capture_prefill(model: KrasisModel, num_repeats: int) -> Optional[int]:
+    """Run a prefill and return prompt_len, WITHOUT cleanup.
+    Leaves the model in prefilled state so decode can follow.
+    """
+    import json as _json
+    base_text = (
+        "Explain the architecture of modern mixture-of-experts models "
+        "including their routing mechanisms, load balancing strategies, "
+        "and computational efficiency trade-offs in detail. "
+    )
+    warmup_text = base_text * num_repeats
+    messages_json = _json.dumps([{"role": "user", "content": warmup_text}])
+    try:
+        result = model.server_prefill(
+            messages_json, max_new_tokens=5, temperature=0.6, top_k=50,
+            top_p=0.95, presence_penalty=0.0,
+            enable_thinking=False, extra_stop_tokens=[],
+            decode_mode="gpu",
+        )
+        return result.prompt_len
+    except Exception as e:
+        logger.warning("Capture prefill failed: %s", e)
+        try:
+            model.server_cleanup()
+        except Exception:
+            pass
+        return None
+
+
+def _capture_decode(model: KrasisModel, num_steps: int = 4):
+    """Run decode steps on an already-prefilled prompt, then cleanup."""
+    try:
+        gpu_store = getattr(model, '_gpu_decode_store', None)
+        if gpu_store is None:
+            raise RuntimeError("GPU decode store not configured")
+        # Use a dummy prefill to get first_token and prompt_len for the decode
+        import json as _json
+        messages_json = _json.dumps([{"role": "user", "content": "Hi"}])
+        result = model.server_prefill(
+            messages_json, max_new_tokens=num_steps + 1, temperature=0.6, top_k=50,
+            top_p=0.95, presence_penalty=0.0,
+            enable_thinking=False, extra_stop_tokens=[],
+            decode_mode="gpu",
+        )
+        if result.first_token not in result.stop_ids:
+            gpu_store.gpu_generate_batch(
+                first_token=result.first_token,
+                start_position=result.prompt_len,
+                max_tokens=num_steps,
+                temperature=0.6,
+                top_k=50,
+                top_p=0.95,
+                stop_ids=result.stop_ids,
+                presence_penalty=0.0,
+            )
+        model.server_cleanup()
+    except Exception as e:
+        logger.warning("Capture decode failed: %s", e)
+        try:
+            model.server_cleanup()
+        except Exception:
+            pass
+
+
 def _warmup_decode(model: KrasisModel, num_steps: int = 4):
     """Run a short GPU decode warmup.
 
@@ -437,6 +501,12 @@ def main():
     # Keep --gpu-decode as a no-op for config file compatibility.
     parser.add_argument("--gpu-decode", action="store_true", default=True,
                         help="(default, only mode) GPU decode via Rust GpuDecodeStore.")
+    parser.add_argument("--draft-model", default=None,
+                        help="Path to draft model for speculative decoding (e.g. ~/.krasis/models/Qwen3-0.6B)")
+    parser.add_argument("--draft-k", type=int, default=3,
+                        help="Number of tokens to draft per speculative round (default: 3)")
+    parser.add_argument("--draft-context", type=int, default=512,
+                        help="Context window for draft model warmup (default: 512)")
     parser.add_argument("--benchmark", action="store_true",
                         help="Run standardized benchmark before starting server")
     parser.add_argument("--benchmark-only", action="store_true",
@@ -591,6 +661,19 @@ def main():
     gpu_store_addr = gpu_store.gpu_store_addr()
     _detail(f"GPU decode store ready (addr={gpu_store_addr:#x})")
 
+    # ── Load draft model BEFORE warmup/VRAM capture so HCS budget accounts for it ──
+    if args.draft_model:
+        import os
+        draft_path = os.path.expanduser(args.draft_model)
+        _status(f"Loading draft model from {draft_path}")
+        gpu_store.load_draft_model(
+            draft_path,
+            max_seq=4096,
+            draft_k=args.draft_k,
+            context_window=args.draft_context,
+        )
+        _detail(f"Draft model loaded (k={args.draft_k}, context={args.draft_context})")
+
     # ── Start VRAM monitor before warmup for visibility ──
     from krasis import VramMonitor
     SAFETY_MARGIN_MB = args.vram_safety_margin
@@ -626,38 +709,76 @@ def main():
             idx, warmup_peak_used, warmup_min_free, total,
         )
 
-    # Free transient warmup allocations before measuring
-    gc.collect()
-    torch.cuda.empty_cache()
+    # ── Phase 2: Four-point VRAM calibration ──
+    # Measure min_free VRAM during: short prefill, short decode, long prefill, long decode.
+    # This gives us two linear models (prefill VRAM/token, decode VRAM/token) for
+    # proportional soft-tier HCS eviction at runtime.
+    # Do NOT gc.collect/empty_cache here — persistent allocations stay resident.
+    dev_idx = devices[0].index
+    import torch
 
-    # ── Phase 2: VRAM capture (measure actual runtime VRAM, no warmup spike) ──
-    # Reset the monitor so min_free reflects only the capture phase.
+    _status("VRAM calibration (4-point measurement)")
+    _detail(f"Safety margin: {SAFETY_MARGIN_MB:,} MB")
+
+    # ── 2a: Short prompt prefill ──
+    SHORT_REPEATS = 17   # ~500 tokens
+    LONG_REPEATS = 1700  # ~51K tokens
+
     vram_monitor.reset_min_free()
+    _dim("Capture: short prompt prefill (~500 tokens)")
+    short_prompt_len = _capture_prefill(_model, SHORT_REPEATS)
+    torch.cuda.synchronize()
+    time.sleep(0.1)  # let monitor poll
+    prefill_short_free = vram_monitor.min_free_mb(dev_idx)
+    short_tokens = short_prompt_len or 500
+    _model.server_cleanup()
+    _dim(f"  short prefill: {short_tokens} tokens, min_free={prefill_short_free:,} MB")
 
-    _status("VRAM capture (measuring runtime VRAM)")
-    _detail(f"Polling every 50ms, safety margin: {SAFETY_MARGIN_MB:,} MB")
-    logger.info("VRAM monitor reset for capture: devices=%s, safety_margin=%d MB", device_indices, SAFETY_MARGIN_MB)
-
-    # Run a realistic prefill + decode to capture actual runtime VRAM usage
-    _dim("Running VRAM capture: 1x large prefill + 1x decode")
-    _warmup_prefill(_model)
-    _warmup_decode(_model, num_steps=4)
-
-    # Let monitor capture post-capture state
-    gc.collect()
-    torch.cuda.empty_cache()
+    # ── 2b: Short prompt decode ──
+    vram_monitor.reset_min_free()
+    _dim("Capture: short prompt decode")
+    _capture_decode(_model, num_steps=8)
+    torch.cuda.synchronize()
     time.sleep(0.1)
+    decode_short_free = vram_monitor.min_free_mb(dev_idx)
+    _dim(f"  short decode: min_free={decode_short_free:,} MB")
 
-    _status("VRAM measured (post-warmup, runtime only)")
-    for idx in device_indices:
-        min_free = vram_monitor.min_free_mb(idx)
-        peak_used = vram_monitor.peak_used_mb(idx)
-        total = vram_monitor.total_mb(idx)
-        _detail(f"cuda:{idx}:  peak {peak_used:,} MB used / {total:,} MB total  (min free: {min_free:,} MB)")
-        logger.info(
-            "VRAM monitor cuda:%d: peak_used=%d MB, min_free=%d MB, total=%d MB",
-            idx, peak_used, min_free, total,
-        )
+    # ── 2c: Long prompt prefill ──
+    vram_monitor.reset_min_free()
+    _dim("Capture: long prompt prefill (~50K tokens)")
+    long_prompt_len = _capture_prefill(_model, LONG_REPEATS)
+    torch.cuda.synchronize()
+    time.sleep(0.1)
+    prefill_long_free = vram_monitor.min_free_mb(dev_idx)
+    long_tokens = long_prompt_len or 51000
+    _model.server_cleanup()
+    _dim(f"  long prefill: {long_tokens} tokens, min_free={prefill_long_free:,} MB")
+
+    # ── 2d: Long prompt decode ──
+    vram_monitor.reset_min_free()
+    _dim("Capture: long prompt decode")
+    _capture_decode(_model, num_steps=8)
+    torch.cuda.synchronize()
+    time.sleep(0.1)
+    decode_long_free = vram_monitor.min_free_mb(dev_idx)
+    _dim(f"  long decode: min_free={decode_long_free:,} MB")
+
+    # ── Compute calibration ──
+    if long_tokens > short_tokens:
+        prefill_kb_per_tok = (prefill_short_free - prefill_long_free) / (long_tokens - short_tokens) * 1024
+        decode_kb_per_tok = (decode_short_free - decode_long_free) / (long_tokens - short_tokens) * 1024
+    else:
+        prefill_kb_per_tok = 0
+        decode_kb_per_tok = 0
+
+    hard_budget = max(0, int(prefill_long_free) - SAFETY_MARGIN_MB)
+    decode_budget = max(0, int(decode_short_free) - SAFETY_MARGIN_MB)
+    soft_budget = max(0, decode_budget - hard_budget)
+
+    _status("VRAM calibration complete")
+    _detail(f"Prefill: {prefill_kb_per_tok:.1f} KB/token ({prefill_short_free:,} MB @ {short_tokens} tok → {prefill_long_free:,} MB @ {long_tokens} tok)")
+    _detail(f"Decode:  {decode_kb_per_tok:.1f} KB/token ({decode_short_free:,} MB @ short → {decode_long_free:,} MB @ long)")
+    _detail(f"Hard HCS budget: {hard_budget:,} MB  |  Soft HCS budget: {soft_budget:,} MB  |  Total: {hard_budget + soft_budget:,} MB")
 
     if not args.hcs:
         _status("GPU decode (no HCS)")
@@ -683,24 +804,26 @@ def main():
         ranking = [(int(k.split(",")[0]), int(k.split(",")[1])) for k, _ in sorted_ranking]
         _detail(f"Heatmap: {len(ranking):,} experts ranked from {len(raw_heatmap):,} entries")
 
-        # ── Calculate budget from measured VRAM ──
-        dev_idx = primary_dev.index
-        measured_min_free_mb = vram_monitor.min_free_mb(dev_idx)
-        budget_mb = max(0, int(measured_min_free_mb) - SAFETY_MARGIN_MB)
-        _detail(f"cuda:{dev_idx}:  {measured_min_free_mb:,} MB free - {SAFETY_MARGIN_MB:,} MB safety = {budget_mb:,} MB for HCS pool")
-
-        # ── Initialize Rust pool-based HCS with dynamic eviction ──
+        # ── Pass calibration data to Rust ──
         if hasattr(_model, '_gpu_decode_store'):
             store = _model._gpu_decode_store
-            t_hcs = time.time()
-            _status("Loading HCS pool (Rust, dynamic eviction)")
 
-            # hcs_pool_init: allocates VRAM pool, loads experts from mmap via H2D DMA,
-            # enables sliding-window activation tracking for between-prompt rebalancing.
-            result = store.hcs_pool_init(
+            cal_msg = store.set_vram_calibration(
+                short_tokens, long_tokens,
+                prefill_short_free, prefill_long_free,
+                decode_short_free, decode_long_free,
+                SAFETY_MARGIN_MB,
+            )
+            _dim(cal_msg)
+
+            # ── Initialize tiered HCS: hard pool + soft pool ──
+            t_hcs = time.time()
+            _status("Loading HCS pool (hard + soft tier)")
+
+            result = store.hcs_pool_init_tiered(
                 ranking,
-                budget_mb,
-                headroom_mb=500,
+                hard_budget_mb=hard_budget,
+                soft_budget_mb=soft_budget,
                 window_size=10,
                 replacement_pct=25,
             )
