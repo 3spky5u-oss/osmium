@@ -1890,6 +1890,242 @@ extern "C" __global__ void reduce_ksplits_weighted_accum_bf16(
     accum[n] = *reinterpret_cast<unsigned short*>(&result);
 }
 
+// ── Batched Expert Kernels ─────────────────────────────────────────────
+//
+// Process up to MAX_BATCH_EXPERTS experts in a single kernel launch.
+// blockIdx.z selects the expert. Each expert's weight pointers are read
+// from device arrays passed as kernel arguments.
+//
+// This eliminates per-expert launch overhead (~5us × 30 kernels/layer
+// = 150us/layer → ~30us/layer with batched launches).
+
+#define MAX_BATCH_EXPERTS 10
+
+// Batched w13 GEMV v2 with k-splitting.
+// Grid: (n_tiles, k_splits, num_experts), Block: (256, 1, 1)
+// Each expert reads from its own packed/scales arrays, writes to a striped
+// region of partial_out: expert i writes to partial_out + i * k_splits * N.
+extern "C" __global__ void marlin_gemv_int4_v2_batched(
+    const unsigned long long* __restrict__ packed_ptrs,  // [num_experts] device ptrs to packed weights
+    const unsigned long long* __restrict__ scales_ptrs,  // [num_experts] device ptrs to scale weights
+    const unsigned short* __restrict__ input,           // [K] BF16 (shared across experts)
+    float* __restrict__ partial_out,                    // [num_experts * k_splits * N] FP32
+    const int* __restrict__ inv_weight_perm,            // [1024]
+    const int* __restrict__ inv_scale_perm,             // [64]
+    int K, int N, int group_size, int k_splits
+) {
+    int expert_idx = blockIdx.z;
+    const unsigned int* packed = (const unsigned int*)packed_ptrs[expert_idx];
+    const unsigned short* scales = (const unsigned short*)scales_ptrs[expert_idx];
+
+    // Offset partial_out for this expert
+    float* my_partial = partial_out + expert_idx * k_splits * N;
+
+    extern __shared__ char smem_raw[];
+    unsigned short* s_input = (unsigned short*)smem_raw;
+    int* s_inv_wperm = (int*)(smem_raw + K * 2);
+    int* s_inv_sperm = (int*)(smem_raw + K * 2 + 1024 * 4);
+    float* s_reduce = (float*)(smem_raw + K * 2 + 1024 * 4 + 64 * 4);
+
+    int tid = threadIdx.x;
+
+    for (int i = tid; i < K; i += 256) s_input[i] = input[i];
+    for (int i = tid; i < 1024; i += 256) s_inv_wperm[i] = inv_weight_perm[i];
+    if (tid < 64) s_inv_sperm[tid] = inv_scale_perm[tid];
+    __syncthreads();
+
+    int tn = tid & 15;
+    int k_slice = tid >> 4;
+    int n_tile = blockIdx.x;
+    int ksplit = blockIdx.y;
+    int n = n_tile * 16 + tn;
+
+    if (n >= N) return;
+
+    int k_tiles_total = K >> 4;
+    int out_cols = N << 1;
+    int tiles_per_split = k_tiles_total / k_splits;
+    int split_start = ksplit * tiles_per_split;
+    int split_end = (ksplit == k_splits - 1) ? k_tiles_total : split_start + tiles_per_split;
+    int split_tiles = split_end - split_start;
+    int tiles_per_slice = split_tiles / 16;
+    int kt_start = split_start + k_slice * tiles_per_slice;
+    int kt_end = (k_slice == 15) ? split_end : kt_start + tiles_per_slice;
+
+    float acc = 0.0f;
+    int cur_scale_group = -1;
+    float cached_scale = 0.0f;
+
+    for (int kt = kt_start; kt < kt_end; kt++) {
+        for (int tk = 0; tk < 16; tk++) {
+            int k = (kt << 4) + tk;
+            int sg = k / group_size;
+            if (sg != cur_scale_group) {
+                cur_scale_group = sg;
+                int scale_flat = sg * N + n;
+                int schunk = scale_flat >> 6;
+                int slocal = scale_flat & 63;
+                int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
+                unsigned short scale_bits = scales[sperm_pos];
+                cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+            }
+            int tile_pos = (n_tile << 8) + (tk << 4) + tn;
+            int chunk = tile_pos >> 10;
+            int local_idx = tile_pos & 1023;
+            int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
+            int u32_col = perm_pos >> 3;
+            int nibble = perm_pos & 7;
+            unsigned int word = packed[kt * out_cols + u32_col];
+            int raw = (word >> (nibble << 2)) & 0xF;
+            float w_val = (float)(raw - 8);
+            float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
+            acc += w_val * cached_scale * x;
+        }
+    }
+
+    s_reduce[k_slice * 16 + tn] = acc;
+    __syncthreads();
+
+    if (k_slice == 0) {
+        float sum = 0.0f;
+        for (int ks = 0; ks < 16; ks++) sum += s_reduce[ks * 16 + tn];
+        my_partial[ksplit * N + n] = sum;
+    }
+}
+
+// Batched reduce k-split partial sums → BF16 gate_up output.
+// Grid: (ceil(N/256), 1, num_experts), Block: (256, 1, 1)
+// Each expert reads from partial[expert * k_splits * N] and writes to output[expert * N].
+extern "C" __global__ void reduce_ksplits_bf16_batched(
+    unsigned short* __restrict__ output,  // [num_experts * N] BF16
+    const float* __restrict__ partial,    // [num_experts * k_splits * N] FP32
+    int N, int k_splits
+) {
+    int expert_idx = blockIdx.z;
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+
+    const float* my_partial = partial + expert_idx * k_splits * N;
+    float sum = 0.0f;
+    for (int ks = 0; ks < k_splits; ks++) {
+        sum += my_partial[ks * N + n];
+    }
+    __nv_bfloat16 result = __float2bfloat16(sum);
+    output[expert_idx * N + n] = *reinterpret_cast<unsigned short*>(&result);
+}
+
+// Batched fused silu_mul + w2 GEMV, writing to per-expert output buffers.
+// Grid: (n_tiles, 1, num_experts), Block: (256, 1, 1)
+// Each expert reads its own gate_up and w2 weights, writes to expert_outs[expert * N].
+// Does NOT accumulate into moe_out — that's done by multi_expert_weighted_add.
+extern "C" __global__ void fused_silu_w2_batched(
+    const unsigned long long* __restrict__ w2_packed_ptrs,  // [num_experts]
+    const unsigned long long* __restrict__ w2_scales_ptrs,  // [num_experts]
+    const unsigned short* __restrict__ gate_ups,            // [num_experts * 2*K] BF16
+    unsigned short* __restrict__ expert_outs,               // [num_experts * N] BF16
+    const int* __restrict__ inv_weight_perm,
+    const int* __restrict__ inv_scale_perm,
+    int K, int N, int group_size
+) {
+    int expert_idx = blockIdx.z;
+    const unsigned int* packed = (const unsigned int*)w2_packed_ptrs[expert_idx];
+    const unsigned short* w2_scales = (const unsigned short*)w2_scales_ptrs[expert_idx];
+    const unsigned short* gate_up = gate_ups + expert_idx * 2 * K;
+    unsigned short* out = expert_outs + expert_idx * N;
+
+    extern __shared__ char smem_raw[];
+    unsigned short* s_input = (unsigned short*)smem_raw;
+    int* s_inv_wperm = (int*)(smem_raw + K * 2);
+    int* s_inv_sperm = (int*)(smem_raw + K * 2 + 1024 * 4);
+
+    int tid = threadIdx.x;
+
+    // Apply silu_mul while loading gate_up into shared memory
+    for (int i = tid; i < K; i += 256) {
+        float g = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&gate_up[i]));
+        float u = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&gate_up[K + i]));
+        float silu_g = g / (1.0f + expf(-g));
+        __nv_bfloat16 val = __float2bfloat16(silu_g * u);
+        s_input[i] = *reinterpret_cast<unsigned short*>(&val);
+    }
+    for (int i = tid; i < 1024; i += 256) s_inv_wperm[i] = inv_weight_perm[i];
+    if (tid < 64) s_inv_sperm[tid] = inv_scale_perm[tid];
+    __syncthreads();
+
+    int k_slice = tid & 15;
+    int tn = tid >> 4;
+    int n_tile = blockIdx.x;
+    int n = n_tile * 16 + tn;
+    if (n >= N) return;
+
+    int k_tiles_total = K >> 4;
+    int out_cols = N << 1;
+    int tiles_per_slice = k_tiles_total >> 4;
+    int kt_start = k_slice * tiles_per_slice;
+    int kt_end = (k_slice == 15) ? k_tiles_total : (kt_start + tiles_per_slice);
+
+    float acc = 0.0f;
+    int cur_scale_group = -1;
+    float cached_scale = 0.0f;
+
+    for (int kt = kt_start; kt < kt_end; kt++) {
+        for (int tk = 0; tk < 16; tk++) {
+            int k = (kt << 4) + tk;
+            int sg = k / group_size;
+            if (sg != cur_scale_group) {
+                cur_scale_group = sg;
+                int scale_flat = sg * N + n;
+                int schunk = scale_flat >> 6;
+                int slocal = scale_flat & 63;
+                int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
+                unsigned short scale_bits = w2_scales[sperm_pos];
+                cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+            }
+            int tile_pos = (n_tile << 8) + (tk << 4) + tn;
+            int chunk = tile_pos >> 10;
+            int local_idx = tile_pos & 1023;
+            int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
+            int u32_col = perm_pos >> 3;
+            int nibble = perm_pos & 7;
+            unsigned int word = packed[kt * out_cols + u32_col];
+            int raw = (word >> (nibble << 2)) & 0xF;
+            float w_val = (float)(raw - 8);
+            float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
+            acc += w_val * cached_scale * x;
+        }
+    }
+
+    // Warp shuffle reduction across 16 k_slices
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset, 16);
+    }
+
+    if (k_slice == 0) {
+        __nv_bfloat16 result = __float2bfloat16(acc);
+        out[n] = *reinterpret_cast<unsigned short*>(&result);
+    }
+}
+
+// Multi-expert weighted accumulation: moe_out += sum(weight[i] * expert_out[i])
+// Grid: (ceil(N/256), 1, 1), Block: (256, 1, 1)
+extern "C" __global__ void multi_expert_weighted_add_bf16(
+    unsigned short* __restrict__ accum,              // [N] BF16 moe_out
+    const unsigned short* __restrict__ expert_outs,  // [num_experts * N] BF16
+    const float* __restrict__ weights,               // [num_experts] FP32
+    int N, int num_experts
+) {
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+
+    float sum = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&accum[n]));
+    for (int e = 0; e < num_experts; e++) {
+        float val = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&expert_outs[e * N + n]));
+        sum += weights[e] * val;
+    }
+    __nv_bfloat16 result = __float2bfloat16(sum);
+    accum[n] = *reinterpret_cast<unsigned short*>(&result);
+}
+
 // ── Simple INT4 GEMV (for draft model) ───────────────────────────────
 //
 // Row-major packed INT4 weights: each byte holds 2 values (low nibble = even col, high nibble = odd col).

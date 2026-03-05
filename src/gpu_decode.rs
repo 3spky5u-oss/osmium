@@ -64,6 +64,10 @@ const KERNEL_NAMES: &[&str] = &[
     "sigmoid_gate_inplace_bf16",
     "simple_int4_gemv_f32",
     "simple_int4_gemv_bf16",
+    "marlin_gemv_int4_v2_batched",
+    "reduce_ksplits_bf16_batched",
+    "fused_silu_w2_batched",
+    "multi_expert_weighted_add_bf16",
     // "fused_gate_topk" exists in .cu but is not loaded (single-block = slow on multi-SM GPUs)
 ];
 
@@ -706,6 +710,11 @@ struct CachedKernels {
     gqa_attention_tiled: cudarc::driver::CudaFunction,
     gqa_attention_reduce: cudarc::driver::CudaFunction,
     apply_gated_attn: cudarc::driver::CudaFunction,
+    // Batched expert kernels — reduce launch overhead from 30/layer to 4/layer
+    marlin_gemv_int4_v2_batched: cudarc::driver::CudaFunction,
+    reduce_ksplits_bf16_batched: cudarc::driver::CudaFunction,
+    fused_silu_w2_batched: cudarc::driver::CudaFunction,
+    multi_expert_weighted_add_bf16: cudarc::driver::CudaFunction,
 }
 
 // ── Main GPU decode graph ──────────────────────────────────────────────
@@ -794,6 +803,28 @@ struct GpuDecodeGraph {
     // max_N = max(2*intermediate_size, hidden_size), max_k_splits = 8
     d_v2_partial: cudarc::driver::CudaSlice<f32>,
     num_sms: usize,
+
+    // ── Batched expert buffers (reduce kernel launch overhead) ──
+    // Per-expert gate_up outputs: [max_experts_per_tok * 2 * intermediate_size] BF16
+    d_batch_gate_ups: cudarc::driver::CudaSlice<u16>,
+    // Per-expert v2 partial sums: [max_experts_per_tok * max_k_splits * max_N] FP32
+    d_batch_partials: cudarc::driver::CudaSlice<f32>,
+    // Per-expert w2 GEMV outputs: [max_experts_per_tok * hidden_size] BF16
+    d_batch_expert_outs: cudarc::driver::CudaSlice<u16>,
+    // Device arrays for batched kernel pointer arguments (uploaded each layer)
+    d_batch_w13_packed_ptrs: cudarc::driver::CudaSlice<u64>,
+    d_batch_w13_scales_ptrs: cudarc::driver::CudaSlice<u64>,
+    d_batch_w2_packed_ptrs: cudarc::driver::CudaSlice<u64>,
+    d_batch_w2_scales_ptrs: cudarc::driver::CudaSlice<u64>,
+    // Device array for batched routing weights: [max_experts_per_tok] FP32
+    d_batch_weights: cudarc::driver::CudaSlice<f32>,
+    // Host staging buffers for pointer upload
+    h_batch_w13_packed_ptrs: Vec<u64>,
+    h_batch_w13_scales_ptrs: Vec<u64>,
+    h_batch_w2_packed_ptrs: Vec<u64>,
+    h_batch_w2_scales_ptrs: Vec<u64>,
+    h_batch_weights: Vec<f32>,
+    max_experts_per_tok: usize,
 
     // GQA scratch (FP32 for Q, K, V, attention output)
     d_gqa_q: cudarc::driver::CudaSlice<f32>,
@@ -1228,6 +1259,29 @@ impl GpuDecodeStore {
         let d_v2_partial = self.device.alloc_zeros::<f32>(max_k_splits * max_n_v2)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
 
+        // Batched expert buffers: per-expert scratch for batched kernel launches
+        let max_ept = max_experts_per_tok;
+        let d_batch_gate_ups = self.device.alloc_zeros::<u16>(max_ept * intermediate * 2)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
+        let d_batch_partials = self.device.alloc_zeros::<f32>(max_ept * max_k_splits * max_n_v2)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
+        let d_batch_expert_outs = self.device.alloc_zeros::<u16>(max_ept * hidden_size)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
+        let d_batch_w13_packed_ptrs = self.device.alloc_zeros::<u64>(max_ept)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
+        let d_batch_w13_scales_ptrs = self.device.alloc_zeros::<u64>(max_ept)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
+        let d_batch_w2_packed_ptrs = self.device.alloc_zeros::<u64>(max_ept)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
+        let d_batch_w2_scales_ptrs = self.device.alloc_zeros::<u64>(max_ept)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
+        let d_batch_weights = self.device.alloc_zeros::<f32>(max_ept)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
+        log::info!("GpuDecodeStore: batched expert buffers allocated ({:.1} KB gate_ups + {:.1} KB partials + {:.1} KB outs)",
+            (max_ept * intermediate * 2 * 2) as f64 / 1024.0,
+            (max_ept * max_k_splits * max_n_v2 * 4) as f64 / 1024.0,
+            (max_ept * hidden_size * 2) as f64 / 1024.0);
+
         // Query SM count for auto K-split calculation
         let num_sms = unsafe {
             let mut dev: i32 = 0;
@@ -1309,6 +1363,20 @@ impl GpuDecodeStore {
             d_inv_scale_perm,
             d_v2_partial,
             num_sms,
+            d_batch_gate_ups,
+            d_batch_partials,
+            d_batch_expert_outs,
+            d_batch_w13_packed_ptrs,
+            d_batch_w13_scales_ptrs,
+            d_batch_w2_packed_ptrs,
+            d_batch_w2_scales_ptrs,
+            d_batch_weights,
+            h_batch_w13_packed_ptrs: vec![0u64; max_ept],
+            h_batch_w13_scales_ptrs: vec![0u64; max_ept],
+            h_batch_w2_packed_ptrs: vec![0u64; max_ept],
+            h_batch_w2_scales_ptrs: vec![0u64; max_ept],
+            h_batch_weights: vec![0.0f32; max_ept],
+            max_experts_per_tok: max_ept,
             d_gqa_q,
             d_gqa_k,
             d_gqa_v,
@@ -1438,9 +1506,13 @@ impl GpuDecodeStore {
                 gqa_attention_tiled: get("gqa_attention_tiled")?,
                 gqa_attention_reduce: get("gqa_attention_reduce")?,
                 apply_gated_attn: get("apply_gated_attn")?,
+                marlin_gemv_int4_v2_batched: get("marlin_gemv_int4_v2_batched")?,
+                reduce_ksplits_bf16_batched: get("reduce_ksplits_bf16_batched")?,
+                fused_silu_w2_batched: get("fused_silu_w2_batched")?,
+                multi_expert_weighted_add_bf16: get("multi_expert_weighted_add_bf16")?,
             };
             self.graph.as_mut().unwrap().kernels = Some(kernels);
-            log::info!("GpuDecodeStore: cached 33 kernel function handles");
+            log::info!("GpuDecodeStore: cached 37 kernel function handles");
         }
 
         // Pre-allocate CUDA events (reuse across MoE forward calls)
@@ -8023,21 +8095,24 @@ impl GpuDecodeStore {
         if timing { graph.t_moe_apfl += (Instant::now() - t_apfl_start).as_secs_f64(); }
         let t_expert_loop_start = Instant::now();
 
+        // ── Phase 1: Classify experts as HCS-hit or DMA-needed ──
+        let mut hcs_batch_count = 0usize;
+        let mut dma_experts: [(usize, f32); 10] = [(0, 0.0); 10]; // (expert_idx_in_topk, weight)
+        let mut dma_count = 0usize;
+
         for i in 0..topk {
             let eid = graph.h_topk_ids[i];
             if eid < 0 { continue; }
             let eid = eid as usize;
             let weight = graph.h_topk_weights[i];
 
-            let expert = &moe.experts[eid];
-
             // Record activation for HCS heatmap
             if let Some(ref mut hcs) = graph.hcs {
                 hcs.record_activation(layer_idx, eid);
             }
 
-            // ── Priority 1: HCS cache — expert permanently resident in VRAM ──
-            let hcs_entry_ptrs = if let Some(ref hcs) = graph.hcs {
+            // Check HCS cache
+            let hcs_ptrs = if let Some(ref hcs) = graph.hcs {
                 hcs.get(layer_idx, eid).map(|entry| (
                     entry.w13_packed_ptr(), entry.w13_scales_ptr(),
                     entry.w2_packed_ptr(), entry.w2_scales_ptr(),
@@ -8046,13 +8121,152 @@ impl GpuDecodeStore {
                 None
             };
 
-            if let Some((w13p, w13s, w2p, w2s)) = hcs_entry_ptrs {
-                // ── HCS HIT: zero DMA, VRAM-resident at full bandwidth ──
-                hcs_hits += 1;
-                if timing { graph.dma_hcs_experts += 1; }
+            if let Some((w13p, w13s, w2p, w2s)) = hcs_ptrs {
+                // Gather HCS expert pointers for batched launch
+                if hcs_batch_count < graph.max_experts_per_tok {
+                    graph.h_batch_w13_packed_ptrs[hcs_batch_count] = w13p;
+                    graph.h_batch_w13_scales_ptrs[hcs_batch_count] = w13s;
+                    graph.h_batch_w2_packed_ptrs[hcs_batch_count] = w2p;
+                    graph.h_batch_w2_scales_ptrs[hcs_batch_count] = w2s;
+                    graph.h_batch_weights[hcs_batch_count] = weight;
+                    hcs_batch_count += 1;
+                    hcs_hits += 1;
+                    if timing { graph.dma_hcs_experts += 1; }
+                }
+            } else {
+                if dma_count < 10 {
+                    dma_experts[dma_count] = (i, weight);
+                    dma_count += 1;
+                }
+            }
+        }
 
-                // w13 GEMV: hidden -> gate_up (v2 with k-splits for better SM utilization)
-                let t_w13 = Instant::now();
+        // ── Phase 2: Batched HCS expert compute (4 launches instead of 3*N) ──
+        if hcs_batch_count > 0 && use_v2_w13 && hcs_batch_count >= 2 {
+            let t_w13 = Instant::now();
+
+            // Upload pointer arrays to GPU
+            unsafe {
+                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                    *graph.d_batch_w13_packed_ptrs.device_ptr(),
+                    graph.h_batch_w13_packed_ptrs.as_ptr() as *const std::ffi::c_void,
+                    hcs_batch_count * 8, std::ptr::null_mut());
+                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                    *graph.d_batch_w13_scales_ptrs.device_ptr(),
+                    graph.h_batch_w13_scales_ptrs.as_ptr() as *const std::ffi::c_void,
+                    hcs_batch_count * 8, std::ptr::null_mut());
+                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                    *graph.d_batch_w2_packed_ptrs.device_ptr(),
+                    graph.h_batch_w2_packed_ptrs.as_ptr() as *const std::ffi::c_void,
+                    hcs_batch_count * 8, std::ptr::null_mut());
+                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                    *graph.d_batch_w2_scales_ptrs.device_ptr(),
+                    graph.h_batch_w2_scales_ptrs.as_ptr() as *const std::ffi::c_void,
+                    hcs_batch_count * 8, std::ptr::null_mut());
+                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                    *graph.d_batch_weights.device_ptr(),
+                    graph.h_batch_weights.as_ptr() as *const std::ffi::c_void,
+                    hcs_batch_count * 4, std::ptr::null_mut());
+            }
+
+            // Batched w13 GEMV v2: all HCS experts in one launch
+            let w13_n_tiles = (w13_n + 15) / 16;
+            let w13_smem = (hs * 2 + 1024 * 4 + 64 * 4 + 16 * 16 * 4) as u32;
+            unsafe {
+                k.marlin_gemv_int4_v2_batched.clone().launch(
+                    LaunchConfig {
+                        grid_dim: (w13_n_tiles as u32, w13_ksplits as u32, hcs_batch_count as u32),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: w13_smem,
+                    },
+                    (
+                        *graph.d_batch_w13_packed_ptrs.device_ptr(),
+                        *graph.d_batch_w13_scales_ptrs.device_ptr(),
+                        *graph.d_hidden.device_ptr(),
+                        *graph.d_batch_partials.device_ptr(),
+                        inv_wp, inv_sp,
+                        hs as i32, w13_n as i32, gs as i32, w13_ksplits as i32,
+                    ),
+                ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("batched w13 v2: {:?}", e)))?;
+            }
+
+            // Batched reduce: all experts' k-split partials → gate_up
+            unsafe {
+                k.reduce_ksplits_bf16_batched.clone().launch(
+                    LaunchConfig {
+                        grid_dim: (((w13_n + 255) / 256) as u32, 1, hcs_batch_count as u32),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (
+                        *graph.d_batch_gate_ups.device_ptr(),
+                        *graph.d_batch_partials.device_ptr(),
+                        w13_n as i32, w13_ksplits as i32,
+                    ),
+                ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("batched reduce: {:?}", e)))?;
+            }
+
+            if timing {
+                unsafe { cuda_sys::lib().cuStreamSynchronize(std::ptr::null_mut()); }
+                graph.t_expert_w13 += (Instant::now() - t_w13).as_secs_f64();
+            }
+            let t_silu_w2 = Instant::now();
+
+            // Batched silu+w2 GEMV: all experts in one launch, writes to per-expert output
+            let w2_n_tiles = (hs + 15) / 16;
+            let w2_smem = (intermediate * 2 + 1024 * 4 + 64 * 4) as u32;
+            unsafe {
+                k.fused_silu_w2_batched.clone().launch(
+                    LaunchConfig {
+                        grid_dim: (w2_n_tiles as u32, 1, hcs_batch_count as u32),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: w2_smem,
+                    },
+                    (
+                        *graph.d_batch_w2_packed_ptrs.device_ptr(),
+                        *graph.d_batch_w2_scales_ptrs.device_ptr(),
+                        *graph.d_batch_gate_ups.device_ptr(),
+                        *graph.d_batch_expert_outs.device_ptr(),
+                        inv_wp, inv_sp,
+                        intermediate as i32, hs as i32, gs as i32,
+                    ),
+                ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("batched silu_w2: {:?}", e)))?;
+            }
+
+            // Multi-expert weighted add: sum all expert outputs into moe_out
+            unsafe {
+                k.multi_expert_weighted_add_bf16.clone().launch(
+                    LaunchConfig {
+                        grid_dim: (((hs + 255) / 256) as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (
+                        *graph.d_moe_out.device_ptr(),
+                        *graph.d_batch_expert_outs.device_ptr(),
+                        *graph.d_batch_weights.device_ptr(),
+                        hs as i32, hcs_batch_count as i32,
+                    ),
+                ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("multi_expert_weighted_add: {:?}", e)))?;
+            }
+
+            if timing {
+                unsafe { cuda_sys::lib().cuStreamSynchronize(std::ptr::null_mut()); }
+                graph.t_expert_silu_w2 += (Instant::now() - t_silu_w2).as_secs_f64();
+            }
+        } else if hcs_batch_count > 0 {
+            // Fallback for 1 HCS expert or non-v2: sequential launch (original code)
+            for bi in 0..hcs_batch_count {
+                let w13p = graph.h_batch_w13_packed_ptrs[bi];
+                let w13s = graph.h_batch_w13_scales_ptrs[bi];
+                let w2p = graph.h_batch_w2_packed_ptrs[bi];
+                let w2s = graph.h_batch_w2_scales_ptrs[bi];
+                let weight = graph.h_batch_weights[bi];
+
                 if use_v2_w13 {
                     self.launch_marlin_gemv_v2(
                         w13p, w13s,
@@ -8074,27 +8288,25 @@ impl GpuDecodeStore {
                         hs, w13_n, gs,
                     )?;
                 }
-                if timing {
-                    unsafe { cuda_sys::lib().cuStreamSynchronize(std::ptr::null_mut()); }
-                    graph.t_expert_w13 += (Instant::now() - t_w13).as_secs_f64();
-                }
-
-                // Fused: silu_mul + w2 GEMV + weighted_add (3 launches -> 1)
-                let t_silu_w2 = Instant::now();
                 self.launch_fused_silu_accum(
                     w2p, w2s,
                     *graph.d_expert_gate_up.device_ptr(),
                     *graph.d_moe_out.device_ptr(),
                     inv_wp, inv_sp,
                     intermediate, hs, gs,
-                    weight, 0u64,
-                    k,
+                    weight, 0u64, k,
                 )?;
-                if timing {
-                    unsafe { cuda_sys::lib().cuStreamSynchronize(std::ptr::null_mut()); }
-                    graph.t_expert_silu_w2 += (Instant::now() - t_silu_w2).as_secs_f64();
-                }
-            } else if use_double_buf {
+            }
+        }
+
+        // ── Phase 3: DMA experts (double-buffered pipeline, unchanged) ──
+        for di in 0..dma_count {
+            let (i, _weight) = dma_experts[di];
+            let eid = graph.h_topk_ids[i] as usize;
+            let weight = graph.h_topk_weights[i];
+            let expert = &moe.experts[eid];
+
+            if use_double_buf {
                 // ── Priority 3: Double-buffered DMA with ping-pong overlap ──
                 //
                 // Expert N DMAs to buf[slot], expert N-1 computes from buf[prev_slot].
