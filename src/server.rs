@@ -248,12 +248,22 @@ fn handle_request(
     }
 }
 
+/// Overhead timings collected during request setup (before decode).
+struct RequestOverhead {
+    parse_ms: f64,       // HTTP parse + JSON parse + tokenization
+    evict_ms: f64,       // HCS soft-tier eviction
+    prefill_ms: f64,     // GIL acquire + Python prefill
+    reload_ms: f64,      // HCS soft-tier reload
+}
+
 /// Handle /v1/chat/completions request.
 fn handle_chat_completion(
     stream: &mut TcpStream,
     body: &str,
     state: &ServerState,
 ) {
+    let t_request = Instant::now();
+
     // Parse request
     let req: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -327,10 +337,13 @@ fn handle_chat_completion(
             est, text_len, base_count);
         est
     };
+    let parse_ms = t_request.elapsed().as_secs_f64() * 1000.0;
 
     // ── Evict soft HCS before prefill to free VRAM ──
+    let t_evict = Instant::now();
     let store_for_evict = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
     let (evicted, _freed_mb) = store_for_evict.hcs_evict_for_prefill(estimated_tokens);
+    let evict_ms = t_evict.elapsed().as_secs_f64() * 1000.0;
 
     // ── Call Python for prefill (GIL required) ──
     let t_prefill_gil = Instant::now();
@@ -423,12 +436,21 @@ fn handle_chat_completion(
     let tokenizer = &state.tokenizer;
 
     // ── Reload soft HCS after prefill frees temporary VRAM ──
+    let t_reload = Instant::now();
     let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
     if evicted > 0 {
-        let (reloaded, reload_ms) = store.hcs_reload_after_prefill();
-        log::info!("Request {}: HCS soft reloaded {} experts in {:.1}ms (evicted {} for prefill)",
-            request_id, reloaded, reload_ms, evicted);
+        let (reloaded, _reload_detail_ms) = store.hcs_reload_after_prefill();
+        log::info!("Request {}: HCS soft reloaded {} experts (evicted {} for prefill)",
+            request_id, reloaded, evicted);
     }
+    let reload_ms = t_reload.elapsed().as_secs_f64() * 1000.0;
+
+    let overhead = RequestOverhead {
+        parse_ms,
+        evict_ms,
+        prefill_ms: prefill_gil_ms,
+        reload_ms,
+    };
 
     // ── GPU decode: GIL-free Rust decode via GpuDecodeStore ──
     handle_gpu_decode(
@@ -436,6 +458,7 @@ fn handle_chat_completion(
         first_token, prompt_len, max_tokens, temperature,
         top_k, top_p, presence_penalty, &stop_ids,
         &request_id, &state.model_name, created,
+        &overhead,
     );
 
     // ── Cleanup (GIL required) ──
@@ -445,10 +468,11 @@ fn handle_chat_completion(
     });
     let cleanup_gil_ms = t_cleanup_gil.elapsed().as_secs_f64() * 1000.0;
 
-    if state.gil_timing {
-        log::info!("GIL timing: prefill={:.1}ms cleanup={:.1}ms",
-            prefill_gil_ms, cleanup_gil_ms);
-    }
+    let total_ms = t_request.elapsed().as_secs_f64() * 1000.0;
+    log::info!(
+        "Request {} complete: total={:.0}ms | parse={:.1}ms evict={:.1}ms prefill={:.0}ms reload={:.0}ms cleanup={:.1}ms",
+        request_id, total_ms, parse_ms, evict_ms, prefill_gil_ms, reload_ms, cleanup_gil_ms
+    );
 }
 
 /// GPU decode: GIL-free Rust decode loop via GpuDecodeStore.
@@ -471,6 +495,7 @@ fn handle_gpu_decode(
     request_id: &str,
     model_name: &str,
     created: u64,
+    overhead: &RequestOverhead,
 ) {
     if is_stream {
         if let Err(e) = begin_sse(stream) {
@@ -569,18 +594,25 @@ fn handle_gpu_decode(
         } else {
             0.0
         };
+        let decode_ms = elapsed * 1000.0;
+        let overhead_total_ms = overhead.parse_ms + overhead.evict_ms + overhead.prefill_ms + overhead.reload_ms;
         let timing_chunk = format!(
-            r#"{{"id":"{}","object":"chat.completion.chunk","created":{},"model":"{}","choices":[],"krasis_timing":{{"decode_tokens":{},"decode_time_ms":{:.1},"decode_tok_s":{:.2},"total_generated":{},"prompt_tokens":{}}}}}"#,
+            r#"{{"id":"{}","object":"chat.completion.chunk","created":{},"model":"{}","choices":[],"krasis_timing":{{"decode_tokens":{},"decode_time_ms":{:.1},"decode_tok_s":{:.2},"total_generated":{},"prompt_tokens":{},"overhead_ms":{:.1},"overhead":{{"parse_ms":{:.1},"evict_ms":{:.1},"prefill_ms":{:.1},"reload_ms":{:.1}}}}}}}"#,
             request_id, created, model_name,
-            decode_token_count, elapsed * 1000.0, decode_tok_s, total_gen, prompt_len
+            decode_token_count, decode_ms, decode_tok_s, total_gen, prompt_len,
+            overhead_total_ms,
+            overhead.parse_ms, overhead.evict_ms, overhead.prefill_ms, overhead.reload_ms
         );
         let _ = tx.send(format!("data: {}\n\n", timing_chunk));
         let _ = tx.send("data: [DONE]\n\n".to_string());
         drop(tx);
         let _ = writer_handle.join();
 
-        log::info!("Request {} GPU streaming complete ({:.2}s, {} tokens, {:.2} tok/s)",
-            request_id, elapsed, total_gen, decode_tok_s);
+        log::info!(
+            "Request {} complete: decode={:.2}s ({} tok, {:.1} tok/s) | overhead={:.0}ms (parse={:.1} evict={:.1} prefill={:.0} reload={:.0})",
+            request_id, elapsed, total_gen, decode_tok_s,
+            overhead_total_ms, overhead.parse_ms, overhead.evict_ms, overhead.prefill_ms, overhead.reload_ms
+        );
     } else {
         let mut all_text = String::new();
         let first_text = tokenizer.decode(&[first_token as u32], true).unwrap_or_default();

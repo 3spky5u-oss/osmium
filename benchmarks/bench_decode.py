@@ -66,6 +66,7 @@ def run_streaming_test(prompt, max_tokens, temperature=0.7):
     t_first_token = None
     token_times = []
     token_count = 0
+    engine_timing = None  # krasis_timing from SSE stream
 
     with urllib.request.urlopen(req, timeout=3600) as resp:
         buffer = b""
@@ -79,6 +80,10 @@ def run_streaming_test(prompt, max_tokens, temperature=0.7):
                 if line.startswith(b"data: "):
                     try:
                         obj = json.loads(line[6:])
+                        # Check for engine timing chunk (no choices with content)
+                        if "krasis_timing" in obj:
+                            engine_timing = obj["krasis_timing"]
+                            continue
                         delta = obj["choices"][0].get("delta", {})
                         content = delta.get("content", "")
                         if content:
@@ -111,13 +116,31 @@ def run_streaming_test(prompt, max_tokens, temperature=0.7):
         avg_itl = 0
         decode_tok_s = 0
 
-    return {
+    result = {
         "tokens": token_count,
         "ttft_s": round(ttft, 2),
         "decode_tok_s": round(decode_tok_s, 2),
         "avg_itl_ms": round(avg_itl * 1000, 1),
         "total_s": round(total, 2),
     }
+
+    # Add engine-reported timing if available
+    if engine_timing:
+        result["engine"] = {
+            "decode_tok_s": round(engine_timing.get("decode_tok_s", 0), 2),
+            "decode_ms": round(engine_timing.get("decode_time_ms", 0), 1),
+            "overhead_ms": round(engine_timing.get("overhead_ms", 0), 1),
+        }
+        oh = engine_timing.get("overhead", {})
+        if oh:
+            result["engine"]["overhead_detail"] = {
+                "parse_ms": round(oh.get("parse_ms", 0), 1),
+                "evict_ms": round(oh.get("evict_ms", 0), 1),
+                "prefill_ms": round(oh.get("prefill_ms", 0), 0),
+                "reload_ms": round(oh.get("reload_ms", 0), 0),
+            }
+
+    return result
 
 
 def main():
@@ -126,8 +149,9 @@ def main():
         sys.exit(1)
 
     print(f"Benchmarking {MODEL} at {SERVER}")
-    print(f"{'Test':<10} {'TTFT(s)':<9} {'Decode tok/s':<14} {'ITL(ms)':<10} {'Tokens':<8} {'Total(s)'}")
-    print("-" * 65)
+    print()
+    print(f"{'Test':<10} {'Engine tok/s':<14} {'HTTP tok/s':<12} {'Overhead(ms)':<14} {'Prefill(ms)':<13} {'Reload(ms)':<12} {'Tokens':<8} {'Total(s)'}")
+    print("-" * 100)
 
     results = []
 
@@ -144,9 +168,18 @@ def main():
             r["label"] = label
             r["target_input"] = target_tokens
             results.append(r)
+
+            eng = r.get("engine", {})
+            eng_tok_s = eng.get("decode_tok_s", 0)
+            overhead = eng.get("overhead_ms", 0)
+            detail = eng.get("overhead_detail", {})
+            prefill = detail.get("prefill_ms", 0)
+            reload = detail.get("reload_ms", 0)
+
             print(
-                f"{label:<10} {r['ttft_s']:<9} {r['decode_tok_s']:<14} "
-                f"{r['avg_itl_ms']:<10} {r['tokens']:<8} {r['total_s']}"
+                f"{label:<10} {eng_tok_s:<14} {r['decode_tok_s']:<12} "
+                f"{overhead:<14.0f} {prefill:<13.0f} {reload:<12.0f} "
+                f"{r['tokens']:<8} {r['total_s']}"
             )
         except Exception as e:
             print(f"{label:<10} ERROR: {e}")
@@ -154,9 +187,15 @@ def main():
     print()
 
     if results:
-        rates = [r["decode_tok_s"] for r in results if r["decode_tok_s"] > 0]
-        if rates:
-            print(f"Decode tok/s: min={min(rates):.2f}, max={max(rates):.2f}, avg={sum(rates)/len(rates):.2f}")
+        eng_rates = [r["engine"]["decode_tok_s"] for r in results if r.get("engine", {}).get("decode_tok_s", 0) > 0]
+        http_rates = [r["decode_tok_s"] for r in results if r["decode_tok_s"] > 0]
+        if eng_rates:
+            print(f"Engine decode:  min={min(eng_rates):.1f}, max={max(eng_rates):.1f}, avg={sum(eng_rates)/len(eng_rates):.1f} tok/s")
+        if http_rates:
+            print(f"HTTP decode:    min={min(http_rates):.1f}, max={max(http_rates):.1f}, avg={sum(http_rates)/len(http_rates):.1f} tok/s")
+        overheads = [r["engine"]["overhead_ms"] for r in results if r.get("engine", {}).get("overhead_ms", 0) > 0]
+        if overheads:
+            print(f"Overhead:       min={min(overheads):.0f}, max={max(overheads):.0f}, avg={sum(overheads)/len(overheads):.0f} ms")
 
     output_file = sys.argv[2] if len(sys.argv) > 2 and sys.argv[1] == "--output" else None
     if output_file:
