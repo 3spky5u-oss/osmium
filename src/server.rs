@@ -435,13 +435,13 @@ fn handle_chat_completion(
 
     let tokenizer = &state.tokenizer;
 
-    // ── Reload soft HCS after prefill frees temporary VRAM ──
+    // ── Reload soft HCS after prefill (async — DMA overlaps with decode) ──
     let t_reload = Instant::now();
     let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
     if evicted > 0 {
-        let (reloaded, _reload_detail_ms) = store.hcs_reload_after_prefill();
-        log::info!("Request {}: HCS soft reloaded {} experts (evicted {} for prefill)",
-            request_id, reloaded, evicted);
+        let (queued, _alloc_mb) = store.hcs_reload_after_prefill_async();
+        log::info!("Request {}: HCS soft async reload queued {} experts (evicted {} for prefill)",
+            request_id, queued, evicted);
     }
     let reload_ms = t_reload.elapsed().as_secs_f64() * 1000.0;
 

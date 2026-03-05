@@ -390,6 +390,14 @@ struct HcsState {
     soft_num_cached: usize,
     /// Whether soft tier is currently loaded (false during prefill).
     soft_loaded: bool,
+    /// Whether an async soft-tier reload is in progress.
+    soft_reload_pending: bool,
+    /// CUDA event signaling async soft-tier DMA completion.
+    soft_reload_event: Option<CudaEvent>,
+    /// CUDA stream for async soft-tier reload DMA.
+    soft_reload_stream: Option<CudaStream>,
+    /// Pending cache entries to activate when async reload completes.
+    soft_reload_entries: Vec<(usize, usize, HcsCacheEntry)>,
 
     // ── Dynamic eviction: sliding window activation tracking ──
     /// Bitset for current prompt: 1 bit per (layer_idx * num_experts + expert_idx).
@@ -436,6 +444,10 @@ impl HcsState {
             soft_ranking: Vec::new(),
             soft_num_cached: 0,
             soft_loaded: false,
+            soft_reload_pending: false,
+            soft_reload_event: None,  // CudaEvent
+            soft_reload_stream: None, // CudaStream
+            soft_reload_entries: Vec::new(),
             current_activations: Vec::new(),
             num_experts_per_layer: 0,
             prompt_history: std::collections::VecDeque::new(),
@@ -6214,6 +6226,24 @@ impl GpuDecodeStore {
             None => return (0, 0.0),
         };
 
+        // Cancel any pending async reload first
+        if hcs.soft_reload_pending {
+            if let Some(ref stream) = hcs.soft_reload_stream {
+                unsafe { let _ = cuda_sys::lib().cuStreamSynchronize(stream.0); }
+            }
+            hcs.soft_reload_pending = false;
+            hcs.soft_reload_entries.clear();
+            // The soft_buf was already allocated by async reload; need to free it
+            if hcs.soft_buf.is_some() && !hcs.soft_loaded {
+                let freed_bytes = hcs.soft_num_slots * hcs.soft_slot_size;
+                hcs.soft_buf = None;
+                hcs.vram_bytes -= freed_bytes;
+                eprintln!("  \x1b[33mHCS soft: cancelled pending async reload ({:.1} MB freed)\x1b[0m",
+                    freed_bytes as f64 / (1024.0 * 1024.0));
+            }
+            return (0, 0.0);
+        }
+
         if !hcs.soft_loaded || hcs.soft_buf.is_none() || hcs.soft_num_cached == 0 {
             return (0, 0.0);
         }
@@ -6391,6 +6421,218 @@ impl GpuDecodeStore {
         (loaded, elapsed_ms)
     }
 
+    /// Async version of hcs_reload_after_prefill.
+    /// Queues all DMA on a dedicated CUDA stream and returns immediately.
+    /// Call hcs_check_soft_reload_complete() each decode step to activate
+    /// the soft tier once all DMA finishes.
+    /// Returns (num_experts_queued, alloc_mb).
+    pub fn hcs_reload_after_prefill_async(&mut self) -> (usize, f64) {
+        let graph = match self.graph.as_mut() {
+            Some(g) => g,
+            None => return (0, 0.0),
+        };
+        let hcs = match graph.hcs.as_mut() {
+            Some(h) => h,
+            None => return (0, 0.0),
+        };
+
+        if hcs.soft_loaded || hcs.soft_ranking.is_empty() || hcs.soft_reload_pending {
+            return (0, 0.0);
+        }
+
+        let slot_size = hcs.soft_slot_size;
+        let num_slots = hcs.soft_num_slots;
+        if slot_size == 0 || num_slots == 0 {
+            return (0, 0.0);
+        }
+
+        let t0 = std::time::Instant::now();
+        let alloc_bytes = num_slots * slot_size;
+
+        // Allocate fresh soft pool (no zeroing — we overwrite all data with DMA)
+        let soft_buf = match unsafe { self.device.alloc::<u8>(alloc_bytes) } {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::warn!("HCS soft async reload: alloc failed ({:.1} MB): {:?}",
+                    alloc_bytes as f64 / (1024.0 * 1024.0), e);
+                return (0, 0.0);
+            }
+        };
+        let soft_base = *soft_buf.device_ptr();
+
+        // Create or reuse the reload stream and event
+        if hcs.soft_reload_stream.is_none() {
+            let mut s: cuda_sys::CUstream = std::ptr::null_mut();
+            unsafe {
+                let err = cuda_sys::lib().cuStreamCreate(
+                    &mut s,
+                    cuda_sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
+                );
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    log::warn!("HCS soft async reload: cuStreamCreate failed: {:?}", err);
+                    return (0, 0.0);
+                }
+            }
+            hcs.soft_reload_stream = Some(CudaStream(s));
+        }
+        if hcs.soft_reload_event.is_none() {
+            let mut e: cuda_sys::CUevent = std::ptr::null_mut();
+            unsafe {
+                let err = cuda_sys::lib().cuEventCreate(
+                    &mut e,
+                    cuda_sys::CUevent_flags::CU_EVENT_DISABLE_TIMING as u32,
+                );
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    log::warn!("HCS soft async reload: cuEventCreate failed: {:?}", err);
+                    return (0, 0.0);
+                }
+            }
+            hcs.soft_reload_event = Some(CudaEvent(e));
+        }
+        let reload_stream = hcs.soft_reload_stream.as_ref().unwrap().0;
+        let reload_event = hcs.soft_reload_event.as_ref().unwrap().0;
+
+        // Queue async DMA for each expert on the reload stream
+        let ranking = hcs.soft_ranking.clone();
+        let mut queued = 0usize;
+        let mut slot = 0usize;
+        let mut slot_to_expert: Vec<Option<(usize, usize)>> = vec![None; num_slots];
+        let mut pending_entries: Vec<(usize, usize, HcsCacheEntry)> = Vec::new();
+
+        for &(layer_idx, expert_idx) in &ranking {
+            if slot >= num_slots {
+                break;
+            }
+            let moe = match graph.moe_layers.get(layer_idx).and_then(|m| m.as_ref()) {
+                Some(m) => m,
+                None => continue,
+            };
+            if expert_idx >= moe.experts.len() {
+                continue;
+            }
+
+            let expert = &moe.experts[expert_idx];
+            let dst = soft_base + (slot as u64 * slot_size as u64);
+
+            let w13p_off = 0u64;
+            let w13s_off = expert.w13_packed_bytes as u64;
+            let w2p_off = w13s_off + expert.w13_scales_bytes as u64;
+            let w2s_off = w2p_off + expert.w2_packed_bytes as u64;
+
+            let mut ok = true;
+            unsafe {
+                for &(off, src_ptr, bytes) in &[
+                    (w13p_off, expert.w13_packed_ptr, expert.w13_packed_bytes),
+                    (w13s_off, expert.w13_scales_ptr, expert.w13_scales_bytes),
+                    (w2p_off, expert.w2_packed_ptr, expert.w2_packed_bytes),
+                    (w2s_off, expert.w2_scales_ptr, expert.w2_scales_bytes),
+                ] {
+                    let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        dst + off,
+                        src_ptr as *const std::ffi::c_void,
+                        bytes,
+                        reload_stream,
+                    );
+                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+
+            let entry = HcsCacheEntry {
+                d_buf: None,
+                w13_packed_offset: 0, w13_packed_size: 0,
+                w13_scales_offset: 0, w13_scales_size: 0,
+                w2_packed_offset: 0, w2_packed_size: 0,
+                w2_scales_offset: 0, w2_scales_size: 0,
+                ext_w13_packed: dst + w13p_off,
+                ext_w13_scales: dst + w13s_off,
+                ext_w2_packed: dst + w2p_off,
+                ext_w2_scales: dst + w2s_off,
+                pool_slot: None,
+            };
+            pending_entries.push((layer_idx, expert_idx, entry));
+            slot_to_expert[slot] = Some((layer_idx, expert_idx));
+            slot += 1;
+            queued += 1;
+        }
+
+        // Record event after all DMA
+        unsafe {
+            let err = cuda_sys::lib().cuEventRecord(reload_event, reload_stream);
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                log::warn!("HCS soft async reload: cuEventRecord failed: {:?}", err);
+            }
+        }
+
+        // Store the buffer and pending state (but don't activate cache entries yet)
+        hcs.soft_buf = Some(soft_buf);
+        hcs.soft_slot_to_expert = slot_to_expert;
+        hcs.soft_num_cached = queued;
+        hcs.soft_loaded = false; // Not yet — DMA still in flight
+        hcs.soft_reload_pending = true;
+        hcs.soft_reload_entries = pending_entries;
+        hcs.vram_bytes += alloc_bytes;
+
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("  \x1b[36mHCS soft: async reload queued {} experts ({:.1} MB) in {:.1}ms\x1b[0m",
+            queued, alloc_bytes as f64 / (1024.0 * 1024.0), elapsed_ms);
+        log::info!("HCS soft: async reload queued {} experts ({:.1} MB) in {:.1}ms",
+            queued, alloc_bytes as f64 / (1024.0 * 1024.0), elapsed_ms);
+
+        (queued, alloc_bytes as f64 / (1024.0 * 1024.0))
+    }
+
+    /// Check if async soft-tier reload DMA has completed.
+    /// If so, activate all cache entries and mark soft tier as loaded.
+    /// Returns true if the soft tier just became available this call.
+    pub fn hcs_check_soft_reload_complete(&mut self) -> bool {
+        let graph = match self.graph.as_mut() {
+            Some(g) => g,
+            None => return false,
+        };
+        let hcs = match graph.hcs.as_mut() {
+            Some(h) => h,
+            None => return false,
+        };
+
+        if !hcs.soft_reload_pending {
+            return false;
+        }
+
+        let event = match hcs.soft_reload_event {
+            Some(ref e) => e.0,
+            None => return false,
+        };
+
+        // Non-blocking check: is the DMA complete?
+        let result = unsafe { cuda_sys::lib().cuEventQuery(event) };
+        if result != cuda_sys::CUresult::CUDA_SUCCESS {
+            // CUDA_ERROR_NOT_READY means DMA still in flight
+            return false;
+        }
+
+        // DMA complete — activate all cache entries
+        let entries = std::mem::take(&mut hcs.soft_reload_entries);
+        let activated = entries.len();
+        for (layer_idx, expert_idx, entry) in entries {
+            hcs.cache_fast_set(layer_idx, expert_idx, &entry);
+            hcs.cache.insert((layer_idx, expert_idx), entry);
+        }
+        hcs.soft_loaded = true;
+        hcs.soft_reload_pending = false;
+        hcs.num_cached += activated;
+
+        eprintln!("  \x1b[32mHCS soft: async reload complete — {} experts activated\x1b[0m", activated);
+        log::info!("HCS soft: async reload complete — {} experts activated", activated);
+
+        true
+    }
+
     /// Generate tokens in a tight Rust loop via GPU decode.
     /// No Python, no GIL. Same interface as CpuDecodeStore.generate_stream.
     pub fn gpu_generate_stream<F>(
@@ -6505,6 +6747,9 @@ impl GpuDecodeStore {
         let mut step = 0usize;
         while step < max_tokens {
             let pos = start_position + step;
+
+            // Check if async soft-tier reload has completed
+            self.hcs_check_soft_reload_complete();
 
             if use_speculative {
                 // ── Phase 2: Batched Speculative Decode ──
