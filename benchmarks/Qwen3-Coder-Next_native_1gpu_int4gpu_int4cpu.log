@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-03-07 12:20:04
+Krasis Benchmark — 2026-03-08 10:14:47
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -7,9 +7,9 @@ PP Partition:     [48] (1 GPUs)
 
 Hardware:
   CPU:            AMD EPYC 7742 64-Core Processor (64 cores)
-  RAM:            1007 GB total, 79.1 GB used by process
-  GPU 0:          NVIDIA GeForce RTX 5090 (32607 MB), 6410 MB allocated
-  GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), N/A
+  RAM:            1007 GB total, 78.9 GB used by process
+  GPU 0:          NVIDIA GeForce RTX 5090 (32607 MB), 6333 MB allocated
+  GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), 0 MB allocated
 
 Quantization:
   GPU experts:    INT4 (Marlin)
@@ -26,25 +26,25 @@ Strategy:
   Mode:           gpu_decode (layer_grouped(2))
 
 Engine Prefill (6 runs at different lengths):
-  Run 1:  689.5 tok/s (1,101 tokens in 1596.9ms)
-  Run 2:  2,337.6 tok/s (5,407 tokens in 2313.1ms)
-  Run 3:  2,957.2 tok/s (9,961 tokens in 3368.4ms)
-  Run 4:  3,347.8 tok/s (20,309 tokens in 6066.4ms)
-  Run 5:  3,497.0 tok/s (35,122 tokens in 10043.6ms)
-  Run 6:  3,390.5 tok/s (50,418 tokens in 14870.2ms)
-  Best:   3,497.0 tok/s (35,122 tokens)
+  Run 1:  690.1 tok/s (1,101 tokens in 1595.5ms)
+  Run 2:  2,352.5 tok/s (5,407 tokens in 2298.5ms)
+  Run 3:  2,936.7 tok/s (9,961 tokens in 3391.9ms)
+  Run 4:  3,344.8 tok/s (20,309 tokens in 6071.9ms)
+  Run 5:  3,539.0 tok/s (35,122 tokens in 9924.3ms)
+  Run 6:  3,434.7 tok/s (50,418 tokens in 14678.9ms)
+  Best:   3,539.0 tok/s (35,122 tokens)
 
 Engine Decode (64 tokens, 3 runs, different prompts):
-  Run 1:  42.32 tok/s (23.6ms/tok)
-  Run 2:  47.56 tok/s (21.0ms/tok)
-  Run 3:  49.82 tok/s (20.1ms/tok)
-  Average: 46.57 tok/s (21.6ms/tok)
+  Run 1:  40.64 tok/s (24.6ms/tok)
+  Run 2:  46.54 tok/s (21.5ms/tok)
+  Run 3:  50.98 tok/s (19.6ms/tok)
+  Average: 46.05 tok/s (21.9ms/tok)
 
 Client TTFT (6 runs via HTTP at different lengths):
    1,101 tokens:  1.61s
-   5,407 tokens:  2.38s
-   9,961 tokens:  3.47s
-  20,309 tokens:  6.23s
-  35,122 tokens:  10.27s
-  50,418 tokens:  15.01s
+   5,407 tokens:  2.30s
+   9,961 tokens:  3.41s
+  20,309 tokens:  6.13s
+  35,122 tokens:  10.06s
+  50,418 tokens:  14.87s
 ================================================================

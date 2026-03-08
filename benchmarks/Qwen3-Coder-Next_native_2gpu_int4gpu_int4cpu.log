@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-02-22 08:45:58
+Krasis Benchmark — 2026-03-08 02:25:36
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -7,15 +7,14 @@ PP Partition:     [48] (2 GPUs)
 
 Hardware:
   CPU:            AMD EPYC 7742 64-Core Processor (64 cores)
-  RAM:            995 GB total, 76.6 GB used by process
-  GPU 0:          NVIDIA RTX 2000 Ada Generation (16380 MB), 5030 MB allocated
-  GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), 0 MB allocated
-  GPU 2:          NVIDIA RTX 2000 Ada Generation (16380 MB), 0 MB allocated
+  RAM:            1007 GB total, 80.3 GB used by process
+  GPU 0:          NVIDIA GeForce RTX 5090 (32607 MB), 6411 MB allocated
+  GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), 1983 MB allocated
 
 Quantization:
   GPU experts:    INT4 (Marlin)
   CPU experts:    INT4
-  Attention:      INT8
+  Attention:      BF16
   Shared expert:  INT8
   Dense MLP:      INT8
   LM head:        INT8
@@ -23,33 +22,29 @@ Quantization:
 
 Strategy:
   Layer group size: 2 (layer_grouped(2))
-  Prefill threshold: 300
-  Mode:           pure_cpu decode, layer_grouped(2) prefill
+  Prefill threshold: 1
+  Mode:           gpu_decode (layer_grouped(2))
 
-Prefill (10000 tokens, 3 runs):
-  Run 1:  798.9 tok/s, TTFT=12.52s
-  Run 2:  854.6 tok/s, TTFT=11.70s
-  Run 3:  847.6 tok/s, TTFT=11.80s
-  Average: 833.7 tok/s, TTFT=12.01s
+Engine Prefill (6 runs at different lengths):
+  Run 1:  687.2 tok/s (1,101 tokens in 1602.1ms)
+  Run 2:  2,296.3 tok/s (5,407 tokens in 2354.7ms)
+  Run 3:  2,898.7 tok/s (9,961 tokens in 3436.4ms)
+  Run 4:  3,256.6 tok/s (20,309 tokens in 6236.2ms)
+  Run 5:  3,490.5 tok/s (35,122 tokens in 10062.3ms)
+  Run 6:  3,415.7 tok/s (50,418 tokens in 14760.7ms)
+  Best:   3,490.5 tok/s (35,122 tokens)
 
-Decode (64 tokens, 3 runs):
-  Run 1:  10.66 tok/s (93.8ms/tok)
-  Run 2:  10.59 tok/s (94.4ms/tok)
-  Run 3:  10.54 tok/s (94.9ms/tok)
-  Average: 10.60 tok/s (94.4ms/tok)
+Engine Decode (64 tokens, 3 runs, different prompts):
+  Run 1:  31.89 tok/s (31.4ms/tok)
+  Run 2:  34.27 tok/s (29.2ms/tok)
+  Run 3:  33.86 tok/s (29.5ms/tok)
+  Average: 33.34 tok/s (30.0ms/tok)
 
-Verification:
-  Prefill prompt: user
-Distributed consensus algorithms form the backbone of modern fault-tolerant systems. The Paxos algorithm, proposed by Leslie Lamport, achieves consensus among a group of processes even when some ... [52428 chars total]
-  Decode prompt:  Write a poem about recursion in programming at least 100 words long.
-  Generated output (64 tokens):
-    **The Recursive Ladder**
-    
-    A function calls itself—no error, no dread,  
-    A mirror reflecting its own inner thread.  
-    Like a dream within a dream, deep and profound,  
-    It spirals inward on common ground.  
-    
-    *"Base case first!"* whispers the sage in the night—  
-    A guard
+Client TTFT (6 runs via HTTP at different lengths):
+   1,101 tokens:  1.61s
+   5,407 tokens:  2.36s
+   9,961 tokens:  3.42s
+  20,309 tokens:  6.23s
+  35,122 tokens:  10.14s
+  50,418 tokens:  14.83s
 ================================================================

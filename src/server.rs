@@ -91,6 +91,12 @@ struct ServerState {
     /// When true, log wall-clock time for each Python GIL acquisition.
     /// Enabled by KRASIS_GIL_TIMING=1. Zero cost when off (branch only).
     gil_timing: bool,
+    /// Multi-GPU: auxiliary store address (0 = single GPU mode).
+    aux_gpu_store_addr: usize,
+    /// Multi-GPU: layer index where GPU0 segment ends and GPU1 segment begins.
+    multi_gpu_split_layer: usize,
+    /// Multi-GPU: number of GQA layers before the split point (for KV cache indexing on GPU1).
+    multi_gpu_gqa_offset: usize,
 }
 
 /// Parsed HTTP request.
@@ -570,6 +576,7 @@ fn handle_chat_completion(
     let t_evict = Instant::now();
     let store_for_evict = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
     let (evicted, _freed_mb) = store_for_evict.hcs_evict_for_prefill(estimated_tokens);
+    // NOTE: aux GPU never does prefill, so no eviction needed there
     let evict_ms = t_evict.elapsed().as_secs_f64() * 1000.0;
 
     // ── Call Python for prefill (GIL required) ──
@@ -670,6 +677,18 @@ fn handle_chat_completion(
         let (queued, _alloc_mb) = store.hcs_reload_after_prefill_async();
         log::info!("Request {}: HCS soft async reload queued {} experts (evicted {} for prefill)",
             request_id, queued, evicted);
+    }
+    // NOTE: aux GPU has no soft tier (100% hard), no eviction/reload needed
+    // ── Multi-GPU: copy KV cache from GPU0 to GPU1 after prefill ──
+    if state.aux_gpu_store_addr != 0 {
+        let t_kvcopy = Instant::now();
+        let aux_store = unsafe { &mut *(state.aux_gpu_store_addr as *mut GpuDecodeStore) };
+        if let Err(e) = store.copy_kv_to_aux(aux_store, state.multi_gpu_split_layer, state.multi_gpu_gqa_offset, prompt_len) {
+            log::error!("Request {}: KV cache copy to aux GPU failed: {}", request_id, e);
+        } else {
+            let kvcopy_ms = t_kvcopy.elapsed().as_secs_f64() * 1000.0;
+            log::info!("Request {}: KV cache copied to aux GPU in {:.1}ms", request_id, kvcopy_ms);
+        }
     }
     let reload_ms = t_reload.elapsed().as_secs_f64() * 1000.0;
 
@@ -829,70 +848,93 @@ fn handle_gpu_decode(
             }
         }
 
-        store.gpu_generate_stream(
-            first_token,
-            prompt_len,
-            max_tokens.saturating_sub(1),
-            temperature,
-            top_k,
-            top_p,
-            stop_ids,
-            tokenizer,
-            presence_penalty,
-            |_token_id, text, finish_reason| {
-                decode_token_count += 1;
+        // Shared callback for both single-GPU and multi-GPU decode
+        let mut on_token = |_token_id: usize, text: &str, finish_reason: Option<&str>| -> bool {
+            decode_token_count += 1;
 
-                if has_tools {
-                    tc_all_text.push_str(text);
-                    if let Some(fr) = finish_reason {
-                        tc_finish = fr.to_string();
-                    }
+            if has_tools {
+                tc_all_text.push_str(text);
+                if let Some(fr) = finish_reason {
+                    tc_finish = fr.to_string();
+                }
 
-                    if tc_in_tool_call {
-                        // Inside a tool call block — buffer silently
-                    } else if text.contains("<tool_call>") {
-                        // Entering tool call territory
-                        tc_in_tool_call = true;
-                        tc_found = true;
-                        // Send any content before the marker in this text
-                        if let Some(idx) = text.find("<tool_call>") {
-                            let before = &text[..idx];
-                            if !before.is_empty() {
-                                let chunk = format_sse_token(
-                                    request_id, model_name, before, None, created,
-                                );
-                                let _ = tx.send(format!("data: {}\n\n", chunk));
-                            }
-                        }
-                    } else {
-                        // Normal content — stream it (no finish_reason; handled post-generation)
-                        if !text.is_empty() {
+                if tc_in_tool_call {
+                    // Inside a tool call block — buffer silently
+                } else if text.contains("<tool_call>") {
+                    // Entering tool call territory
+                    tc_in_tool_call = true;
+                    tc_found = true;
+                    // Send any content before the marker in this text
+                    if let Some(idx) = text.find("<tool_call>") {
+                        let before = &text[..idx];
+                        if !before.is_empty() {
                             let chunk = format_sse_token(
-                                request_id, model_name, text, None, created,
+                                request_id, model_name, before, None, created,
                             );
                             let _ = tx.send(format!("data: {}\n\n", chunk));
                         }
                     }
-
-                    if writer_disconnected.load(Ordering::Acquire) {
-                        return false;
-                    }
-                    true
                 } else {
-                    // Original non-tool path
-                    let chunk = format_sse_token(
-                        request_id, model_name, text, finish_reason, created,
-                    );
-                    let formatted = format!("data: {}\n\n", chunk);
-                    if tx.send(formatted).is_err()
-                        || writer_disconnected.load(Ordering::Acquire)
-                    {
-                        return false;
+                    // Normal content — stream it (no finish_reason; handled post-generation)
+                    if !text.is_empty() {
+                        let chunk = format_sse_token(
+                            request_id, model_name, text, None, created,
+                        );
+                        let _ = tx.send(format!("data: {}\n\n", chunk));
                     }
-                    true
                 }
-            },
-        );
+
+                if writer_disconnected.load(Ordering::Acquire) {
+                    return false;
+                }
+                true
+            } else {
+                // Original non-tool path
+                let chunk = format_sse_token(
+                    request_id, model_name, text, finish_reason, created,
+                );
+                let formatted = format!("data: {}\n\n", chunk);
+                if tx.send(formatted).is_err()
+                    || writer_disconnected.load(Ordering::Acquire)
+                {
+                    return false;
+                }
+                true
+            }
+        };
+
+        if state.aux_gpu_store_addr != 0 {
+            // Multi-GPU decode: GPU0 layers [0..split), GPU1 layers [split..N)
+            store.gpu_generate_stream_multi(
+                state.aux_gpu_store_addr,
+                state.multi_gpu_split_layer,
+                state.multi_gpu_gqa_offset,
+                first_token,
+                prompt_len,
+                max_tokens.saturating_sub(1),
+                temperature,
+                top_k,
+                top_p,
+                stop_ids,
+                tokenizer,
+                presence_penalty,
+                &mut on_token,
+            );
+        } else {
+            // Single-GPU decode
+            store.gpu_generate_stream(
+                first_token,
+                prompt_len,
+                max_tokens.saturating_sub(1),
+                temperature,
+                top_k,
+                top_p,
+                stop_ids,
+                tokenizer,
+                presence_penalty,
+                on_token,
+            );
+        }
 
         // ── Post-generation: emit tool calls or finish ──
         if has_tools {
@@ -962,25 +1004,46 @@ fn handle_gpu_decode(
         let mut total_tokens = 1usize;
         let mut finish = "length".to_string();
 
-        store.gpu_generate_stream(
-            first_token,
-            prompt_len,
-            max_tokens.saturating_sub(1),
-            temperature,
-            top_k,
-            top_p,
-            stop_ids,
-            tokenizer,
-            presence_penalty,
-            |_token_id, text, finish_reason| {
+        {
+            let mut on_token = |_token_id: usize, text: &str, finish_reason: Option<&str>| -> bool {
                 all_text.push_str(text);
                 total_tokens += 1;
                 if let Some(fr) = finish_reason {
                     finish = fr.to_string();
                 }
                 true
-            },
-        );
+            };
+            if state.aux_gpu_store_addr != 0 {
+                store.gpu_generate_stream_multi(
+                    state.aux_gpu_store_addr,
+                    state.multi_gpu_split_layer,
+                    state.multi_gpu_gqa_offset,
+                    first_token,
+                    prompt_len,
+                    max_tokens.saturating_sub(1),
+                    temperature,
+                    top_k,
+                    top_p,
+                    stop_ids,
+                    tokenizer,
+                    presence_penalty,
+                    &mut on_token,
+                );
+            } else {
+                store.gpu_generate_stream(
+                    first_token,
+                    prompt_len,
+                    max_tokens.saturating_sub(1),
+                    temperature,
+                    top_k,
+                    top_p,
+                    stop_ids,
+                    tokenizer,
+                    presence_penalty,
+                    on_token,
+                );
+            }
+        }
 
         if has_tools {
             let (content, tool_calls) = parse_tool_calls(&all_text);
@@ -1023,12 +1086,15 @@ pub struct RustServer {
     gpu_store_addr: usize,
     py_model: Py<PyAny>,
     running: Arc<AtomicBool>,
+    aux_gpu_store_addr: usize,
+    multi_gpu_split_layer: usize,
+    multi_gpu_gqa_offset: usize,
 }
 
 #[pymethods]
 impl RustServer {
     #[new]
-    #[pyo3(signature = (py_model, host, port, model_name, tokenizer_path, max_context_tokens, enable_thinking=true, gpu_store_addr=0))]
+    #[pyo3(signature = (py_model, host, port, model_name, tokenizer_path, max_context_tokens, enable_thinking=true, gpu_store_addr=0, aux_gpu_store_addr=0, multi_gpu_split_layer=0, multi_gpu_gqa_offset=0))]
     fn new(
         py_model: PyObject,
         host: String,
@@ -1038,6 +1104,9 @@ impl RustServer {
         max_context_tokens: usize,
         enable_thinking: bool,
         gpu_store_addr: usize,
+        aux_gpu_store_addr: usize,
+        multi_gpu_split_layer: usize,
+        multi_gpu_gqa_offset: usize,
     ) -> Self {
         Self {
             host,
@@ -1049,6 +1118,9 @@ impl RustServer {
             gpu_store_addr,
             py_model: py_model.into(),
             running: Arc::new(AtomicBool::new(false)),
+            aux_gpu_store_addr,
+            multi_gpu_split_layer,
+            multi_gpu_gqa_offset,
         }
     }
 
@@ -1064,6 +1136,9 @@ impl RustServer {
         let max_context_tokens = self.max_context_tokens;
         let default_enable_thinking = self.default_enable_thinking;
         let gpu_store_addr = self.gpu_store_addr;
+        let aux_gpu_store_addr = self.aux_gpu_store_addr;
+        let multi_gpu_split_layer = self.multi_gpu_split_layer;
+        let multi_gpu_gqa_offset = self.multi_gpu_gqa_offset;
         let running = self.running.clone();
 
         // Install raw SIGINT handler BEFORE releasing the GIL.
@@ -1128,6 +1203,9 @@ impl RustServer {
                 default_enable_thinking,
                 gpu_store_addr,
                 gil_timing,
+                aux_gpu_store_addr,
+                multi_gpu_split_layer,
+                multi_gpu_gqa_offset,
             };
 
             while running.load(Ordering::Acquire) {
@@ -1202,10 +1280,11 @@ impl RustServer {
             base_count + 200
         };
 
-        // Evict soft HCS before prefill
+        // Evict soft HCS before prefill (both stores in multi-GPU)
         let store = unsafe { &mut *(self.gpu_store_addr as *mut GpuDecodeStore) };
         let t_evict = Instant::now();
         let (evicted, _) = store.hcs_evict_for_prefill(estimated_tokens);
+        // NOTE: aux GPU never does prefill, so no eviction needed there
         let evict_ms = t_evict.elapsed().as_secs_f64() * 1000.0;
 
         // Prefill (Python, GIL held)
@@ -1235,11 +1314,20 @@ impl RustServer {
             .unwrap_or(false);
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
 
-        // Reload soft HCS after prefill
+        // Copy KV cache to aux store (multi-GPU)
+        if self.aux_gpu_store_addr != 0 {
+            let aux_store = unsafe { &mut *(self.aux_gpu_store_addr as *mut GpuDecodeStore) };
+            if let Err(e) = store.copy_kv_to_aux(aux_store, self.multi_gpu_split_layer, self.multi_gpu_gqa_offset, prompt_len) {
+                log::error!("benchmark_request: KV copy to aux failed: {}", e);
+            }
+        }
+
+        // Reload soft HCS after prefill (both stores)
         let t_reload = Instant::now();
         if evicted > 0 {
             store.hcs_reload_after_prefill_async();
         }
+        // NOTE: aux GPU has no soft tier (100% hard), no eviction/reload needed
         let reload_ms = t_reload.elapsed().as_secs_f64() * 1000.0;
 
         // Decode (pure Rust, GIL held but unused by decode loop)
@@ -1248,21 +1336,42 @@ impl RustServer {
         } else {
             let decode_start = Instant::now();
             let mut count = 0usize;
-            store.gpu_generate_stream(
-                first_token,
-                prompt_len,
-                max_new_tokens.saturating_sub(1),
-                temperature,
-                50,     // top_k
-                0.95,   // top_p
-                &stop_ids,
-                &tokenizer,
-                0.0,    // presence_penalty
-                |_token_id, _text, _finish_reason| {
-                    count += 1;
-                    true
-                },
-            );
+            if self.aux_gpu_store_addr != 0 {
+                store.gpu_generate_stream_multi(
+                    self.aux_gpu_store_addr,
+                    self.multi_gpu_split_layer,
+                    self.multi_gpu_gqa_offset,
+                    first_token,
+                    prompt_len,
+                    max_new_tokens.saturating_sub(1),
+                    temperature,
+                    50,     // top_k
+                    0.95,   // top_p
+                    &stop_ids,
+                    &tokenizer,
+                    0.0,    // presence_penalty
+                    |_token_id: usize, _text: &str, _finish_reason: Option<&str>| {
+                        count += 1;
+                        true
+                    },
+                );
+            } else {
+                store.gpu_generate_stream(
+                    first_token,
+                    prompt_len,
+                    max_new_tokens.saturating_sub(1),
+                    temperature,
+                    50,     // top_k
+                    0.95,   // top_p
+                    &stop_ids,
+                    &tokenizer,
+                    0.0,    // presence_penalty
+                    |_token_id, _text, _finish_reason| {
+                        count += 1;
+                        true
+                    },
+                );
+            }
             let elapsed = decode_start.elapsed().as_secs_f64();
             let total = count + 1; // includes first_token from prefill
             let tok_s = if elapsed > 0.0 && count > 0 {

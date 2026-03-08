@@ -634,16 +634,9 @@ class KrasisModel:
         self._init_kv_caches()
         _vram_checkpoint("after-kv-cache-init")
 
-        # Phase 4: CPU Hub (for multi-GPU prefill coordination)
-        if len(self.all_devices) > 1 and self.krasis_engine is not None:
-            self.cpu_hub = CPUHubManager(
-                num_gpus=len(self.all_devices),
-                hidden_size=self.cfg.hidden_size,
-                engine=self.krasis_engine,
-            )
-            logger.info("CPU Hub initialized for %d GPUs", len(self.all_devices))
-        else:
-            self.cpu_hub = None
+        # Phase 4: CPU Hub — disabled.  Multi-GPU uses layer-split decode,
+        # not Expert Parallelism.  Prefill runs on primary GPU only.
+        self.cpu_hub = None
 
         # Load tokenizer — override eos_token_id from tokenizer (authoritative)
         # config.json may have wrong eos_token_id (e.g. Qwen3.5 has endoftext=248044
@@ -1554,14 +1547,20 @@ class KrasisModel:
         logger.info("Routing weights sent to Rust engine (%d MoE layers)", moe_idx)
 
     def _init_gpu_prefill(self):
-        """Create GpuPrefillManager per device and wire to MoE layers on ALL devices."""
+        """Create GpuPrefillManager for primary GPU only.
+
+        In multi-GPU mode, prefill runs exclusively on the primary GPU (most VRAM).
+        Aux GPUs are only used for decode (layer-split with HCS).
+        """
         from krasis.gpu_prefill import GpuPrefillManager
 
         engine_ref = getattr(self, 'krasis_engine', None)
         num_moe_layers = self.cfg.num_hidden_layers - self.cfg.first_k_dense_replace
-        num_ranks = len(self.all_devices)
+        # Only create prefill manager for primary GPU — aux GPUs are decode-only
+        prefill_devices = [self.all_devices[0]]
+        num_ranks = 1
 
-        for i, dev in enumerate(self.all_devices):
+        for i, dev in enumerate(prefill_devices):
             dev_str = str(dev)
             if dev_str not in self.gpu_prefill_managers:
                 manager = GpuPrefillManager(
@@ -3573,6 +3572,7 @@ class KrasisModel:
                 raise RuntimeError("GPU decode store not configured. Call setup_gpu_decode_store() first.")
             self._export_kv_to_rust(seq_states_per_rank, len(prompt_tokens))
             self._update_la_state_ptrs()
+            self._update_la_state_ptrs_aux()
             decode_tokens = gpu_store.gpu_generate_batch(
                 first_token=next_token,
                 start_position=len(prompt_tokens),
@@ -3715,6 +3715,7 @@ class KrasisModel:
             raise RuntimeError("GpuDecodeStore not configured. Call setup_gpu_decode_store() first.")
         self._export_kv_to_rust(seq_states, len(prompt_tokens))
         self._update_la_state_ptrs()
+        self._update_la_state_ptrs_aux()
         store_addr = gpu_store.gpu_store_addr()
 
         class _Result:
@@ -4009,6 +4010,315 @@ class KrasisModel:
                      len(self.layers), store.gpu_store_addr())
         return store
 
+    def setup_gpu_decode_store_aux(self, gpu_idx: int, split_layer: int) -> "GpuDecodeStore":
+        """Create an auxiliary GpuDecodeStore for multi-GPU decode.
+
+        Sets up a second store on gpu_idx for layers [split_layer..num_layers).
+        Registers attention weights (copied to aux GPU), KV cache (allocated on
+        aux GPU), MoE layers, final norm, LM head, and RoPE on the aux GPU.
+        """
+        from krasis import GpuDecodeStore
+        import torch
+
+        aux_device = torch.device(f"cuda:{gpu_idx}")
+        primary_device = torch.device(self.ranks[0].device)
+
+        store = GpuDecodeStore(gpu_idx)
+
+        # Same configure as primary
+        max_qkv = self.cfg.hidden_size * 3
+        for layer in self.layers:
+            if layer.layer_type == "linear_attention":
+                attn = layer.attention
+                qkvz_out = attn.num_k_heads * (2 * attn.k_head_dim + 2 * attn.head_ratio * attn.v_head_dim)
+                max_qkv = max(max_qkv, qkvz_out)
+            elif hasattr(layer.attention, 'num_heads'):
+                ga = layer.attention
+                q_sz = ga.num_heads * ga.head_dim * (2 if ga.gated_attention else 1)
+                kv_sz = ga.num_kv_heads * ga.head_dim
+                max_qkv = max(max_qkv, q_sz + kv_sz * 2)
+
+        store.configure(
+            hidden_size=self.cfg.hidden_size,
+            num_layers=len(self.layers),
+            vocab_size=self.cfg.vocab_size,
+            eps=self.cfg.rms_norm_eps,
+            max_experts_per_tok=self.cfg.num_experts_per_tok,
+            max_intermediate_size=self.cfg.moe_intermediate_size,
+            max_qkv_size=max_qkv,
+            group_size=128,
+        )
+
+        # Embedding — not needed on aux (segment_skip_embedding=true), but register
+        # a dummy so configure doesn't complain. Use primary embedding ptr (not accessed).
+        store.set_embedding(self.embedding.data_ptr())
+
+        # Final norm — copy to aux GPU
+        fn_aux = self.final_norm.to(aux_device).contiguous()
+        self._aux_final_norm = fn_aux  # prevent GC
+        store.set_final_norm(fn_aux.data_ptr(), self.cfg.hidden_size)
+
+        # LM head — copy to aux GPU (needed for final segment)
+        # Dequantize on CPU to avoid OOM on GPU0 (LM head is ~1.2 GB in BF16)
+        lm_head_w = self.lm_head_data
+        if isinstance(lm_head_w, tuple):
+            w_int8, scale = lm_head_w
+            lm_head_bf16 = (w_int8.cpu().float() * scale.cpu().unsqueeze(1)).to(torch.bfloat16).contiguous().to(aux_device)
+        else:
+            lm_head_bf16 = lm_head_w.to(aux_device).contiguous()
+        self._aux_lm_head = lm_head_bf16
+        lm_head_wid = store.register_weight(lm_head_bf16.data_ptr(), lm_head_bf16.shape[0], lm_head_bf16.shape[1], 0)
+        store.set_lm_head(lm_head_wid)
+
+        store.set_norm_bias_one(getattr(self.cfg, 'norm_bias_one', False))
+
+        # Keep references to aux GPU weight copies
+        self._aux_decode_weights = []
+        aux_rope_set = False
+        gqa_count_before_split = 0
+
+        for layer_idx, layer in enumerate(self.layers):
+            attn = layer.attention
+            inp_norm = layer.input_norm_weight
+            post_norm = layer.post_attn_norm_weight
+
+            # Count GQA layers before split for gqa_cache_offset
+            if layer_idx < split_layer and layer.layer_type != "linear_attention":
+                gqa_count_before_split += 1
+
+            if layer.layer_type == "linear_attention":
+                if layer_idx >= split_layer:
+                    # Copy LA weights to aux GPU
+                    qkvz_w = attn.in_proj_qkvz.to(aux_device, non_blocking=True)
+                    ba_w = attn.in_proj_ba.to(aux_device, non_blocking=True)
+                    out_w = attn.out_proj.to(aux_device, non_blocking=True)
+                    self._aux_decode_weights.extend([qkvz_w, ba_w, out_w])
+                    qkvz_wid = store.register_weight(qkvz_w.data_ptr(), qkvz_w.shape[0], qkvz_w.shape[1], 0)
+                    ba_wid = store.register_weight(ba_w.data_ptr(), ba_w.shape[0], ba_w.shape[1], 0)
+                    out_wid = store.register_weight(out_w.data_ptr(), out_w.shape[0], out_w.shape[1], 0)
+
+                    # Copy norm weights to aux GPU
+                    inp_norm_aux = inp_norm.to(aux_device, non_blocking=True)
+                    post_norm_aux = post_norm.to(aux_device, non_blocking=True)
+                    self._aux_decode_weights.extend([inp_norm_aux, post_norm_aux])
+
+                    # Copy LA-specific weights
+                    conv_w = attn.conv1d_weight.squeeze(1).contiguous().float().to(aux_device)
+                    attn._aux_conv_state = attn._conv_state.squeeze(0).float().contiguous().to(aux_device) if attn._conv_state is not None else torch.zeros(attn.conv_dim, attn.kernel_dim, device=aux_device, dtype=torch.float32)
+                    attn._aux_norm_weight = attn.norm_weight.float().contiguous().to(aux_device)
+                    attn._aux_recur_state = attn._recurrent_state.squeeze(0).float().contiguous().to(aux_device) if attn._recurrent_state is not None else torch.zeros(attn.num_k_heads, attn.k_head_dim, attn.head_ratio * attn.v_head_dim, device=aux_device, dtype=torch.float32)
+                    attn._aux_a_log = attn.A_log.float().contiguous().to(aux_device)
+                    attn._aux_dt_bias = attn.dt_bias.float().contiguous().to(aux_device)
+                    self._aux_decode_weights.extend([conv_w, attn._aux_conv_state, attn._aux_norm_weight, attn._aux_recur_state, attn._aux_a_log, attn._aux_dt_bias])
+
+                    store.register_la_layer(
+                        layer_idx=layer_idx,
+                        input_norm_ptr=inp_norm_aux.data_ptr(), input_norm_size=inp_norm_aux.numel(),
+                        post_attn_norm_ptr=post_norm_aux.data_ptr(), post_attn_norm_size=post_norm_aux.numel(),
+                        in_proj_qkvz_wid=qkvz_wid, in_proj_ba_wid=ba_wid, out_proj_wid=out_wid,
+                        conv_weight_ptr=conv_w.data_ptr(),
+                        a_log_ptr=attn._aux_a_log.data_ptr(),
+                        dt_bias_ptr=attn._aux_dt_bias.data_ptr(),
+                        norm_weight_ptr=attn._aux_norm_weight.data_ptr(),
+                        conv_state_ptr=attn._aux_conv_state.data_ptr(),
+                        recur_state_ptr=attn._aux_recur_state.data_ptr(),
+                        nk=attn.num_k_heads, nv=attn.num_v_heads,
+                        dk=attn.k_head_dim, dv=attn.v_head_dim,
+                        hr=attn.head_ratio,
+                        kernel_dim=attn.kernel_dim, conv_dim=attn.conv_dim,
+                        scale=attn.scale,
+                    )
+                else:
+                    # Layers before split — register placeholder (won't be executed)
+                    store.register_la_layer(
+                        layer_idx=layer_idx,
+                        input_norm_ptr=inp_norm.data_ptr(), input_norm_size=inp_norm.numel(),
+                        post_attn_norm_ptr=post_norm.data_ptr(), post_attn_norm_size=post_norm.numel(),
+                        in_proj_qkvz_wid=store.register_weight(attn.in_proj_qkvz.data_ptr(), attn.in_proj_qkvz.shape[0], attn.in_proj_qkvz.shape[1], 0),
+                        in_proj_ba_wid=store.register_weight(attn.in_proj_ba.data_ptr(), attn.in_proj_ba.shape[0], attn.in_proj_ba.shape[1], 0),
+                        out_proj_wid=store.register_weight(attn.out_proj.data_ptr(), attn.out_proj.shape[0], attn.out_proj.shape[1], 0),
+                        conv_weight_ptr=attn._rust_conv_weight.data_ptr() if hasattr(attn, '_rust_conv_weight') else 0,
+                        a_log_ptr=attn._rust_a_log.data_ptr() if hasattr(attn, '_rust_a_log') else 0,
+                        dt_bias_ptr=attn._rust_dt_bias.data_ptr() if hasattr(attn, '_rust_dt_bias') else 0,
+                        norm_weight_ptr=attn._rust_norm_weight.data_ptr() if hasattr(attn, '_rust_norm_weight') else 0,
+                        conv_state_ptr=attn._rust_conv_state.data_ptr() if hasattr(attn, '_rust_conv_state') else 0,
+                        recur_state_ptr=attn._rust_recur_state.data_ptr() if hasattr(attn, '_rust_recur_state') else 0,
+                        nk=attn.num_k_heads, nv=attn.num_v_heads,
+                        dk=attn.k_head_dim, dv=attn.v_head_dim,
+                        hr=attn.head_ratio,
+                        kernel_dim=attn.kernel_dim, conv_dim=attn.conv_dim,
+                        scale=attn.scale,
+                    )
+            else:
+                # GQA attention
+                if layer_idx >= split_layer:
+                    # Copy GQA weights to aux GPU
+                    q_w = attn.q_proj.to(aux_device, non_blocking=True)
+                    k_w = attn.k_proj.to(aux_device, non_blocking=True)
+                    v_w = attn.v_proj.to(aux_device, non_blocking=True)
+                    o_w = attn.o_proj.to(aux_device, non_blocking=True)
+                    self._aux_decode_weights.extend([q_w, k_w, v_w, o_w])
+                    q_wid = store.register_weight(q_w.data_ptr(), q_w.shape[0], q_w.shape[1], 0)
+                    k_wid = store.register_weight(k_w.data_ptr(), k_w.shape[0], k_w.shape[1], 0)
+                    v_wid = store.register_weight(v_w.data_ptr(), v_w.shape[0], v_w.shape[1], 0)
+                    o_wid = store.register_weight(o_w.data_ptr(), o_w.shape[0], o_w.shape[1], 0)
+
+                    # Copy norm weights to aux GPU
+                    inp_norm_aux = inp_norm.to(aux_device, non_blocking=True)
+                    post_norm_aux = post_norm.to(aux_device, non_blocking=True)
+                    self._aux_decode_weights.extend([inp_norm_aux, post_norm_aux])
+
+                    # QK norms
+                    if attn.q_norm is not None:
+                        q_norm_aux = attn.q_norm.float().contiguous().to(aux_device)
+                        self._aux_decode_weights.append(q_norm_aux)
+                        q_norm_ptr = q_norm_aux.data_ptr()
+                    else:
+                        q_norm_ptr = 0
+                    if attn.k_norm is not None:
+                        k_norm_aux = attn.k_norm.float().contiguous().to(aux_device)
+                        self._aux_decode_weights.append(k_norm_aux)
+                        k_norm_ptr = k_norm_aux.data_ptr()
+                    else:
+                        k_norm_ptr = 0
+
+                    store.register_gqa_layer(
+                        layer_idx=layer_idx,
+                        input_norm_ptr=inp_norm_aux.data_ptr(), input_norm_size=inp_norm_aux.numel(),
+                        post_attn_norm_ptr=post_norm_aux.data_ptr(), post_attn_norm_size=post_norm_aux.numel(),
+                        q_proj_wid=q_wid, k_proj_wid=k_wid,
+                        v_proj_wid=v_wid, o_proj_wid=o_wid,
+                        fused_qkv_wid=None,
+                        num_heads=attn.num_heads, num_kv_heads=attn.num_kv_heads,
+                        head_dim=attn.head_dim, sm_scale=attn.sm_scale,
+                        q_norm_ptr=q_norm_ptr, k_norm_ptr=k_norm_ptr,
+                        gated=attn.gated_attention,
+                    )
+
+                    # RoPE tables on aux GPU (from first GQA layer in segment)
+                    if not aux_rope_set:
+                        max_seq = max(
+                            c.max_context_tokens for c in self.kv_caches if c is not None
+                        )
+                        cos, sin = attn._get_rope_cos_sin(max_seq)
+                        cos_f32 = cos.float().contiguous().to(aux_device)
+                        sin_f32 = sin.float().contiguous().to(aux_device)
+                        self._aux_rope_cos = cos_f32
+                        self._aux_rope_sin = sin_f32
+                        store.set_rope_tables(
+                            cos_f32.data_ptr(), sin_f32.data_ptr(),
+                            cos_f32.shape[1], max_seq,
+                        )
+                        aux_rope_set = True
+                else:
+                    # Layers before split — register placeholder
+                    q_wid = store.register_weight(attn.q_proj.data_ptr(), attn.q_proj.shape[0], attn.q_proj.shape[1], 0)
+                    k_wid = store.register_weight(attn.k_proj.data_ptr(), attn.k_proj.shape[0], attn.k_proj.shape[1], 0)
+                    v_wid = store.register_weight(attn.v_proj.data_ptr(), attn.v_proj.shape[0], attn.v_proj.shape[1], 0)
+                    o_wid = store.register_weight(attn.o_proj.data_ptr(), attn.o_proj.shape[0], attn.o_proj.shape[1], 0)
+                    if attn.q_norm is not None:
+                        q_norm_ptr = attn._rust_q_norm.data_ptr() if hasattr(attn, '_rust_q_norm') else 0
+                    else:
+                        q_norm_ptr = 0
+                    if attn.k_norm is not None:
+                        k_norm_ptr = attn._rust_k_norm.data_ptr() if hasattr(attn, '_rust_k_norm') else 0
+                    else:
+                        k_norm_ptr = 0
+                    store.register_gqa_layer(
+                        layer_idx=layer_idx,
+                        input_norm_ptr=inp_norm.data_ptr(), input_norm_size=inp_norm.numel(),
+                        post_attn_norm_ptr=post_norm.data_ptr(), post_attn_norm_size=post_norm.numel(),
+                        q_proj_wid=q_wid, k_proj_wid=k_wid,
+                        v_proj_wid=v_wid, o_proj_wid=o_wid,
+                        fused_qkv_wid=None,
+                        num_heads=attn.num_heads, num_kv_heads=attn.num_kv_heads,
+                        head_dim=attn.head_dim, sm_scale=attn.sm_scale,
+                        q_norm_ptr=q_norm_ptr, k_norm_ptr=k_norm_ptr,
+                        gated=attn.gated_attention,
+                    )
+
+            # Register MLP type
+            if layer.is_moe:
+                store.register_mlp(layer_idx, "moe")
+            elif layer.dense_mlp is not None:
+                if layer_idx >= split_layer:
+                    gp = layer.dense_mlp["gate_proj"].to(aux_device, non_blocking=True)
+                    up = layer.dense_mlp["up_proj"].to(aux_device, non_blocking=True)
+                    dp = layer.dense_mlp["down_proj"].to(aux_device, non_blocking=True)
+                    self._aux_decode_weights.extend([gp, up, dp])
+                    gp_wid = store.register_weight(gp.data_ptr(), gp.shape[0], gp.shape[1], 0)
+                    up_wid = store.register_weight(up.data_ptr(), up.shape[0], up.shape[1], 0)
+                    dp_wid = store.register_weight(dp.data_ptr(), dp.shape[0], dp.shape[1], 0)
+                else:
+                    gp = layer.dense_mlp["gate_proj"]
+                    up = layer.dense_mlp["up_proj"]
+                    dp = layer.dense_mlp["down_proj"]
+                    gp_wid = store.register_weight(gp.data_ptr(), gp.shape[0], gp.shape[1], 0)
+                    up_wid = store.register_weight(up.data_ptr(), up.shape[0], up.shape[1], 0)
+                    dp_wid = store.register_weight(dp.data_ptr(), dp.shape[0], dp.shape[1], 0)
+                store.register_mlp(layer_idx, "dense",
+                                   gate_proj_wid=gp_wid, up_proj_wid=up_wid, down_proj_wid=dp_wid)
+            else:
+                store.register_mlp(layer_idx, "none")
+
+        # Register MoE expert data from engine (same engine, same CPU RAM data)
+        if self.krasis_engine is not None:
+            store.setup_from_engine(self.krasis_engine)
+
+        # Shared expert gates for aux layers
+        self._aux_shared_gate_refs = []
+        for layer_idx, layer in enumerate(self.layers):
+            if layer.is_moe and layer.shared_expert_gate is not None:
+                if layer_idx >= split_layer:
+                    sg = layer.shared_expert_gate.to(aux_device, non_blocking=True)
+                    self._aux_shared_gate_refs.append(sg)
+                    sg_wid = store.register_weight(sg.data_ptr(), sg.shape[0], sg.shape[1], 0)
+                else:
+                    sg = layer.shared_expert_gate
+                    sg_wid = store.register_weight(sg.data_ptr(), sg.shape[0], sg.shape[1], 0)
+                store.set_moe_shared_gate_wid(layer_idx, sg_wid)
+
+        # Allocate KV cache on aux GPU for GQA layers in GPU1's segment
+        cache = self.kv_caches[0]
+        if cache is not None and cache.k_cache is not None:
+            kv_ptrs = []
+            gqa_cache_idx = 0
+            for layer_idx, layer in enumerate(self.layers):
+                if layer.layer_type != "linear_attention":
+                    if layer_idx >= split_layer:
+                        # Allocate FP8 KV cache on aux GPU matching primary's shape
+                        k_src = cache.k_cache[gqa_cache_idx]
+                        v_src = cache.v_cache[gqa_cache_idx]
+                        k_aux = torch.empty_like(k_src, device=aux_device)
+                        v_aux = torch.empty_like(v_src, device=aux_device)
+                        if not hasattr(self, '_aux_kv_cache'):
+                            self._aux_kv_cache = []
+                        self._aux_kv_cache.extend([k_aux, v_aux])
+                        kv_ptrs.append((layer_idx, k_aux.data_ptr(), v_aux.data_ptr()))
+                    else:
+                        # Layers before split — register primary GPU pointers (won't be accessed by aux decode)
+                        k_layer = cache.k_cache[gqa_cache_idx]
+                        v_layer = cache.v_cache[gqa_cache_idx]
+                        kv_ptrs.append((layer_idx, k_layer.data_ptr(), v_layer.data_ptr()))
+                    gqa_cache_idx += 1
+            max_seq = cache.max_pages * cache.page_size
+            store.set_kv_cache_ptrs(kv_ptrs, max_seq)
+            logger.info("Aux KV cache: %d GQA layers, max_seq=%d", len(kv_ptrs), max_seq)
+
+        torch.cuda.synchronize(aux_device)
+
+        self._aux_gpu_decode_store = store
+        self._aux_gpu_idx = gpu_idx
+        self._multi_gpu_split_layer = split_layer
+        self._multi_gpu_gqa_offset = gqa_count_before_split
+
+        if os.environ.get("KRASIS_DECODE_TIMING", "") == "1":
+            store.set_timing(True)
+
+        logger.info("Aux GPU decode store configured: gpu=%d, split_layer=%d, gqa_offset=%d, store_addr=%d",
+                     gpu_idx, split_layer, gqa_count_before_split, store.gpu_store_addr())
+        return store
+
     def _export_kv_to_rust(self, seq_states, prompt_len: int):
         """Set KV cache position for Rust decode after prefill.
 
@@ -4045,9 +4355,18 @@ class KrasisModel:
                 post_norm = layer.post_attn_norm_weight
                 conv_w = attn._rust_conv_weight
 
-                # Prefill may have updated conv_state and recurrent_state (BF16) -- convert to FP32 for Rust
-                attn._rust_conv_state = attn._conv_state.squeeze(0).float().contiguous()
-                attn._rust_recur_state = attn._recurrent_state.squeeze(0).float().contiguous()
+                # Prefill may have updated conv_state and recurrent_state (BF16) -- convert to FP32 for Rust.
+                # IMPORTANT: copy INTO existing buffers to preserve fixed GPU addresses for CUDA graph replay.
+                # Only allocate on first call; subsequent calls copy data in-place.
+                new_conv = attn._conv_state.squeeze(0).float().contiguous()
+                new_recur = attn._recurrent_state.squeeze(0).float().contiguous()
+                if hasattr(attn, '_rust_conv_state') and attn._rust_conv_state is not None \
+                        and attn._rust_conv_state.shape == new_conv.shape:
+                    attn._rust_conv_state.copy_(new_conv)
+                    attn._rust_recur_state.copy_(new_recur)
+                else:
+                    attn._rust_conv_state = new_conv
+                    attn._rust_recur_state = new_recur
 
                 store.register_la_layer(
                     layer_idx=layer_idx,
@@ -4066,6 +4385,51 @@ class KrasisModel:
                     kernel_dim=attn.kernel_dim, conv_dim=attn.conv_dim,
                     scale=attn.scale,
                 )
+
+    def _update_la_state_ptrs_aux(self):
+        """Re-register LA state pointers on the aux store after prefill.
+        Copies post-prefill conv/recur states from GPU0 to GPU1."""
+        aux_store = getattr(self, '_aux_gpu_decode_store', None)
+        if aux_store is None:
+            return
+        split_layer = getattr(self, '_multi_gpu_split_layer', 0)
+        aux_gpu_idx = getattr(self, '_aux_gpu_idx', 1)
+        import torch
+        aux_dev = torch.device(f"cuda:{aux_gpu_idx}")
+
+        for layer_idx, layer in enumerate(self.layers):
+            if layer_idx < split_layer:
+                continue
+            if layer.layer_type != "linear_attention":
+                continue
+            attn = layer.attention
+            if attn._conv_state is None or attn._recurrent_state is None:
+                continue
+            # Copy updated states to aux GPU -- preserve fixed addresses for CUDA graph replay.
+            new_conv_aux = attn._conv_state.squeeze(0).float().contiguous().to(aux_dev)
+            new_recur_aux = attn._recurrent_state.squeeze(0).float().contiguous().to(aux_dev)
+            if hasattr(attn, '_aux_conv_state') and attn._aux_conv_state is not None \
+                    and attn._aux_conv_state.shape == new_conv_aux.shape:
+                attn._aux_conv_state.copy_(new_conv_aux)
+                attn._aux_recur_state.copy_(new_recur_aux)
+            else:
+                attn._aux_conv_state = new_conv_aux
+                attn._aux_recur_state = new_recur_aux
+            # Re-register on aux store (reuse existing weight IDs from setup)
+            inp_norm = layer.input_norm_weight
+            post_norm = layer.post_attn_norm_weight
+            # Find the aux-device norm copies
+            inp_norm_aux = getattr(layer, '_aux_inp_norm', inp_norm)
+            post_norm_aux = getattr(layer, '_aux_post_norm', post_norm)
+            # We need weight IDs — LA layers store them; for aux we need to look them up
+            # For simplicity, re-register (register_la_layer overwrites the existing config)
+            # The weight IDs for projections were set during setup_gpu_decode_store_aux
+            # and are stored in the aux store's graph. We can just update state pointers.
+            aux_store.update_la_state_ptrs(
+                layer_idx,
+                attn._aux_conv_state.data_ptr(),
+                attn._aux_recur_state.data_ptr(),
+            )
 
     def server_cleanup(self):
         """Free server request state (KV cache pages, etc.)."""

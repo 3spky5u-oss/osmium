@@ -24,6 +24,10 @@ use cudarc::driver::sys as cuda_sys;
 #[cfg(has_decode_kernels)]
 const DECODE_KERNELS_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/decode_kernels.ptx"));
 
+// CUDA graph types from cudarc's sys bindings (dynamically loaded via cuda_sys::lib())
+type CUgraph = cuda_sys::CUgraph;
+type CUgraphExec = cuda_sys::CUgraphExec;
+
 /// All kernel function names from decode_kernels.cu.
 const KERNEL_NAMES: &[&str] = &[
     "embedding_lookup",
@@ -68,7 +72,11 @@ const KERNEL_NAMES: &[&str] = &[
     "reduce_ksplits_bf16_batched",
     "fused_silu_w2_batched",
     "multi_expert_weighted_add_bf16",
-    // "fused_gate_topk" exists in .cu but is not loaded (single-block = slow on multi-SM GPUs)
+    // Graphable kernel variants (read position/token from GPU pointers for CUDA graph capture)
+    "embedding_lookup_g",
+    "apply_rope_g",
+    "kv_cache_write_g",
+    "gqa_attention_g",
 ];
 
 const MODULE_NAME: &str = "decode_kernels";
@@ -416,6 +424,16 @@ struct HcsState {
     total_evictions: u64,
     total_promotions: u64,
     total_rebalances: u64,
+
+    // ── GPU-side expert pointer table (for CUDA graph capture) ──
+    /// Flat GPU buffer: [num_layers * num_experts * 4] u64 pointers.
+    /// Layout per expert: [w13_packed, w13_scales, w2_packed, w2_scales].
+    /// Zero = not cached. Updated on load/evict.
+    d_expert_ptrs: Option<cudarc::driver::CudaSlice<u64>>,
+    /// Number of experts per layer for d_expert_ptrs indexing.
+    d_expert_ptrs_ne: usize,
+    /// Number of layers for d_expert_ptrs indexing.
+    d_expert_ptrs_nl: usize,
 }
 
 impl HcsState {
@@ -457,6 +475,9 @@ impl HcsState {
             total_evictions: 0,
             total_promotions: 0,
             total_rebalances: 0,
+            d_expert_ptrs: None,
+            d_expert_ptrs_ne: 0,
+            d_expert_ptrs_nl: 0,
         }
     }
 
@@ -492,6 +513,7 @@ impl HcsState {
     }
 
     /// Update flat cache when an entry is inserted.
+    /// Also updates the GPU-side expert pointer table if initialized.
     fn cache_fast_set(&mut self, layer: usize, expert: usize, entry: &HcsCacheEntry) {
         if self.num_experts_per_layer == 0 { return; }
         let idx = layer * self.num_experts_per_layer + expert;
@@ -501,14 +523,79 @@ impl HcsState {
                 entry.w2_packed_ptr(), entry.w2_scales_ptr(),
             ];
         }
+        self.gpu_expert_ptrs_set(layer, expert, entry);
     }
 
     /// Clear flat cache when an entry is removed.
+    /// Also clears the GPU-side expert pointer table if initialized.
     fn cache_fast_clear(&mut self, layer: usize, expert: usize) {
         if self.num_experts_per_layer == 0 { return; }
         let idx = layer * self.num_experts_per_layer + expert;
         if idx < self.cache_fast.len() {
             self.cache_fast[idx] = [0u64; 4];
+        }
+        self.gpu_expert_ptrs_clear(layer, expert);
+    }
+
+    /// Initialize the GPU-side expert pointer table.
+    /// Must be called after init_cache_fast and before any CUDA graph capture.
+    fn init_gpu_expert_ptrs(&mut self, device: &std::sync::Arc<cudarc::driver::CudaDevice>,
+                            num_layers: usize, num_experts: usize) {
+        let total = num_layers * num_experts * 4;
+        self.d_expert_ptrs_nl = num_layers;
+        self.d_expert_ptrs_ne = num_experts;
+        match device.alloc_zeros::<u64>(total) {
+            Ok(buf) => {
+                log::info!("HCS: allocated GPU expert pointer table: {} entries ({:.1} MB)",
+                    total, (total * 8) as f64 / 1048576.0);
+                self.d_expert_ptrs = Some(buf);
+            }
+            Err(e) => {
+                log::warn!("HCS: failed to allocate GPU expert pointer table: {:?}", e);
+            }
+        }
+    }
+
+    /// Update the GPU-side expert pointer table when an expert is loaded.
+    fn gpu_expert_ptrs_set(&self, layer: usize, expert: usize, entry: &HcsCacheEntry) {
+        if let Some(ref buf) = self.d_expert_ptrs {
+            let idx = (layer * self.d_expert_ptrs_ne + expert) * 4;
+            let ptrs = [
+                entry.w13_packed_ptr(), entry.w13_scales_ptr(),
+                entry.w2_packed_ptr(), entry.w2_scales_ptr(),
+            ];
+            unsafe {
+                let dst = *buf.device_ptr() + (idx * 8) as u64;
+                let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                    dst,
+                    ptrs.as_ptr() as *const std::ffi::c_void,
+                    32, // 4 * u64
+                    std::ptr::null_mut(),
+                );
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    log::warn!("gpu_expert_ptrs_set[{},{}]: {:?}", layer, expert, err);
+                }
+            }
+        }
+    }
+
+    /// Clear the GPU-side expert pointer table when an expert is evicted.
+    fn gpu_expert_ptrs_clear(&self, layer: usize, expert: usize) {
+        if let Some(ref buf) = self.d_expert_ptrs {
+            let idx = (layer * self.d_expert_ptrs_ne + expert) * 4;
+            let zeros = [0u64; 4];
+            unsafe {
+                let dst = *buf.device_ptr() + (idx * 8) as u64;
+                let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                    dst,
+                    zeros.as_ptr() as *const std::ffi::c_void,
+                    32,
+                    std::ptr::null_mut(),
+                );
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    log::warn!("gpu_expert_ptrs_clear[{},{}]: {:?}", layer, expert, err);
+                }
+            }
         }
     }
 
@@ -787,6 +874,11 @@ struct CachedKernels {
     reduce_ksplits_bf16_batched: cudarc::driver::CudaFunction,
     fused_silu_w2_batched: cudarc::driver::CudaFunction,
     multi_expert_weighted_add_bf16: cudarc::driver::CudaFunction,
+    // Graphable kernel variants (read position/token from GPU pointers)
+    embedding_lookup_g: cudarc::driver::CudaFunction,
+    apply_rope_g: cudarc::driver::CudaFunction,
+    kv_cache_write_g: cudarc::driver::CudaFunction,
+    gqa_attention_g: cudarc::driver::CudaFunction,
 }
 
 // ── Main GPU decode graph ──────────────────────────────────────────────
@@ -1052,6 +1144,42 @@ struct GpuDecodeGraph {
     batch_max_proj_dim: usize,
     /// Maximum attention output dimension across all layers (for O projection input).
     batch_max_attn_out_dim: usize,
+
+    // ── Multi-GPU segment config ──
+    /// When set, restricts the layer loop to [segment_layer_start..segment_layer_end).
+    /// Default: 0 and num_layers (full decode).
+    segment_layer_start: usize,
+    segment_layer_end: usize, // 0 = use num_layers
+    /// Skip embedding lookup (hidden state uploaded from another GPU).
+    segment_skip_embedding: bool,
+    /// Skip final norm + LM head (hidden state will be downloaded for transfer).
+    segment_skip_final: bool,
+    /// GQA cache index offset (number of GQA layers before segment_layer_start).
+    segment_gqa_cache_offset: usize,
+
+    // ── CUDA Graph capture state ──
+    /// GPU-side token ID for graphable embedding lookup (1 element).
+    d_graph_token_id: Option<cudarc::driver::CudaSlice<i32>>,
+    /// GPU-side decode position for graphable attention kernels (1 element).
+    d_graph_pos: Option<cudarc::driver::CudaSlice<i32>>,
+    /// GPU-side sequence length (pos+1) for graphable GQA attention (1 element).
+    d_graph_seq_len: Option<cudarc::driver::CudaSlice<i32>>,
+    /// Dummy expert buffer (zeros) for cold experts during CUDA graph replay.
+    /// Sized to hold one full expert (w13_packed + w13_scales + w2_packed + w2_scales).
+    d_dummy_expert: Option<cudarc::driver::CudaSlice<u8>>,
+    /// GPU-side array of 4 u64 dummy pointers [w13p, w13s, w2p, w2s] for unused batch slots.
+    d_dummy_ptrs: Option<cudarc::driver::CudaSlice<u64>>,
+
+    // ── Per-layer CUDA graph capture (49 graphs for 48 MoE layers) ──
+    /// Per-layer graph executables: graph[0] = routing for first MoE layer,
+    /// graph[1..N-1] = experts(N-1) + routing(N), graph[N] = experts(last) + final.
+    per_layer_graphs: Vec<CudaGraphExecPtr>,
+    /// Whether per-layer graphs are valid for replay.
+    per_layer_graphs_valid: bool,
+    /// MoE layer indices (which layers have MoE data).
+    per_layer_moe_indices: Vec<usize>,
+    /// Persistent cuBLAS workspace for CUDA graph capture (prevents internal cudaMalloc).
+    d_cublas_workspace: Option<cudarc::driver::CudaSlice<u8>>,
 }
 
 /// Backup storage for one LA layer's mutable state.
@@ -1074,6 +1202,10 @@ unsafe impl Sync for CudaStream {}
 struct CudaEvent(cuda_sys::CUevent);
 unsafe impl Send for CudaEvent {}
 unsafe impl Sync for CudaEvent {}
+
+struct CudaGraphExecPtr(CUgraphExec);
+unsafe impl Send for CudaGraphExecPtr {}
+unsafe impl Sync for CudaGraphExecPtr {}
 
 // ── PyO3 wrapper ───────────────────────────────────────────────────────
 
@@ -1237,6 +1369,48 @@ impl GpuDecodeStore {
                     }
                 } else {
                     log::info!("GQA attention: device max shared memory = {} KB (no opt-in needed)", max_smem_i32 / 1024);
+                }
+            }
+
+            // Also opt-in for gated_delta_net_step which needs ~65KB shared memory
+            if let Some(delta_func) = device.get_func(MODULE_NAME, "gated_delta_net_step") {
+                let struct_ptr = &delta_func as *const _ as *const u8;
+                let word0: cuda_sys::CUfunction = unsafe {
+                    std::ptr::read(struct_ptr as *const cuda_sys::CUfunction)
+                };
+                let word1: cuda_sys::CUfunction = unsafe {
+                    std::ptr::read(struct_ptr.add(8) as *const cuda_sys::CUfunction)
+                };
+                let mut dummy = 0i32;
+                let w0_valid = unsafe {
+                    cuda_sys::lib().cuFuncGetAttribute(
+                        &mut dummy,
+                        cuda_sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_NUM_REGS,
+                        word0,
+                    ) == cuda_sys::CUresult::CUDA_SUCCESS
+                };
+                let raw_fn = if w0_valid { word0 } else { word1 };
+                let mut max_smem_i32 = 0i32;
+                unsafe {
+                    let _ = cuda_sys::lib().cuDeviceGetAttribute(
+                        &mut max_smem_i32,
+                        cuda_sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+                        device_ordinal as i32,
+                    );
+                }
+                if max_smem_i32 > 49152 {
+                    let result = unsafe {
+                        cuda_sys::lib().cuFuncSetAttribute(
+                            raw_fn,
+                            cuda_sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            max_smem_i32,
+                        )
+                    };
+                    if result == cuda_sys::CUresult::CUDA_SUCCESS {
+                        log::info!("gated_delta_net_step: opt-in shared memory = {} KB", max_smem_i32 / 1024);
+                    } else {
+                        log::warn!("gated_delta_net_step: failed to set extended shared memory, result={:?}", result);
+                    }
                 }
             }
         }
@@ -1547,8 +1721,23 @@ impl GpuDecodeStore {
             d_batch_attn_out: None,
             batch_max_proj_dim: 0,
             batch_max_attn_out_dim: 0,
+            segment_layer_start: 0,
+            segment_layer_end: 0,
+            segment_skip_embedding: false,
+            segment_skip_final: false,
+            segment_gqa_cache_offset: 0,
             la_backup: Vec::new(),
             d_la_hidden_stack: None,
+            // CUDA graph state
+            d_graph_token_id: None,
+            d_graph_pos: None,
+            d_graph_seq_len: None,
+            d_dummy_expert: None,
+            d_dummy_ptrs: None,
+            per_layer_graphs: Vec::new(),
+            per_layer_graphs_valid: false,
+            per_layer_moe_indices: Vec::new(),
+            d_cublas_workspace: None,
         }));
 
         // Cache kernel function handles (avoid HashMap lookup per call)
@@ -1597,6 +1786,11 @@ impl GpuDecodeStore {
                 reduce_ksplits_bf16_batched: get("reduce_ksplits_bf16_batched")?,
                 fused_silu_w2_batched: get("fused_silu_w2_batched")?,
                 multi_expert_weighted_add_bf16: get("multi_expert_weighted_add_bf16")?,
+                // Graphable variants
+                embedding_lookup_g: get("embedding_lookup_g")?,
+                apply_rope_g: get("apply_rope_g")?,
+                kv_cache_write_g: get("kv_cache_write_g")?,
+                gqa_attention_g: get("gqa_attention_g")?,
             };
             self.graph.as_mut().unwrap().kernels = Some(kernels);
             log::info!("GpuDecodeStore: cached 37 kernel function handles");
@@ -3035,6 +3229,32 @@ impl GpuDecodeStore {
         Ok(())
     }
 
+    /// Update LA layer conv/recur state pointers (after prefill reallocates them).
+    fn update_la_state_ptrs(
+        &mut self,
+        layer_idx: usize,
+        new_conv_state_ptr: usize,
+        new_recur_state_ptr: usize,
+    ) -> PyResult<()> {
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        if layer_idx >= graph.layers.len() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                format!("Layer {} out of range", layer_idx)));
+        }
+        match &mut graph.layers[layer_idx].attn {
+            GpuAttnConfig::LinearAttention { conv_state_ptr, recur_state_ptr, .. } => {
+                *conv_state_ptr = new_conv_state_ptr as u64;
+                *recur_state_ptr = new_recur_state_ptr as u64;
+            }
+            _ => {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("Layer {} is not LinearAttention", layer_idx)));
+            }
+        }
+        Ok(())
+    }
+
     /// Register a GQA layer's weights and config for GPU decode.
     #[pyo3(signature = (layer_idx,
                         input_norm_ptr, input_norm_size,
@@ -3390,6 +3610,139 @@ impl GpuDecodeStore {
         Ok(tokens)
     }
 
+    /// Multi-GPU batch generate (for warmup/validation from Python).
+    ///
+    /// Like gpu_generate_batch but uses gpu_generate_stream_multi under the hood.
+    fn gpu_generate_batch_multi(
+        &mut self,
+        aux_store_addr: usize,
+        split_layer: usize,
+        gqa_cache_offset: usize,
+        first_token: usize,
+        start_position: usize,
+        max_tokens: usize,
+        temperature: f32,
+        top_k: usize,
+        top_p: f32,
+        stop_ids: Vec<usize>,
+        presence_penalty: f32,
+    ) -> PyResult<Vec<usize>> {
+        if aux_store_addr == 0 {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err("aux_store_addr is 0"));
+        }
+
+        // We need a tokenizer for stream_multi — use a minimal one that just returns empty strings
+        // since we only care about token IDs for batch mode.
+        // Actually, stream_multi requires a real tokenizer. Let's inline the logic instead.
+        let aux_store = unsafe { &mut *(aux_store_addr as *mut GpuDecodeStore) };
+
+        let vocab_size = match aux_store.graph.as_ref() {
+            Some(g) => g.vocab_size,
+            None => return Err(pyo3::exceptions::PyRuntimeError::new_err("aux graph not configured")),
+        };
+        let num_layers = match self.graph.as_ref() {
+            Some(g) => g.layers.len(),
+            None => return Err(pyo3::exceptions::PyRuntimeError::new_err("primary graph not configured")),
+        };
+
+        let stop_set: std::collections::HashSet<usize> = stop_ids.iter().copied().collect();
+
+        let mut rng_state: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        if rng_state == 0 { rng_state = 0xDEADBEEF; }
+        let mut rng_next = move || -> u64 {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            rng_state
+        };
+
+        // Begin activation tracking on both stores
+        if let Some(ref mut hcs) = self.graph.as_mut().unwrap().hcs {
+            hcs.begin_prompt();
+        }
+        if let Some(ref mut hcs) = aux_store.graph.as_mut().unwrap().hcs {
+            hcs.begin_prompt();
+        }
+
+        let mut next_token = first_token;
+        let mut tokens = Vec::with_capacity(max_tokens);
+        let mut seen_tokens: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        seen_tokens.insert(first_token);
+
+        let decode_start = std::time::Instant::now();
+
+        for step in 0..max_tokens {
+            let pos = start_position + step;
+
+            // GPU0: embedding + layers [0..split_layer)
+            if let Err(e) = self.device.bind_to_thread() {
+                log::error!("batch_multi: bind GPU0 failed: {:?}", e);
+                break;
+            }
+            if let Err(e) = self.gpu_decode_segment(
+                next_token, pos, true, 0, split_layer, false, 0,
+            ) {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("GPU0 segment error: {}", e)));
+            }
+
+            // Transfer hidden state GPU0 -> GPU1 via host
+            let (h_hidden, h_residual) = self.download_hidden_state()
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("download_hidden error: {}", e)))?;
+
+            // GPU1: layers [split_layer..num_layers) + final
+            if let Err(e) = aux_store.device.bind_to_thread() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("bind GPU1 failed: {:?}", e)));
+            }
+            aux_store.upload_hidden_state(&h_hidden, &h_residual)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("upload_hidden error: {}", e)))?;
+            if let Err(e) = aux_store.gpu_decode_segment(
+                next_token, pos, false, split_layer, num_layers, true, gqa_cache_offset,
+            ) {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("GPU1 segment error: {}", e)));
+            }
+
+            let logits = &mut aux_store.graph.as_mut().unwrap().h_logits;
+            if presence_penalty != 0.0 {
+                for &tok in &seen_tokens {
+                    if tok < vocab_size { logits[tok] -= presence_penalty; }
+                }
+            }
+
+            next_token = crate::decode::sample_from_logits_pub(
+                logits, vocab_size, temperature, top_k, top_p, &mut rng_next);
+            seen_tokens.insert(next_token);
+            tokens.push(next_token);
+
+            if stop_set.contains(&next_token) { break; }
+        }
+
+        let elapsed = decode_start.elapsed().as_secs_f64();
+        if !tokens.is_empty() {
+            let tps = tokens.len() as f64 / elapsed;
+            log::info!("gpu_generate_batch_multi: {} tokens in {:.2}s ({:.1} tok/s)",
+                tokens.len(), elapsed, tps);
+        }
+        self.last_decode_elapsed = elapsed;
+
+        // End activation tracking
+        if let Some(ref mut hcs) = self.graph.as_mut().unwrap().hcs {
+            hcs.finish_prompt();
+        }
+        if let Some(ref mut hcs) = aux_store.graph.as_mut().unwrap().hcs {
+            hcs.finish_prompt();
+        }
+
+        Ok(tokens)
+    }
+
     /// Get elapsed time of last decode run (seconds).
     #[getter]
     fn last_decode_elapsed_s(&self) -> f64 {
@@ -3413,6 +3766,14 @@ impl GpuDecodeStore {
     /// Returns (loaded_count, reload_ms).
     fn py_hcs_reload_after_prefill(&mut self) -> (usize, f64) {
         self.hcs_reload_after_prefill()
+    }
+
+    /// Copy KV cache from this store to an aux store (PyO3 wrapper for validation).
+    #[pyo3(signature = (aux_store_addr, split_layer, gqa_offset, prompt_len))]
+    fn py_copy_kv_to_aux(&self, aux_store_addr: usize, split_layer: usize, gqa_offset: usize, prompt_len: usize) -> PyResult<()> {
+        let aux_store = unsafe { &mut *(aux_store_addr as *mut GpuDecodeStore) };
+        self.copy_kv_to_aux(aux_store, split_layer, gqa_offset, prompt_len)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
     }
 
     /// Fill HCS-resident experts into a GPU buffer for prefill via D2D copy.
@@ -4011,6 +4372,1502 @@ impl GpuDecodeStore {
         Ok(())
     }
 
+    /// Initialize CUDA graph infrastructure: allocate GPU-side buffers for
+    /// graphable kernels and dummy expert buffer for cold expert handling.
+    /// Must be called after configure() and HCS pool init.
+    fn init_cuda_graph_buffers(&mut self) -> Result<(), String> {
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| "Call configure first".to_string())?;
+
+        // Allocate GPU-side scalar buffers for graphable kernels
+        graph.d_graph_token_id = Some(self.device.alloc_zeros::<i32>(1)
+            .map_err(|e| format!("alloc d_graph_token_id: {:?}", e))?);
+        graph.d_graph_pos = Some(self.device.alloc_zeros::<i32>(1)
+            .map_err(|e| format!("alloc d_graph_pos: {:?}", e))?);
+        graph.d_graph_seq_len = Some(self.device.alloc_zeros::<i32>(1)
+            .map_err(|e| format!("alloc d_graph_seq_len: {:?}", e))?);
+        // Allocate dummy expert buffer (all zeros, used for cold experts during graph replay).
+        // Size = one full expert's worth of data.
+        if let Some(ref hcs) = graph.hcs {
+            if hcs.expert_vram_bytes > 0 {
+                graph.d_dummy_expert = Some(self.device.alloc_zeros::<u8>(hcs.expert_vram_bytes)
+                    .map_err(|e| format!("alloc d_dummy_expert: {:?}", e))?);
+                // Build dummy pointer array [w13p, w13s, w2p, w2s] on GPU
+                let dummy_base = *graph.d_dummy_expert.as_ref().unwrap().device_ptr();
+                let hs = graph.hidden_size;
+                let intermediate = graph.intermediate_size;
+                let gs = graph.group_size;
+                let w13_packed_bytes = (2 * intermediate * hs / 8) as u64;
+                let w13_scales_bytes = (2 * intermediate * hs / gs * 2 / 8) as u64;
+                let w2_packed_bytes = (hs * intermediate / 8) as u64;
+                let dummy_vals: [u64; 4] = [
+                    dummy_base,
+                    dummy_base + w13_packed_bytes,
+                    dummy_base + w13_packed_bytes + w13_scales_bytes,
+                    dummy_base + w13_packed_bytes + w13_scales_bytes + w2_packed_bytes,
+                ];
+                let d_dummy_ptrs = self.device.htod_copy(dummy_vals.to_vec())
+                    .map_err(|e| format!("alloc d_dummy_ptrs: {:?}", e))?;
+                graph.d_dummy_ptrs = Some(d_dummy_ptrs);
+                log::info!("CUDA graph: allocated dummy expert buffer ({} KB)",
+                    hcs.expert_vram_bytes / 1024);
+            }
+        }
+
+        // Allocate persistent cuBLAS workspace (required for CUDA graph capture —
+        // cuBLAS must not do internal cudaMalloc during capture).
+        // 32 KB is sufficient for GEMV operations (N=1).
+        let workspace_bytes = 32 * 1024;
+        let d_workspace = self.device.alloc_zeros::<u8>(workspace_bytes)
+            .map_err(|e| format!("alloc d_cublas_workspace: {:?}", e))?;
+        unsafe {
+            let ws_ptr = *d_workspace.device_ptr() as *mut std::ffi::c_void;
+            let lib = cublas_sys::lib();
+            let err = lib.cublasSetWorkspace_v2(*self.blas.handle(), ws_ptr, workspace_bytes);
+            if err != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                return Err(format!("cublasSetWorkspace: {:?}", err));
+            }
+        }
+        graph.d_cublas_workspace = Some(d_workspace);
+
+        eprintln!("[krasis] CUDA graph infrastructure initialized (has_dummy={}, workspace=32KB)",
+            graph.d_dummy_expert.is_some());
+        Ok(())
+    }
+
+    /// Invalidate per-layer CUDA graphs (e.g. when HCS layout changes around prefill).
+    fn invalidate_cuda_graph(&mut self) {
+        if let Some(ref mut graph) = self.graph {
+            for exec in graph.per_layer_graphs.drain(..) {
+                unsafe { cuda_sys::lib().cuGraphExecDestroy(exec.0); }
+            }
+            graph.per_layer_graphs_valid = false;
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Per-layer CUDA graph capture & replay (49 graphs for 48 MoE layers)
+    // ════════════════════════════════════════════════════════════════════
+
+    /// Capture 49 per-layer CUDA graphs:
+    ///   Graph 0: embedding + layer 0 routing
+    ///   Graph 1..N-1: layer K experts + layer K+1 routing
+    ///   Graph N: last layer experts + final norm + LM head
+    ///
+    /// Between segments, CPU reads routing results, DMAs cold experts, and
+    /// populates d_batch_upload with expert pointers. The first decode token
+    /// is computed correctly during capture (real execution on step 0 provides
+    /// correct routing data for the CPU-side work between captures).
+    /// Capture per-layer CUDA graphs for a segment of layers.
+    /// - layer_range: if Some((start, end)), only capture graphs for MoE layers in [start..end).
+    ///   If None, capture for all layers (single-GPU mode).
+    /// - do_embedding: include embedding lookup in the first graph.
+    /// - do_final: include final norm + LM head in the last graph.
+    /// - gqa_cache_offset: number of GQA layers before the segment start (for multi-GPU).
+    fn capture_per_layer_graphs(
+        &mut self,
+        layer_range: Option<(usize, usize)>,
+        do_embedding: bool,
+        do_final: bool,
+        gqa_cache_offset: usize,
+    ) -> Result<(), String> {
+        let mut graph = self.graph.take()
+            .ok_or_else(|| "Call configure first".to_string())?;
+
+        if graph.d_graph_token_id.is_none() {
+            self.graph = Some(graph);
+            return Err("Call init_cuda_graph_buffers first".to_string());
+        }
+
+        // Set segment config so run_segment_kernels uses correct GQA cache indices
+        if let Some((start, _end)) = layer_range {
+            graph.segment_layer_start = start;
+            graph.segment_gqa_cache_offset = gqa_cache_offset;
+        } else {
+            graph.segment_layer_start = 0;
+            graph.segment_gqa_cache_offset = 0;
+        }
+
+        // Invalidate any existing per-layer graphs
+        for exec in graph.per_layer_graphs.drain(..) {
+            unsafe { cuda_sys::lib().cuGraphExecDestroy(exec.0); }
+        }
+        graph.per_layer_graphs_valid = false;
+
+        // Identify which layers have MoE data (within our range)
+        let num_layers = graph.layers.len();
+        let (range_start, range_end) = layer_range.unwrap_or((0, num_layers));
+        let mut moe_indices: Vec<usize> = Vec::new();
+        for i in range_start..range_end {
+            if i < graph.moe_layers.len() && graph.moe_layers[i].is_some() {
+                moe_indices.push(i);
+            }
+        }
+        graph.per_layer_moe_indices = moe_indices.clone();
+        let num_moe = moe_indices.len();
+        let num_graphs = num_moe + 1; // routing(0) + (num_moe-1) combined + final
+
+        eprintln!("[krasis] Capturing {} per-layer graphs ({} MoE layers, range {}-{}, emb={}, final={})",
+            num_graphs, num_moe, range_start, range_end, do_embedding, do_final);
+
+        // Create capture stream
+        let mut capture_stream: cuda_sys::CUstream = std::ptr::null_mut();
+        unsafe {
+            let err = cuda_sys::lib().cuStreamCreate(
+                &mut capture_stream,
+                cuda_sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
+            );
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                self.graph = Some(graph);
+                return Err(format!("cuStreamCreate for capture: {:?}", err));
+            }
+        }
+
+        // Save original stream and swap to capture stream
+        let stream_ptr: *mut cuda_sys::CUstream;
+        let orig_stream: cuda_sys::CUstream;
+        unsafe {
+            self.device.synchronize().map_err(|e| format!("sync before capture: {:?}", e))?;
+            let stream_ref = self.device.cu_stream();
+            stream_ptr = stream_ref as *const cuda_sys::CUstream as *mut cuda_sys::CUstream;
+            orig_stream = *stream_ptr;
+            *stream_ptr = capture_stream;
+
+            // Switch cuBLAS handle to capture stream so GEMM/GEMV ops are recorded in the graph
+            cublas_result::set_stream(*self.blas.handle(), capture_stream as cublas_sys::cudaStream_t)
+                .map_err(|e| format!("cublasSetStream to capture: {:?}", e))?;
+        }
+
+        // Shared memory opt-in for gated_delta_net_step (same as monolithic capture)
+        {
+            let k = graph.kernels.as_ref().unwrap();
+            let struct_ptr = &k.gated_delta_net_step as *const _ as *const u8;
+            let word0: cuda_sys::CUfunction = unsafe {
+                std::ptr::read(struct_ptr as *const cuda_sys::CUfunction)
+            };
+            let word1: cuda_sys::CUfunction = unsafe {
+                std::ptr::read(struct_ptr.add(8) as *const cuda_sys::CUfunction)
+            };
+            let mut dummy = 0i32;
+            let w0_valid = unsafe {
+                cuda_sys::lib().cuFuncGetAttribute(
+                    &mut dummy,
+                    cuda_sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_NUM_REGS,
+                    word0,
+                ) == cuda_sys::CUresult::CUDA_SUCCESS
+            };
+            let raw_fn = if w0_valid { word0 } else { word1 };
+            let mut cur_smem = 0i32;
+            unsafe {
+                cuda_sys::lib().cuFuncGetAttribute(
+                    &mut cur_smem,
+                    cuda_sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    raw_fn,
+                );
+            }
+            if cur_smem < 66560 {
+                let mut max_smem_i32 = 0i32;
+                unsafe {
+                    cuda_sys::lib().cuDeviceGetAttribute(
+                        &mut max_smem_i32,
+                        cuda_sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+                        self.device.ordinal() as i32,
+                    );
+                    cuda_sys::lib().cuFuncSetAttribute(
+                        raw_fn,
+                        cuda_sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        max_smem_i32,
+                    );
+                }
+            }
+        }
+
+        let mut captured_graphs: Vec<CudaGraphExecPtr> = Vec::with_capacity(num_graphs);
+        let mut capture_err: Option<String> = None;
+
+        // Helper: begin capture on stream
+        let begin_capture = |stream: cuda_sys::CUstream| -> Result<(), String> {
+            let err = unsafe {
+                cuda_sys::lib().cuStreamBeginCapture_v2(
+                    stream,
+                    cuda_sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_RELAXED,
+                )
+            };
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("cuStreamBeginCapture: {:?}", err));
+            }
+            Ok(())
+        };
+
+        // Helper: end capture and instantiate
+        let end_capture_and_instantiate = |stream: cuda_sys::CUstream, label: &str|
+            -> Result<CudaGraphExecPtr, String>
+        {
+            let mut cu_graph: CUgraph = std::ptr::null_mut();
+            let err = unsafe { cuda_sys::lib().cuStreamEndCapture(stream, &mut cu_graph) };
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("cuStreamEndCapture[{}]: {:?}", label, err));
+            }
+            if cu_graph.is_null() {
+                return Err(format!("cuStreamEndCapture[{}]: null graph", label));
+            }
+            let mut graph_exec: CUgraphExec = std::ptr::null_mut();
+            let err = unsafe {
+                cuda_sys::lib().cuGraphInstantiateWithFlags(&mut graph_exec, cu_graph, 0)
+            };
+            unsafe { cuda_sys::lib().cuGraphDestroy(cu_graph); }
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("cuGraphInstantiate[{}]: {:?}", label, err));
+            }
+            Ok(CudaGraphExecPtr(graph_exec))
+        };
+
+        // ── Capture all graphs ──
+        // Each graph captures kernels on the capture stream (operations are recorded, not executed).
+        // The buffer addresses are fixed, so the graph structure is valid regardless of data content.
+
+        for graph_idx in 0..num_graphs {
+            if capture_err.is_some() { break; }
+
+            let label = if graph_idx == 0 {
+                format!("routing-L{}", moe_indices[0])
+            } else if graph_idx < num_moe {
+                format!("experts-L{}-routing-L{}", moe_indices[graph_idx - 1], moe_indices[graph_idx])
+            } else {
+                format!("experts-L{}-final", moe_indices[num_moe - 1])
+            };
+
+            if let Err(e) = begin_capture(capture_stream) {
+                capture_err = Some(format!("begin[{}]: {}", label, e));
+                break;
+            }
+
+            // Run the segment kernels
+            let seg_result = self.run_graph_segment(&mut graph, graph_idx, &moe_indices, do_embedding, do_final);
+            if let Err(e) = seg_result {
+                // Must still end capture to restore stream state
+                let mut dummy: CUgraph = std::ptr::null_mut();
+                unsafe { cuda_sys::lib().cuStreamEndCapture(capture_stream, &mut dummy); }
+                if !dummy.is_null() { unsafe { cuda_sys::lib().cuGraphDestroy(dummy); } }
+                capture_err = Some(format!("segment[{}]: {}", label, e));
+                break;
+            }
+
+            match end_capture_and_instantiate(capture_stream, &label) {
+                Ok(exec) => {
+                    captured_graphs.push(exec);
+                    eprintln!("[krasis] Captured graph {} ({})", graph_idx, label);
+                }
+                Err(e) => {
+                    capture_err = Some(e);
+                    break;
+                }
+            }
+        }
+
+        // Restore original stream, cuBLAS handle, and destroy capture stream
+        unsafe {
+            *stream_ptr = orig_stream;
+            cublas_result::set_stream(*self.blas.handle(), orig_stream as cublas_sys::cudaStream_t)
+                .map_err(|e| format!("cublasSetStream restore: {:?}", e))?;
+            cuda_sys::lib().cuStreamDestroy_v2(capture_stream);
+        }
+
+        if let Some(e) = capture_err {
+            // Clean up any graphs we did capture
+            for exec in captured_graphs {
+                unsafe { cuda_sys::lib().cuGraphExecDestroy(exec.0); }
+            }
+            self.graph = Some(graph);
+            return Err(format!("Per-layer graph capture failed: {}", e));
+        }
+
+        graph.per_layer_graphs = captured_graphs;
+        graph.per_layer_graphs_valid = true;
+        self.graph = Some(graph);
+        eprintln!("[krasis] Per-layer graphs captured: {} graphs", num_graphs);
+        Ok(())
+    }
+
+    /// Run one graph segment's kernels (for capture or debug).
+    /// graph_idx 0: embedding + routing for moe_indices[0]
+    /// graph_idx 1..N-1: experts for moe_indices[idx-1] + routing for moe_indices[idx]
+    /// graph_idx N: experts for moe_indices[N-1] + final norm + LM head
+    ///
+    /// seg_do_embedding/seg_do_final control whether the first/last graph includes
+    /// embedding and final norm+LM head (set false for multi-GPU segments that
+    /// don't own those parts).
+    fn run_graph_segment(
+        &self,
+        graph: &mut GpuDecodeGraph,
+        graph_idx: usize,
+        moe_indices: &[usize],
+        seg_do_embedding: bool,
+        seg_do_final: bool,
+    ) -> Result<(), String> {
+        let num_moe = moe_indices.len();
+        let is_first = graph_idx == 0;
+        let is_last = graph_idx == num_moe;
+
+        // What this segment contains:
+        // - Expert compute for a MoE layer (if not first graph)
+        // - Routing for next layer group (if not last graph)
+        //   "Routing" = all layers from prev_moe+1 through this_moe (inclusive),
+        //   covering any non-MoE layers in between + the MoE layer's routing portion.
+
+        // Expert layer index (layer whose experts we compute)
+        let expert_layer = if !is_first { Some(moe_indices[graph_idx - 1]) } else { None };
+
+        // Range of layers whose routing (norm+attn+post-norm+gate+topk) we capture
+        let routing_range = if !is_last {
+            let moe_layer = moe_indices[graph_idx];
+            // Start after the previous MoE layer's experts (or from layer 0 for graph 0)
+            let start = if is_first {
+                // For multi-GPU, the first MoE index might not be 0
+                // Use the layer range start or 0
+                if !moe_indices.is_empty() {
+                    // Start from the beginning of the segment or 0
+                    let seg_start = graph.segment_layer_start;
+                    if seg_start > 0 { seg_start } else { 0 }
+                } else { 0 }
+            } else {
+                moe_indices[graph_idx - 1] + 1
+            };
+            // Include non-MoE layers between start and moe_layer, plus moe_layer itself
+            Some((start, moe_layer))
+        } else {
+            None
+        };
+
+        // Include final norm + LM head only in last graph AND if segment owns it
+        let include_final = is_last && seg_do_final;
+        // Include embedding only in first graph AND if segment owns it
+        let include_embedding = is_first && seg_do_embedding;
+
+        self.run_segment_kernels(graph, expert_layer, routing_range, include_embedding, include_final)
+    }
+
+    /// Run the actual kernels for one graph segment.
+    /// - expert_layer: if Some, run MoE expert compute for this layer (from d_batch_upload)
+    /// - routing_range: if Some((start, end)), run routing for layers start..=end
+    /// - include_embedding: run embedding lookup
+    /// - include_final: run final norm + LM head
+    fn run_segment_kernels(
+        &self,
+        graph: &mut GpuDecodeGraph,
+        expert_layer: Option<usize>,
+        routing_range: Option<(usize, usize)>,
+        include_embedding: bool,
+        include_final: bool,
+    ) -> Result<(), String> {
+        use cudarc::driver::LaunchConfig;
+
+        let cu_stream: cuda_sys::CUstream = *self.device.cu_stream();
+        let hs = graph.hidden_size;
+        let eps = graph.eps;
+        let k = graph.kernels.as_ref()
+            .ok_or_else(|| "Kernels not cached".to_string())?.clone();
+
+        let intermediate = graph.intermediate_size;
+        let gs = graph.group_size;
+        let inv_wp = *graph.d_inv_weight_perm.device_ptr();
+        let inv_sp = *graph.d_inv_scale_perm.device_ptr();
+
+        let d_pos_ptr = *graph.d_graph_pos.as_ref().unwrap().device_ptr();
+        let d_seq_len_ptr = *graph.d_graph_seq_len.as_ref().unwrap().device_ptr();
+
+        // v2 K-split config
+        let w13_n = 2 * intermediate;
+        let w13_k_tiles = hs / 16;
+        let w13_max_ksplits = w13_k_tiles / 16;
+        let w13_ksplits = if w13_max_ksplits > 1 {
+            let n_tiles = (w13_n + 15) / 16;
+            let target = graph.num_sms * 4;
+            let desired = (target + n_tiles - 1) / n_tiles;
+            desired.clamp(1, w13_max_ksplits.min(8))
+        } else { 1 };
+        let use_v2_w13 = w13_ksplits > 1;
+        let partial_ptr = *graph.d_v2_partial.device_ptr();
+
+        // ── Expert compute (if this segment includes it) ──
+        if let Some(layer_idx) = expert_layer {
+            if let Some(ref moe) = graph.moe_layers.get(layer_idx).and_then(|m| m.as_ref()) {
+                let topk = moe.topk;
+                let rsf = moe.routed_scaling_factor;
+
+                let max_ept = graph.max_experts_per_tok;
+                let d_upload_base = *graph.d_batch_upload.device_ptr();
+                let ptr_stride = max_ept * 8;
+                let d_w13p = d_upload_base;
+                let d_w13s = d_upload_base + ptr_stride as u64;
+                let d_w2p = d_upload_base + (ptr_stride * 2) as u64;
+                let d_w2s = d_upload_base + (ptr_stride * 3) as u64;
+                let d_wts = d_upload_base + (ptr_stride * 4) as u64;
+
+                // Zero MoE output accumulator
+                unsafe {
+                    k.zero_bf16.clone().launch(
+                        LaunchConfig::for_num_elems(hs as u32),
+                        (*graph.d_moe_out.device_ptr(), hs as i32),
+                    ).map_err(|e| format!("zero_bf16[{}]: {:?}", layer_idx, e))?;
+                }
+
+                // Batched w13 GEMV v2
+                if use_v2_w13 {
+                    let w13_n_tiles = (w13_n + 15) / 16;
+                    let w13_smem = (hs * 2 + 1024 * 4 + 64 * 4 + 16 * 16 * 4) as u32;
+                    unsafe {
+                        k.marlin_gemv_int4_v2_batched.clone().launch(
+                            LaunchConfig {
+                                grid_dim: (w13_n_tiles as u32, w13_ksplits as u32, topk as u32),
+                                block_dim: (256, 1, 1),
+                                shared_mem_bytes: w13_smem,
+                            },
+                            (
+                                d_w13p, d_w13s,
+                                *graph.d_hidden.device_ptr(),
+                                *graph.d_batch_partials.device_ptr(),
+                                inv_wp, inv_sp,
+                                hs as i32, w13_n as i32, gs as i32, w13_ksplits as i32,
+                            ),
+                        ).map_err(|e| format!("batched w13 v2[{}]: {:?}", layer_idx, e))?;
+                    }
+
+                    // Batched reduce
+                    unsafe {
+                        k.reduce_ksplits_bf16_batched.clone().launch(
+                            LaunchConfig {
+                                grid_dim: (((w13_n + 255) / 256) as u32, 1, topk as u32),
+                                block_dim: (256, 1, 1),
+                                shared_mem_bytes: 0,
+                            },
+                            (
+                                *graph.d_batch_gate_ups.device_ptr(),
+                                *graph.d_batch_partials.device_ptr(),
+                                w13_n as i32, w13_ksplits as i32,
+                            ),
+                        ).map_err(|e| format!("batched reduce[{}]: {:?}", layer_idx, e))?;
+                    }
+                }
+
+                // Batched silu + w2
+                let w2_n_tiles = (hs + 15) / 16;
+                let w2_smem = (intermediate * 2 + 1024 * 4 + 64 * 4) as u32;
+                unsafe {
+                    k.fused_silu_w2_batched.clone().launch(
+                        LaunchConfig {
+                            grid_dim: (w2_n_tiles as u32, 1, topk as u32),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: w2_smem,
+                        },
+                        (
+                            d_w2p, d_w2s,
+                            *graph.d_batch_gate_ups.device_ptr(),
+                            *graph.d_batch_expert_outs.device_ptr(),
+                            inv_wp, inv_sp,
+                            intermediate as i32, hs as i32, gs as i32,
+                        ),
+                    ).map_err(|e| format!("batched silu_w2[{}]: {:?}", layer_idx, e))?;
+                }
+
+                // Multi-expert weighted add
+                unsafe {
+                    k.multi_expert_weighted_add_bf16.clone().launch(
+                        LaunchConfig {
+                            grid_dim: (((hs + 255) / 256) as u32, 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        (
+                            *graph.d_moe_out.device_ptr(),
+                            *graph.d_batch_expert_outs.device_ptr(),
+                            d_wts,
+                            hs as i32, topk as i32,
+                        ),
+                    ).map_err(|e| format!("multi_expert_weighted_add[{}]: {:?}", layer_idx, e))?;
+                }
+
+                // Shared expert (if any)
+                if let Some(ref shared_vram) = graph.shared_expert_vram.get(layer_idx).and_then(|s| s.as_ref()) {
+                    let sw13p = shared_vram.w13_packed_ptr();
+                    let sw13s = shared_vram.w13_scales_ptr();
+                    let sw2p = shared_vram.w2_packed_ptr();
+                    let sw2s = shared_vram.w2_scales_ptr();
+
+                    // Shared gate (if applicable)
+                    if let Some(ref moe_data) = graph.moe_layers[layer_idx] {
+                        if let Some(sg_wid) = moe_data.shared_gate_wid {
+                            let sg_w = &graph.weights[sg_wid];
+                            let alpha: f32 = 1.0;
+                            let beta: f32 = 0.0;
+                            unsafe {
+                                cublas_result::gemm_ex(
+                                    *self.blas.handle(),
+                                    cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                                    cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                                    sg_w.rows as i32, 1, sg_w.cols as i32,
+                                    &alpha as *const f32 as *const std::ffi::c_void,
+                                    sg_w.ptr as *const std::ffi::c_void,
+                                    cublas_sys::cudaDataType::CUDA_R_16BF, sg_w.cols as i32,
+                                    *graph.d_hidden.device_ptr() as *const std::ffi::c_void,
+                                    cublas_sys::cudaDataType::CUDA_R_16BF, hs as i32,
+                                    &beta as *const f32 as *const std::ffi::c_void,
+                                    *graph.d_fp32_scratch.device_ptr() as *mut std::ffi::c_void,
+                                    cublas_sys::cudaDataType::CUDA_R_32F, sg_w.rows as i32,
+                                    cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                                    cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                                ).map_err(|e| format!("shared gate GEMV[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+                    }
+
+                    // w13 GEMV for shared expert
+                    if use_v2_w13 {
+                        self.launch_marlin_gemv_v2(
+                            sw13p, sw13s,
+                            *graph.d_hidden.device_ptr(),
+                            partial_ptr, inv_wp, inv_sp,
+                            hs, w13_n, gs, w13_ksplits, &k,
+                        ).map_err(|e| format!("shared w13 v2: {:?}", e))?;
+                        self.launch_reduce_ksplits_bf16(
+                            *graph.d_expert_gate_up.device_ptr(),
+                            partial_ptr, w13_n, w13_ksplits, &k,
+                        ).map_err(|e| format!("shared reduce: {:?}", e))?;
+                    } else {
+                        self.launch_marlin_gemv_raw(
+                            sw13p, sw13s,
+                            *graph.d_hidden.device_ptr(),
+                            *graph.d_expert_gate_up.device_ptr(),
+                            inv_wp, inv_sp, hs, w13_n, gs,
+                        ).map_err(|e| format!("shared w13 raw: {:?}", e))?;
+                    }
+
+                    let shared_gate_ptr = if graph.moe_layers[layer_idx].as_ref()
+                        .and_then(|m| m.shared_gate_wid).is_some() {
+                        *graph.d_fp32_scratch.device_ptr()
+                    } else { 0 };
+
+                    self.launch_fused_silu_accum(
+                        sw2p, sw2s,
+                        *graph.d_expert_gate_up.device_ptr(),
+                        *graph.d_moe_out.device_ptr(),
+                        inv_wp, inv_sp, intermediate, hs, gs,
+                        1.0, shared_gate_ptr, &k,
+                    ).map_err(|e| format!("shared silu_accum: {:?}", e))?;
+                }
+
+                // Scale by routed_scaling_factor
+                if rsf != 1.0 {
+                    let threads = 256u32;
+                    let blocks = ((hs as u32) + threads - 1) / threads;
+                    unsafe {
+                        k.scale_bf16.clone().launch(
+                            LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                            (*graph.d_moe_out.device_ptr(), rsf, hs as i32),
+                        ).map_err(|e| format!("scale_bf16[{}]: {:?}", layer_idx, e))?;
+                    }
+                }
+
+                // Copy MoE output to hidden state
+                unsafe {
+                    cuda_sys::lib().cuMemcpyDtoDAsync_v2(
+                        *graph.d_hidden.device_ptr(),
+                        *graph.d_moe_out.device_ptr(),
+                        hs * 2, cu_stream);
+                }
+            }
+        }
+
+        // Track first_residual state for routing layers
+        let seg_start = graph.segment_layer_start;
+        let seg_gqa_offset = graph.segment_gqa_cache_offset;
+        let mut first_residual = include_embedding && seg_start == 0;
+        let mut gqa_cache_idx = seg_gqa_offset;
+
+        // Count GQA layers before our routing range start (from segment start, not 0)
+        if let Some((start, _)) = routing_range {
+            gqa_cache_idx = seg_gqa_offset;
+            for i in seg_start..start {
+                if let GpuAttnConfig::GQA { .. } = &graph.layers[i].attn {
+                    gqa_cache_idx += 1;
+                }
+            }
+            if !include_embedding || start > 0 {
+                first_residual = false;
+            }
+        }
+
+        // ── Embedding lookup ──
+        if include_embedding {
+            let d_token_id_ptr = *graph.d_graph_token_id.as_ref().unwrap().device_ptr();
+            let threads = 256u32;
+            let blocks = ((hs as u32) + threads - 1) / threads;
+            unsafe {
+                k.embedding_lookup_g.clone().launch(
+                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                    (
+                        *graph.d_hidden.device_ptr(),
+                        graph.embedding_ptr,
+                        d_token_id_ptr,
+                        hs as i32,
+                    ),
+                ).map_err(|e| format!("embedding_lookup_g: {:?}", e))?;
+            }
+        }
+
+        // ── Routing layers (norm + attention + post-norm + gate + topk for MoE layers) ──
+        if let Some((range_start, range_end)) = routing_range {
+            for layer_idx in range_start..=range_end {
+                let layer = &graph.layers[layer_idx];
+
+                // Pre-attention norm
+                {
+                    let smem = (hs as u32) * 4;
+                    let threads = 256u32.min(hs as u32);
+                    unsafe {
+                        k.fused_add_rmsnorm.clone().launch(
+                            LaunchConfig { grid_dim: (1, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: smem },
+                            (
+                                *graph.d_hidden.device_ptr(),
+                                *graph.d_residual.device_ptr(),
+                                layer.input_norm_ptr,
+                                eps, hs as i32,
+                                if first_residual { 1i32 } else { 0i32 },
+                            ),
+                        ).map_err(|e| format!("fused_add_rmsnorm[{}]: {:?}", layer_idx, e))?;
+                    }
+                }
+                first_residual = false;
+
+                // Attention (LA or GQA)
+                match &layer.attn {
+                    GpuAttnConfig::LinearAttention {
+                        in_proj_qkvz, in_proj_ba, out_proj,
+                        conv_weight_ptr, a_log_ptr, dt_bias_ptr, norm_weight_ptr,
+                        nk, nv, dk, dv, hr, kernel_dim, conv_dim, scale,
+                        conv_state_ptr, recur_state_ptr,
+                    } => {
+                        let nk_ = *nk; let nv_ = *nv; let dk_ = *dk; let dv_ = *dv;
+                        let hr_ = *hr; let cd = *conv_dim; let kd = *kernel_dim;
+                        let key_dim = nk_ * dk_;
+
+                        // LA projections (cuBLAS)
+                        let qkvz_w = &graph.weights[*in_proj_qkvz];
+                        let ba_w = &graph.weights[*in_proj_ba];
+                        self.gemv_bf16_to_f32(qkvz_w, *graph.d_hidden.device_ptr(),
+                            *graph.d_la_qkvz.device_ptr())?;
+                        self.gemv_bf16_to_f32(ba_w, *graph.d_hidden.device_ptr(),
+                            *graph.d_la_ba.device_ptr())?;
+
+                        // Un-interleave QKVZ
+                        {
+                            let group_dim = 2 * dk_ + 2 * hr_ * dv_;
+                            let total = nk_ * group_dim;
+                            let threads = 256u32;
+                            let blocks = ((total as u32) + threads - 1) / threads;
+                            unsafe {
+                                k.uninterleave_qkvz.clone().launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (
+                                        *graph.d_la_conv_out.device_ptr(),
+                                        *graph.d_la_recur_out.device_ptr(),
+                                        *graph.d_la_qkvz.device_ptr(),
+                                        nk_ as i32, dk_ as i32, hr_ as i32, dv_ as i32,
+                                    ),
+                                ).map_err(|e| format!("uninterleave_qkvz[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+
+                        // Save z
+                        {
+                            let z_size = nv_ * dv_;
+                            unsafe {
+                                cuda_sys::lib().cuMemcpyDtoDAsync_v2(
+                                    *graph.d_la_gated_out.device_ptr(),
+                                    *graph.d_la_recur_out.device_ptr(),
+                                    z_size * 4, cu_stream);
+                            }
+                        }
+
+                        // Conv1d (with SiLU)
+                        {
+                            let threads = 256u32;
+                            let blocks = ((cd as u32) + threads - 1) / threads;
+                            unsafe {
+                                k.la_conv1d.clone().launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (
+                                        *conv_state_ptr,
+                                        *graph.d_la_conv_out.device_ptr(),
+                                        *graph.d_la_qkvz.device_ptr(),
+                                        *conv_weight_ptr,
+                                        cd as i32, kd as i32,
+                                    ),
+                                ).map_err(|e| format!("la_conv1d[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+
+                        // Gate and beta from BA
+                        let gate_ptr_local: u64;
+                        let beta_ptr_local: u64;
+                        {
+                            let threads = 256u32;
+                            let blocks = ((nv_ as u32) + threads - 1) / threads;
+                            gate_ptr_local = *graph.d_la_conv_out.device_ptr();
+                            beta_ptr_local = unsafe { (*graph.d_la_conv_out.device_ptr() as *const f32).add(nv_) as u64 };
+                            unsafe {
+                                k.compute_gate_beta.clone().launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (
+                                        gate_ptr_local, beta_ptr_local,
+                                        *graph.d_la_ba.device_ptr(),
+                                        *a_log_ptr, *dt_bias_ptr,
+                                        nv_ as i32, hr_ as i32,
+                                    ),
+                                ).map_err(|e| format!("compute_gate_beta[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+
+                        // Head repeat-interleave (if hr > 1)
+                        let q_ptr_for_recur: u64;
+                        let k_ptr_for_recur: u64;
+                        if hr_ > 1 {
+                            let total_q = (nv_ * dk_) as u32;
+                            let threads = 256u32;
+                            let blocks = (total_q + threads - 1) / threads;
+                            unsafe {
+                                k.repeat_interleave_heads.clone().launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (
+                                        *graph.d_la_recur_out.device_ptr(),
+                                        *graph.d_la_qkvz.device_ptr(),
+                                        nk_ as i32, dk_ as i32, hr_ as i32,
+                                    ),
+                                ).map_err(|e| format!("repeat_interleave q[{}]: {:?}", layer_idx, e))?;
+                                let k_in = (*graph.d_la_qkvz.device_ptr() as *const f32).add(key_dim) as u64;
+                                let k_out = (*graph.d_la_recur_out.device_ptr() as *const f32).add(nv_ * dk_) as u64;
+                                k.repeat_interleave_heads.clone().launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (k_out, k_in, nk_ as i32, dk_ as i32, hr_ as i32),
+                                ).map_err(|e| format!("repeat_interleave k[{}]: {:?}", layer_idx, e))?;
+                            }
+                            q_ptr_for_recur = *graph.d_la_recur_out.device_ptr();
+                            k_ptr_for_recur = unsafe { (*graph.d_la_recur_out.device_ptr() as *const f32).add(nv_ * dk_) as u64 };
+                        } else {
+                            q_ptr_for_recur = *graph.d_la_qkvz.device_ptr();
+                            k_ptr_for_recur = unsafe { (*graph.d_la_qkvz.device_ptr() as *const f32).add(key_dim) as u64 };
+                        }
+
+                        // L2 normalize + scale
+                        {
+                            let threads = 256u32;
+                            unsafe {
+                                k.l2norm_scale_per_head.clone().launch(
+                                    LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (q_ptr_for_recur, *scale, nv_ as i32, dk_ as i32),
+                                ).map_err(|e| format!("l2norm q[{}]: {:?}", layer_idx, e))?;
+                                k.l2norm_scale_per_head.clone().launch(
+                                    LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (k_ptr_for_recur, 1.0f32, nv_ as i32, dk_ as i32),
+                                ).map_err(|e| format!("l2norm k[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+
+                        // Gated delta net recurrence
+                        let v_ptr = unsafe { (*graph.d_la_qkvz.device_ptr() as *const f32).add(2 * key_dim) as u64 };
+                        unsafe {
+                            k.gated_delta_net_step.clone().launch(
+                                LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+                                (
+                                    *recur_state_ptr,
+                                    q_ptr_for_recur, k_ptr_for_recur, v_ptr,
+                                    gate_ptr_local, beta_ptr_local,
+                                    *graph.d_la_ba.device_ptr(),
+                                    nv_ as i32, dk_ as i32, dv_ as i32,
+                                ),
+                            ).map_err(|e| format!("delta_net_step[{}]: {:?}", layer_idx, e))?;
+                        }
+
+                        // Gated RMSNorm + SiLU
+                        {
+                            let threads = 256u32;
+                            let smem = (dv_ as u32 + 32) * 4;
+                            unsafe {
+                                k.gated_rmsnorm_silu.clone().launch(
+                                    LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: smem },
+                                    (
+                                        *graph.d_la_conv_out.device_ptr(),
+                                        *graph.d_la_ba.device_ptr(),
+                                        *graph.d_la_gated_out.device_ptr(),
+                                        *norm_weight_ptr, eps,
+                                        nv_ as i32, dv_ as i32,
+                                    ),
+                                ).map_err(|e| format!("gated_rmsnorm_silu[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+
+                        // Output projection
+                        let gated_size = nv_ * dv_;
+                        {
+                            let threads = 256u32;
+                            let blocks = ((gated_size as u32) + threads - 1) / threads;
+                            unsafe {
+                                k.fp32_to_bf16.clone().launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (
+                                        *graph.d_scratch.device_ptr(),
+                                        *graph.d_la_conv_out.device_ptr(),
+                                        gated_size as i32,
+                                    ),
+                                ).map_err(|e| format!("fp32_to_bf16[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+                        let o_w = &graph.weights[*out_proj];
+                        self.gemv_bf16_internal(o_w, *graph.d_scratch.device_ptr(),
+                            *graph.d_hidden.device_ptr())?;
+                    }
+
+                    GpuAttnConfig::GQA {
+                        q_proj, k_proj, v_proj, o_proj,
+                        fused_qkv,
+                        num_heads, num_kv_heads, head_dim, sm_scale,
+                        q_norm_ptr, k_norm_ptr, gated,
+                    } => {
+                        let nh = *num_heads; let nkv = *num_kv_heads;
+                        let hd = *head_dim; let half_dim = hd / 2;
+                        let kv_stride = nkv * hd;
+
+                        // QKV projection
+                        if let Some(fid) = fused_qkv {
+                            let fw = &graph.weights[*fid];
+                            self.gemv_bf16_to_f32(fw, *graph.d_hidden.device_ptr(),
+                                *graph.d_gqa_q.device_ptr())?;
+                            let q_size = if *gated { nh * hd * 2 } else { nh * hd };
+                            let k_offset = q_size;
+                            let v_offset = k_offset + kv_stride;
+                            unsafe {
+                                cuda_sys::lib().cuMemcpyDtoDAsync_v2(
+                                    *graph.d_gqa_k.device_ptr(),
+                                    (*graph.d_gqa_q.device_ptr() as *const f32).add(k_offset) as u64,
+                                    kv_stride * 4, cu_stream);
+                                cuda_sys::lib().cuMemcpyDtoDAsync_v2(
+                                    *graph.d_gqa_v.device_ptr(),
+                                    (*graph.d_gqa_q.device_ptr() as *const f32).add(v_offset) as u64,
+                                    kv_stride * 4, cu_stream);
+                            }
+                        } else {
+                            let qw = &graph.weights[*q_proj];
+                            let kw = &graph.weights[*k_proj];
+                            let vw = &graph.weights[*v_proj];
+                            self.gemv_bf16_to_f32(qw, *graph.d_hidden.device_ptr(),
+                                *graph.d_gqa_q.device_ptr())?;
+                            self.gemv_bf16_to_f32(kw, *graph.d_hidden.device_ptr(),
+                                *graph.d_gqa_k.device_ptr())?;
+                            self.gemv_bf16_to_f32(vw, *graph.d_hidden.device_ptr(),
+                                *graph.d_gqa_v.device_ptr())?;
+                        }
+
+                        // Split gated Q
+                        if *gated {
+                            let total = (nh * hd) as u32;
+                            let threads = 256u32;
+                            let blocks = (total + threads - 1) / threads;
+                            unsafe {
+                                k.split_gated_q.clone().launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (
+                                        *graph.d_gqa_q.device_ptr(),
+                                        *graph.d_la_qkvz.device_ptr(),
+                                        *graph.d_gqa_q.device_ptr(),
+                                        nh as i32, hd as i32,
+                                    ),
+                                ).map_err(|e| format!("split_gated_q[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+
+                        // QK norm
+                        if *q_norm_ptr != 0 {
+                            let threads = 256u32;
+                            let cfg = LaunchConfig { grid_dim: (nh as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+                            unsafe {
+                                k.per_head_rmsnorm.clone().launch(cfg, (
+                                    *graph.d_gqa_q.device_ptr(), *q_norm_ptr, eps,
+                                    nh as i32, hd as i32, 0i32,
+                                )).map_err(|e| format!("per_head_rmsnorm Q[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+                        if *k_norm_ptr != 0 {
+                            let threads = 256u32;
+                            let cfg = LaunchConfig { grid_dim: (nkv as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+                            unsafe {
+                                k.per_head_rmsnorm.clone().launch(cfg, (
+                                    *graph.d_gqa_k.device_ptr(), *k_norm_ptr, eps,
+                                    nkv as i32, hd as i32, 0i32,
+                                )).map_err(|e| format!("per_head_rmsnorm K[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+
+                        // RoPE
+                        if let Some(ref d_cos) = graph.d_rope_cos {
+                            let total_work = (nh + nkv) * half_dim;
+                            let threads = 256u32;
+                            let blocks = ((total_work as u32) + threads - 1) / threads;
+                            unsafe {
+                                k.apply_rope_g.clone().launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (
+                                        *graph.d_gqa_q.device_ptr(),
+                                        *graph.d_gqa_k.device_ptr(),
+                                        *d_cos.device_ptr(),
+                                        *graph.d_rope_sin.as_ref().unwrap().device_ptr(),
+                                        d_pos_ptr,
+                                        nh as i32, nkv as i32, hd as i32, half_dim as i32,
+                                    ),
+                                ).map_err(|e| format!("apply_rope_g[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+
+                        // KV cache write
+                        {
+                            let threads = 256u32;
+                            let blocks = ((kv_stride as u32) + threads - 1) / threads;
+                            unsafe {
+                                k.kv_cache_write_g.clone().launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (
+                                        graph.kv_k_ptrs[layer_idx],
+                                        graph.kv_v_ptrs[layer_idx],
+                                        *graph.d_gqa_k.device_ptr(),
+                                        *graph.d_gqa_v.device_ptr(),
+                                        d_pos_ptr, kv_stride as i32,
+                                    ),
+                                ).map_err(|e| format!("kv_cache_write_g[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+
+                        // GQA attention
+                        {
+                            let threads = 256u32;
+                            let q_smem = (hd as u32) * 4;
+                            let shared_mem_bytes = q_smem + 128;
+                            unsafe {
+                                k.gqa_attention_g.clone().launch(
+                                    LaunchConfig {
+                                        grid_dim: (nh as u32, 1, 1),
+                                        block_dim: (threads, 1, 1),
+                                        shared_mem_bytes,
+                                    },
+                                    (
+                                        *graph.d_gqa_out.device_ptr(),
+                                        *graph.d_gqa_q.device_ptr(),
+                                        graph.kv_k_ptrs[layer_idx],
+                                        graph.kv_v_ptrs[layer_idx],
+                                        *sm_scale,
+                                        nh as i32, nkv as i32, hd as i32,
+                                        d_seq_len_ptr,
+                                        graph.kv_max_seq as i32,
+                                    ),
+                                ).map_err(|e| format!("gqa_attention_g[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+
+                        // Gated attention
+                        if *gated {
+                            let total = (nh * hd) as u32;
+                            let threads = 256u32;
+                            let blocks = (total + threads - 1) / threads;
+                            unsafe {
+                                k.apply_gated_attn.clone().launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (
+                                        *graph.d_gqa_out.device_ptr(),
+                                        *graph.d_la_qkvz.device_ptr(),
+                                        (nh * hd) as i32,
+                                    ),
+                                ).map_err(|e| format!("apply_gated_attn[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+
+                        // O projection
+                        let attn_out_dim = nh * hd;
+                        {
+                            let threads = 256u32;
+                            let blocks = ((attn_out_dim as u32) + threads - 1) / threads;
+                            unsafe {
+                                k.fp32_to_bf16.clone().launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (
+                                        *graph.d_scratch.device_ptr(),
+                                        *graph.d_gqa_out.device_ptr(),
+                                        attn_out_dim as i32,
+                                    ),
+                                ).map_err(|e| format!("fp32_to_bf16[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+                        let o_w = &graph.weights[*o_proj];
+                        self.gemv_bf16_internal(o_w, *graph.d_scratch.device_ptr(),
+                            *graph.d_hidden.device_ptr())?;
+
+                        gqa_cache_idx += 1;
+                    }
+
+                    GpuAttnConfig::MLA { .. } => {
+                        return Err("MLA not supported in per-layer graph path".to_string());
+                    }
+                }
+
+                // Post-attention norm
+                {
+                    let smem = (hs as u32) * 4;
+                    let threads = 256u32.min(hs as u32);
+                    unsafe {
+                        k.fused_add_rmsnorm.clone().launch(
+                            LaunchConfig { grid_dim: (1, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: smem },
+                            (
+                                *graph.d_hidden.device_ptr(),
+                                *graph.d_residual.device_ptr(),
+                                layer.post_attn_norm_ptr,
+                                eps, hs as i32, 0i32,
+                            ),
+                        ).map_err(|e| format!("post_attn_norm[{}]: {:?}", layer_idx, e))?;
+                    }
+                }
+
+                // Dense MLP (for non-MoE layers in the routing range)
+                let is_moe_layer = layer_idx < graph.moe_layers.len()
+                    && graph.moe_layers[layer_idx].is_some();
+                if !is_moe_layer {
+                    if let GpuMlpConfig::Dense { gate_proj, up_proj, down_proj } = &layer.mlp {
+                        let gw = &graph.weights[*gate_proj];
+                        let uw = &graph.weights[*up_proj];
+                        let dw = &graph.weights[*down_proj];
+                        let inter = gw.rows;
+
+                        self.gemv_bf16_internal(gw, *graph.d_hidden.device_ptr(),
+                            *graph.d_expert_gate_up.device_ptr())?;
+                        let up_out_ptr = unsafe {
+                            (*graph.d_expert_gate_up.device_ptr() as *const u16).add(inter) as u64
+                        };
+                        self.gemv_bf16_internal(uw, *graph.d_hidden.device_ptr(), up_out_ptr)?;
+                        unsafe {
+                            k.silu_mul.clone().launch(
+                                LaunchConfig::for_num_elems(inter as u32),
+                                (*graph.d_expert_scratch.device_ptr(), *graph.d_expert_gate_up.device_ptr(), inter as i32),
+                            ).map_err(|e| format!("silu_mul dense[{}]: {:?}", layer_idx, e))?;
+                        }
+                        self.gemv_bf16_internal(dw, *graph.d_expert_scratch.device_ptr(),
+                            *graph.d_hidden.device_ptr())?;
+                    }
+                }
+
+                // For MoE layers at the end of the routing range: gate GEMV + topk
+                if is_moe_layer && layer_idx == range_end {
+                    let moe = graph.moe_layers[layer_idx].as_ref().unwrap();
+                    let topk = moe.topk;
+                    let ne = moe.num_experts;
+                    let sf = moe.scoring_func;
+                    let gate_wid = moe.gate_wid;
+                    let gate_bias_ptr = moe.gate_bias_ptr;
+                    let e_score_corr_ptr = moe.e_score_corr_ptr;
+
+                    // Gate GEMV
+                    let logits_ptr = unsafe {
+                        (*graph.d_fp32_scratch.device_ptr() as *const f32).add(hs) as u64
+                    };
+                    {
+                        let w = &graph.weights[gate_wid];
+                        let alpha: f32 = 1.0;
+                        let beta: f32 = 0.0;
+                        unsafe {
+                            cublas_result::gemm_ex(
+                                *self.blas.handle(),
+                                cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                                cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                                w.rows as i32, 1, w.cols as i32,
+                                &alpha as *const f32 as *const std::ffi::c_void,
+                                w.ptr as *const std::ffi::c_void,
+                                cublas_sys::cudaDataType::CUDA_R_16BF, w.cols as i32,
+                                *graph.d_hidden.device_ptr() as *const std::ffi::c_void,
+                                cublas_sys::cudaDataType::CUDA_R_16BF, hs as i32,
+                                &beta as *const f32 as *const std::ffi::c_void,
+                                logits_ptr as *mut std::ffi::c_void,
+                                cublas_sys::cudaDataType::CUDA_R_32F, w.rows as i32,
+                                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                            ).map_err(|e| format!("gate GEMV[{}]: {:?}", layer_idx, e))?;
+                        }
+                    }
+
+                    // TopK routing
+                    let topk_ids_dptr = if let Some(ref pm) = graph.pinned_topk_ids {
+                        pm.device_ptr
+                    } else {
+                        *graph.d_topk_indices.device_ptr()
+                    };
+                    let topk_wts_dptr = if let Some(ref pm) = graph.pinned_topk_weights {
+                        pm.device_ptr
+                    } else {
+                        *graph.d_topk_weights.device_ptr()
+                    };
+                    {
+                        let smem = (ne as u32) * 4;
+                        let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: smem };
+                        if sf == 1 {
+                            let bias_ptr = if gate_bias_ptr != 0 { gate_bias_ptr } else { 0u64 };
+                            let corr_ptr = if e_score_corr_ptr != 0 { e_score_corr_ptr } else { 0u64 };
+                            unsafe {
+                                k.sigmoid_topk.clone().launch(cfg, (
+                                    logits_ptr, bias_ptr, corr_ptr,
+                                    topk_ids_dptr, topk_wts_dptr,
+                                    ne as i32, topk as i32,
+                                )).map_err(|e| format!("sigmoid_topk[{}]: {:?}", layer_idx, e))?;
+                            }
+                        } else {
+                            unsafe {
+                                k.softmax_topk.clone().launch(cfg, (
+                                    logits_ptr, topk_ids_dptr, topk_wts_dptr,
+                                    ne as i32, topk as i32,
+                                )).map_err(|e| format!("softmax_topk[{}]: {:?}", layer_idx, e))?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Final norm + LM head ──
+        if include_final {
+            // Final RMSNorm
+            {
+                let smem = (hs as u32) * 4;
+                let threads = 256u32.min(hs as u32);
+                unsafe {
+                    k.fused_add_rmsnorm.clone().launch(
+                        LaunchConfig { grid_dim: (1, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: smem },
+                        (
+                            *graph.d_hidden.device_ptr(),
+                            *graph.d_residual.device_ptr(),
+                            graph.final_norm_ptr,
+                            eps, hs as i32, 0i32,
+                        ),
+                    ).map_err(|e| format!("final_norm: {:?}", e))?;
+                }
+            }
+
+            // LM head GEMV
+            {
+                let w = &graph.weights[graph.lm_head_wid];
+                let alpha: f32 = 1.0;
+                let beta: f32 = 0.0;
+                unsafe {
+                    cublas_result::gemm_ex(
+                        *self.blas.handle(),
+                        cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                        cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                        w.rows as i32, 1, w.cols as i32,
+                        &alpha as *const f32 as *const std::ffi::c_void,
+                        w.ptr as *const std::ffi::c_void,
+                        cublas_sys::cudaDataType::CUDA_R_16BF, w.cols as i32,
+                        *graph.d_hidden.device_ptr() as *const std::ffi::c_void,
+                        cublas_sys::cudaDataType::CUDA_R_16BF, hs as i32,
+                        &beta as *const f32 as *const std::ffi::c_void,
+                        *graph.d_logits.device_ptr() as *mut std::ffi::c_void,
+                        cublas_sys::cudaDataType::CUDA_R_32F, w.rows as i32,
+                        cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                        cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                    ).map_err(|e| format!("lm_head GEMV: {:?}", e))?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Replay per-layer CUDA graphs for one decode token.
+    /// Between each pair of graphs: sync, read routing, DMA cold experts, populate pointer table.
+    /// Replay per-layer CUDA graphs for one decode step.
+    /// - do_final: if true, D2H logits after the last graph (single-GPU or final segment).
+    ///   If false, skip logits D2H (hidden state will be transferred to next GPU).
+    fn replay_per_layer_graphs(
+        &mut self,
+        token_id: usize,
+        position: usize,
+        do_final: bool,
+    ) -> Result<(), String> {
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| "No graph configured".to_string())?;
+        if !graph.per_layer_graphs_valid || graph.per_layer_graphs.is_empty() {
+            return Err("Per-layer graphs not captured".to_string());
+        }
+
+        let num_graphs = graph.per_layer_graphs.len();
+        let moe_indices = graph.per_layer_moe_indices.clone();
+        let replay_stream: cuda_sys::CUstream = *self.device.cu_stream();
+        let copy_stream = self.copy_stream.0;
+
+        // Update scalar params (token_id, pos, seq_len)
+        {
+            let token_id_i32 = token_id as i32;
+            let pos_i32 = position as i32;
+            let seq_len_i32 = (position + 1) as i32;
+            unsafe {
+                if let Some(ref buf) = graph.d_graph_token_id {
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        *buf.device_ptr(),
+                        &token_id_i32 as *const i32 as *const std::ffi::c_void,
+                        4, replay_stream);
+                }
+                if let Some(ref buf) = graph.d_graph_pos {
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        *buf.device_ptr(),
+                        &pos_i32 as *const i32 as *const std::ffi::c_void,
+                        4, replay_stream);
+                }
+                if let Some(ref buf) = graph.d_graph_seq_len {
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        *buf.device_ptr(),
+                        &seq_len_i32 as *const i32 as *const std::ffi::c_void,
+                        4, replay_stream);
+                }
+            }
+        }
+
+        let hs = graph.hidden_size;
+        let max_ept = graph.max_experts_per_tok;
+        let use_pinned = graph.pinned_topk_ids.is_some() && graph.pinned_topk_weights.is_some();
+
+        // Double-buffer base pointers for cold expert DMA
+        let buf_base = [
+            *graph.d_expert_buf[0].device_ptr(),
+            *graph.d_expert_buf[1].device_ptr(),
+        ];
+        let w13p_off = graph.expert_buf_w13p_offset;
+        let w13s_off = graph.expert_buf_w13s_offset;
+        let w2p_off = graph.expert_buf_w2p_offset;
+        let w2s_off = graph.expert_buf_w2s_offset;
+
+        for graph_idx in 0..num_graphs {
+            // ── If not first graph: populate d_batch_upload with expert pointers ──
+            // (The previous graph's routing results are now on GPU after sync)
+            if graph_idx > 0 {
+                let moe_layer_idx = moe_indices[graph_idx - 1];
+                let topk = graph.moe_layers[moe_layer_idx].as_ref()
+                    .map(|m| m.topk).unwrap_or(10);
+
+                // Sync to get routing results
+                unsafe {
+                    let err = cuda_sys::lib().cuStreamSynchronize(replay_stream);
+                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                        return Err(format!("sync routing[{}]: {:?}", moe_layer_idx, err));
+                    }
+                }
+
+                // Read topk indices/weights from GPU
+                if use_pinned {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            graph.pinned_topk_ids.as_ref().unwrap().host_ptr as *const i32,
+                            graph.h_topk_ids.as_mut_ptr(), topk);
+                        std::ptr::copy_nonoverlapping(
+                            graph.pinned_topk_weights.as_ref().unwrap().host_ptr as *const f32,
+                            graph.h_topk_weights.as_mut_ptr(), topk);
+                    }
+                } else {
+                    unsafe {
+                        cuda_sys::lib().cuMemcpyDtoH_v2(
+                            graph.h_topk_ids.as_mut_ptr() as *mut std::ffi::c_void,
+                            *graph.d_topk_indices.device_ptr(), topk * 4);
+                        cuda_sys::lib().cuMemcpyDtoH_v2(
+                            graph.h_topk_weights.as_mut_ptr() as *mut std::ffi::c_void,
+                            *graph.d_topk_weights.device_ptr(), topk * 4);
+                    }
+                }
+
+                // Classify experts: HCS hit vs cold (need DMA)
+                let mut batch_count = 0usize;
+                let mut cold_experts: Vec<(usize, usize, f32)> = Vec::new(); // (topk_pos, expert_id, weight)
+                let moe_data = graph.moe_layers[moe_layer_idx].as_ref().unwrap();
+
+                for i in 0..topk {
+                    let eid = graph.h_topk_ids[i];
+                    if eid < 0 { continue; }
+                    let eid = eid as usize;
+                    let weight = graph.h_topk_weights[i];
+
+                    // Record activation for HCS heatmap
+                    if let Some(ref mut hcs) = graph.hcs {
+                        hcs.record_activation(moe_layer_idx, eid);
+                    }
+
+                    // Check HCS cache
+                    let hcs_ptrs = if let Some(ref hcs) = graph.hcs {
+                        hcs.get_fast(moe_layer_idx, eid)
+                    } else { None };
+
+                    if let Some((w13p, w13s, w2p, w2s)) = hcs_ptrs {
+                        if batch_count < max_ept {
+                            graph.h_batch_w13_packed_ptrs[batch_count] = w13p;
+                            graph.h_batch_w13_scales_ptrs[batch_count] = w13s;
+                            graph.h_batch_w2_packed_ptrs[batch_count] = w2p;
+                            graph.h_batch_w2_scales_ptrs[batch_count] = w2s;
+                            graph.h_batch_weights[batch_count] = weight;
+                            batch_count += 1;
+                        }
+                    } else {
+                        cold_experts.push((i, eid, weight));
+                    }
+                }
+
+                // DMA cold experts: use double-buffer slots (0,1) then APFL slots for overflow.
+                // Each cold expert needs its own buffer since all must be valid simultaneously
+                // when the expert graph replays.
+                for (ci, &(_topk_pos, eid, weight)) in cold_experts.iter().enumerate() {
+                    let expert = &moe_data.experts[eid];
+
+                    // Choose a buffer: first 2 use double-buffer, rest use APFL slots
+                    let (base, w13p, w13s, w2p, w2s) = if ci < 2 {
+                        let base = buf_base[ci];
+                        (base,
+                         base + w13p_off as u64, base + w13s_off as u64,
+                         base + w2p_off as u64, base + w2s_off as u64)
+                    } else if let Some(ref apfl) = graph.apfl {
+                        let apfl_idx = ci - 2;
+                        if apfl_idx < apfl.slots.len() {
+                            let slot = &apfl.slots[apfl_idx];
+                            let base = *slot.d_buf.device_ptr();
+                            (base,
+                             slot.w13_packed_ptr(), slot.w13_scales_ptr(),
+                             slot.w2_packed_ptr(), slot.w2_scales_ptr())
+                        } else {
+                            // No more slots — skip this expert (will use stale/zero pointer)
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    };
+
+                    // DMA all 4 weight arrays
+                    unsafe {
+                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                            w13p, expert.w13_packed_ptr as *const std::ffi::c_void,
+                            expert.w13_packed_bytes, copy_stream);
+                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                            w13s, expert.w13_scales_ptr as *const std::ffi::c_void,
+                            expert.w13_scales_bytes, copy_stream);
+                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                            w2p, expert.w2_packed_ptr as *const std::ffi::c_void,
+                            expert.w2_packed_bytes, copy_stream);
+                        cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                            w2s, expert.w2_scales_ptr as *const std::ffi::c_void,
+                            expert.w2_scales_bytes, copy_stream);
+                    }
+
+                    // Wait for this expert's DMA
+                    unsafe {
+                        cuda_sys::lib().cuStreamSynchronize(copy_stream);
+                    }
+
+                    // Add to batch
+                    if batch_count < max_ept {
+                        graph.h_batch_w13_packed_ptrs[batch_count] = w13p;
+                        graph.h_batch_w13_scales_ptrs[batch_count] = w13s;
+                        graph.h_batch_w2_packed_ptrs[batch_count] = w2p;
+                        graph.h_batch_w2_scales_ptrs[batch_count] = w2s;
+                        graph.h_batch_weights[batch_count] = weight;
+                        batch_count += 1;
+                    }
+                }
+
+                // Fill unused batch slots with dummy expert pointers (zero weight = no contribution).
+                // The graph was captured with grid.z = topk, so all topk slots must have valid pointers.
+                if batch_count < topk {
+                    let dummy_base = graph.d_dummy_expert.as_ref()
+                        .map(|b| *b.device_ptr()).unwrap_or(buf_base[0]);
+                    let dummy_ptrs = if let Some(ref dp) = graph.d_dummy_ptrs {
+                        // Read the 4 dummy pointers from the GPU-side array
+                        let mut ptrs = [0u64; 4];
+                        unsafe {
+                            cuda_sys::lib().cuMemcpyDtoH_v2(
+                                ptrs.as_mut_ptr() as *mut std::ffi::c_void,
+                                *dp.device_ptr(), 32);
+                        }
+                        ptrs
+                    } else {
+                        [dummy_base, dummy_base, dummy_base, dummy_base]
+                    };
+                    for i in batch_count..topk.min(max_ept) {
+                        graph.h_batch_w13_packed_ptrs[i] = dummy_ptrs[0];
+                        graph.h_batch_w13_scales_ptrs[i] = dummy_ptrs[1];
+                        graph.h_batch_w2_packed_ptrs[i] = dummy_ptrs[2];
+                        graph.h_batch_w2_scales_ptrs[i] = dummy_ptrs[3];
+                        graph.h_batch_weights[i] = 0.0; // zero weight = no contribution
+                    }
+                }
+
+                // Upload pointer table to GPU (d_batch_upload)
+                // The graph's expert kernels read from d_batch_upload at fixed addresses
+                let ptr_stride = max_ept * 8;
+                let fill_count = topk.min(max_ept); // fill all topk slots
+                unsafe {
+                    let h = graph.h_batch_upload.as_mut_ptr();
+                    std::ptr::copy_nonoverlapping(
+                        graph.h_batch_w13_packed_ptrs.as_ptr() as *const u8, h, fill_count * 8);
+                    std::ptr::copy_nonoverlapping(
+                        graph.h_batch_w13_scales_ptrs.as_ptr() as *const u8, h.add(ptr_stride), fill_count * 8);
+                    std::ptr::copy_nonoverlapping(
+                        graph.h_batch_w2_packed_ptrs.as_ptr() as *const u8, h.add(ptr_stride * 2), fill_count * 8);
+                    std::ptr::copy_nonoverlapping(
+                        graph.h_batch_w2_scales_ptrs.as_ptr() as *const u8, h.add(ptr_stride * 3), fill_count * 8);
+                    std::ptr::copy_nonoverlapping(
+                        graph.h_batch_weights.as_ptr() as *const u8, h.add(ptr_stride * 4), fill_count * 4);
+
+                    let upload_bytes = ptr_stride * 4 + max_ept * 4;
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        *graph.d_batch_upload.device_ptr(),
+                        h as *const std::ffi::c_void,
+                        upload_bytes, replay_stream);
+                }
+            }
+
+            // ── Replay graph ──
+            let exec = &graph.per_layer_graphs[graph_idx];
+            let err = unsafe { cuda_sys::lib().cuGraphLaunch(exec.0, replay_stream) };
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("cuGraphLaunch[{}]: {:?}", graph_idx, err));
+            }
+            // DEBUG: sync after each graph to pinpoint crashes
+            if std::env::var("KRASIS_GRAPH_DEBUG").is_ok() {
+                let sync_err = unsafe { cuda_sys::lib().cuStreamSynchronize(replay_stream) };
+                if sync_err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("graph[{}] post-launch sync: {:?}", graph_idx, sync_err));
+                }
+            }
+        }
+
+        // Final sync
+        unsafe {
+            let err = cuda_sys::lib().cuStreamSynchronize(replay_stream);
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("final sync: {:?}", err));
+            }
+        }
+
+        // D2H logits (only if this is the final segment)
+        if do_final {
+            unsafe {
+                let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+                    graph.h_logits.as_mut_ptr() as *mut std::ffi::c_void,
+                    *graph.d_logits.device_ptr(),
+                    graph.vocab_size * 4);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("D2H logits: {:?}", err));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Full GPU decode step: embedding → layer loop → final norm → LM head → logits.
     ///
     /// All computation on GPU via CUDA kernels. Zero Python, zero GIL.
@@ -4092,36 +5949,46 @@ impl GpuDecodeStore {
             log::info!("DBG {} [{:.4}, {:.4}, {:.4}, {:.4}]", label, buf[0], buf[1], buf[2], buf[3]);
         };
 
-        // ── 1. Embedding lookup ──
-        #[cfg(feature = "gpu-debug")]
-        log::info!("gpu_decode_step: token={}, pos={}", token_id, position);
-        {
-            let threads = 256u32;
-            let blocks = ((hs as u32) + threads - 1) / threads;
-            let cfg = LaunchConfig {
-                grid_dim: (blocks, 1, 1),
-                block_dim: (threads, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe {
-                k.embedding_lookup.clone().launch(cfg, (
-                    *graph.d_hidden.device_ptr(),
-                    graph.embedding_ptr,
-                    token_id as i32,
-                    hs as i32,
-                )).map_err(|e| format!("embedding_lookup: {:?}", e))?;
+        // ── Multi-GPU segment config ──
+        let seg_skip_emb = graph.segment_skip_embedding;
+        let seg_skip_final = graph.segment_skip_final;
+        let seg_start = graph.segment_layer_start;
+        let seg_end = if graph.segment_layer_end > 0 { graph.segment_layer_end } else { graph.layers.len() };
+        let seg_gqa_offset = graph.segment_gqa_cache_offset;
+
+        // ── 1. Embedding lookup (skip if this segment receives uploaded hidden state) ──
+        if !seg_skip_emb {
+            #[cfg(feature = "gpu-debug")]
+            log::info!("gpu_decode_step: token={}, pos={}", token_id, position);
+            {
+                let threads = 256u32;
+                let blocks = ((hs as u32) + threads - 1) / threads;
+                let cfg = LaunchConfig {
+                    grid_dim: (blocks, 1, 1),
+                    block_dim: (threads, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    k.embedding_lookup.clone().launch(cfg, (
+                        *graph.d_hidden.device_ptr(),
+                        graph.embedding_ptr,
+                        token_id as i32,
+                        hs as i32,
+                    )).map_err(|e| format!("embedding_lookup: {:?}", e))?;
+                }
+            }
+
+            #[cfg(feature = "gpu-debug")]
+            {
+                self.device.synchronize().map_err(|e| format!("sync after emb: {:?}", e))?;
+                debug_peek_bf16("after_embedding d_hidden", *graph.d_hidden.device_ptr(), 4);
             }
         }
 
-        #[cfg(feature = "gpu-debug")]
-        {
-            self.device.synchronize().map_err(|e| format!("sync after emb: {:?}", e))?;
-            debug_peek_bf16("after_embedding d_hidden", *graph.d_hidden.device_ptr(), 4);
-        }
-
-        let mut first_residual = true;
+        // first_residual: true only when embedding was done (layer 0 initializes residual stream)
+        let mut first_residual = !seg_skip_emb && seg_start == 0;
         let num_layers = graph.layers.len();
-        let mut gqa_cache_idx = 0usize; // Track which GQA cache slot we're on
+        let mut gqa_cache_idx = seg_gqa_offset; // Start at offset for multi-GPU segments
 
         // Timing accumulators for this token
         let mut tt_attn = 0.0f64;
@@ -4130,8 +5997,8 @@ impl GpuDecodeStore {
         let mut tt_shared = 0.0f64;
         let mut tt_dense_mlp = 0.0f64;
 
-        // ── 2. Layer loop ──
-        for layer_idx in 0..num_layers {
+        // ── 2. Layer loop (respects multi-GPU segment bounds) ──
+        for layer_idx in seg_start..seg_end.min(num_layers) {
             let layer = &graph.layers[layer_idx];
 
             // ── Pre-attention norm (fused residual add + RMSNorm) ──
@@ -4911,7 +6778,24 @@ impl GpuDecodeStore {
             }
         }
 
-        // ── 3. Final norm ──
+        // ── 3. Final norm (skip if this segment doesn't produce logits) ──
+        if seg_skip_final {
+            // Segment ends here — hidden+residual ready for download to next GPU.
+            // Just sync to ensure all layer kernels are done.
+            self.device.synchronize()
+                .map_err(|e| format!("sync segment end: {:?}", e))?;
+            if timing {
+                let tt_total = t0.elapsed().as_secs_f64();
+                graph.t_attn += tt_attn;
+                graph.t_route += tt_moe;
+                graph.t_shared += tt_shared;
+                graph.t_dense_mlp += tt_dense_mlp;
+                graph.t_total += tt_total;
+                graph.timing_step_count += 1;
+            }
+            return Ok(());
+        }
+
         let t_lmhead_start = if timing {
             self.device.synchronize().map_err(|e| format!("timing sync: {:?}", e))?;
             Instant::now()
@@ -4992,6 +6876,675 @@ impl GpuDecodeStore {
         }
 
         Ok(())
+    }
+
+    // ── Multi-GPU layer-split decode ───────────────────────────────────
+
+    /// Download hidden + residual state from GPU to host buffer.
+    /// Returns (hidden_bf16, residual_bf16) as byte vectors.
+    pub fn download_hidden_state(&self) -> Result<(Vec<u8>, Vec<u8>), String> {
+        let graph = self.graph.as_ref()
+            .ok_or("graph not configured")?;
+        let hs = graph.hidden_size;
+        let bytes = hs * 2; // BF16
+
+        let mut h_hidden = vec![0u8; bytes];
+        let mut h_residual = vec![0u8; bytes];
+
+        self.device.synchronize()
+            .map_err(|e| format!("sync before download_hidden: {:?}", e))?;
+
+        unsafe {
+            let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+                h_hidden.as_mut_ptr() as *mut std::ffi::c_void,
+                *graph.d_hidden.device_ptr(),
+                bytes);
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("D2H hidden: {:?}", err));
+            }
+            let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+                h_residual.as_mut_ptr() as *mut std::ffi::c_void,
+                *graph.d_residual.device_ptr(),
+                bytes);
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("D2H residual: {:?}", err));
+            }
+        }
+
+        Ok((h_hidden, h_residual))
+    }
+
+    /// Upload hidden + residual state from host buffer to GPU.
+    pub fn upload_hidden_state(&self, hidden: &[u8], residual: &[u8]) -> Result<(), String> {
+        let graph = self.graph.as_ref()
+            .ok_or("graph not configured")?;
+        let hs = graph.hidden_size;
+        let bytes = hs * 2;
+
+        if hidden.len() != bytes || residual.len() != bytes {
+            return Err(format!(
+                "upload_hidden_state: expected {} bytes, got hidden={} residual={}",
+                bytes, hidden.len(), residual.len()));
+        }
+
+        unsafe {
+            let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                *graph.d_hidden.device_ptr(),
+                hidden.as_ptr() as *const std::ffi::c_void,
+                bytes);
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("H2D hidden: {:?}", err));
+            }
+            let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                *graph.d_residual.device_ptr(),
+                residual.as_ptr() as *const std::ffi::c_void,
+                bytes);
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("H2D residual: {:?}", err));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Copy KV cache data from this store (GPU0) to an auxiliary store (GPU1)
+    /// for GQA layers that fall within GPU1's segment.
+    ///
+    /// Called once per request after prefill, before decode begins.
+    /// Only copies positions [0..prompt_len) — decode will write new positions
+    /// directly on each GPU.
+    pub fn copy_kv_to_aux(
+        &self,
+        aux_store: &mut GpuDecodeStore,
+        split_layer: usize,
+        gqa_offset: usize,
+        prompt_len: usize,
+    ) -> Result<(), String> {
+        let graph = self.graph.as_ref().ok_or("primary graph not configured")?;
+        let aux_graph = aux_store.graph.as_ref().ok_or("aux graph not configured")?;
+        let num_layers = graph.layers.len();
+
+        // Iterate GQA layers in GPU1's segment [split_layer..num_layers)
+        let mut copied = 0usize;
+        let mut total_bytes = 0usize;
+        for layer_idx in split_layer..num_layers {
+            let k_src = graph.kv_k_ptrs[layer_idx];
+            let v_src = graph.kv_v_ptrs[layer_idx];
+            if k_src == 0 || v_src == 0 { continue; } // Not a GQA layer
+
+            let k_dst = aux_graph.kv_k_ptrs[layer_idx];
+            let v_dst = aux_graph.kv_v_ptrs[layer_idx];
+            if k_dst == 0 || v_dst == 0 {
+                return Err(format!("Aux store missing KV cache for GQA layer {}", layer_idx));
+            }
+
+            // Get KV stride from GQA config
+            let kv_stride = if let GpuAttnConfig::GQA { num_kv_heads, head_dim, .. } = &graph.layers[layer_idx].attn {
+                num_kv_heads * head_dim
+            } else {
+                continue; // Not GQA, skip
+            };
+
+            // FP8 = 1 byte per element. Copy [0..prompt_len) positions.
+            let bytes = prompt_len * kv_stride;
+            if bytes == 0 { continue; }
+
+            // D2H from GPU0, then H2D to GPU1 (peer access not guaranteed)
+            let mut host_buf = vec![0u8; bytes];
+
+            // Bind GPU0 context for D2H
+            self.device.bind_to_thread()
+                .map_err(|e| format!("bind GPU0 for KV copy: {:?}", e))?;
+            self.device.synchronize()
+                .map_err(|e| format!("sync GPU0 before KV copy: {:?}", e))?;
+
+            unsafe {
+                // K cache: D2H from GPU0
+                let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+                    host_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                    k_src, bytes);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("KV copy D2H K layer {}: {:?}", layer_idx, err));
+                }
+            }
+
+            // Bind GPU1 context for H2D
+            aux_store.device.bind_to_thread()
+                .map_err(|e| format!("bind GPU1 for KV copy: {:?}", e))?;
+            unsafe {
+                // K cache: H2D to GPU1
+                let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                    k_dst,
+                    host_buf.as_ptr() as *const std::ffi::c_void,
+                    bytes);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("KV copy H2D K layer {}: {:?}", layer_idx, err));
+                }
+            }
+
+            // Back to GPU0 for V D2H
+            self.device.bind_to_thread()
+                .map_err(|e| format!("bind GPU0 for KV V copy: {:?}", e))?;
+            unsafe {
+                // V cache: D2H from GPU0
+                let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+                    host_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                    v_src, bytes);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("KV copy D2H V layer {}: {:?}", layer_idx, err));
+                }
+            }
+
+            // GPU1 for V H2D
+            aux_store.device.bind_to_thread()
+                .map_err(|e| format!("bind GPU1 for KV V copy: {:?}", e))?;
+            unsafe {
+                // V cache: H2D to GPU1
+                let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                    v_dst,
+                    host_buf.as_ptr() as *const std::ffi::c_void,
+                    bytes);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("KV copy H2D V layer {}: {:?}", layer_idx, err));
+                }
+            }
+            copied += 1;
+            total_bytes += bytes * 2; // K + V
+        }
+
+        // Set KV position on aux store
+        if let Some(ref mut ag) = aux_store.graph.as_mut() {
+            ag.kv_current_pos = prompt_len;
+        }
+
+        log::info!("copy_kv_to_aux: copied {} GQA layers, {} bytes total ({} positions)",
+            copied, total_bytes, prompt_len);
+        Ok(())
+    }
+
+    /// Decode a segment of layers (for multi-GPU layer split).
+    ///
+    /// - `do_embedding`: if true, performs embedding lookup for token_id
+    /// - `layer_start..layer_end`: which layers to execute
+    /// - `do_final`: if true, performs final norm + LM head + logits D2H
+    /// - `gqa_cache_offset`: number of GQA layers before layer_start (for KV cache indexing)
+    pub fn gpu_decode_segment(
+        &mut self,
+        token_id: usize,
+        position: usize,
+        do_embedding: bool,
+        layer_start: usize,
+        layer_end: usize,
+        do_final: bool,
+        gqa_cache_offset: usize,
+    ) -> Result<(), String> {
+        if !self.kernels_loaded {
+            return Err("Decode kernels not loaded".to_string());
+        }
+
+        // Set segment config on graph, run, then restore defaults
+        let mut graph = self.graph.take()
+            .ok_or_else(|| "Call configure first".to_string())?;
+
+        graph.segment_skip_embedding = !do_embedding;
+        graph.segment_skip_final = !do_final;
+        graph.segment_layer_start = layer_start;
+        graph.segment_layer_end = layer_end;
+        graph.segment_gqa_cache_offset = gqa_cache_offset;
+
+        let result = self.gpu_decode_step_with_graph(&mut graph, token_id, position);
+
+        // Restore defaults
+        graph.segment_skip_embedding = false;
+        graph.segment_skip_final = false;
+        graph.segment_layer_start = 0;
+        graph.segment_layer_end = 0;
+        graph.segment_gqa_cache_offset = 0;
+
+        self.graph = Some(graph);
+        result
+    }
+
+    /// Multi-GPU streaming decode: coordinates two GpuDecodeStore instances.
+    ///
+    /// `self` owns layers [0..split_layer) (GPU0).
+    /// `aux_store` (via raw pointer) owns layers [split_layer..num_layers) (GPU1).
+    /// GPU0 does embedding. GPU1 does final norm + LM head.
+    /// Hidden state transfers via host memory (D2H + H2D, ~8KB, <1μs).
+    ///
+    /// The streaming callback `on_token` is the same as gpu_generate_stream.
+    pub fn gpu_generate_stream_multi<F>(
+        &mut self,
+        aux_store_addr: usize,
+        split_layer: usize,
+        gqa_cache_offset: usize,
+        first_token: usize,
+        start_position: usize,
+        max_tokens: usize,
+        temperature: f32,
+        top_k: usize,
+        top_p: f32,
+        stop_ids: &[usize],
+        tokenizer: &tokenizers::Tokenizer,
+        presence_penalty: f32,
+        mut on_token: F,
+    ) -> usize
+    where
+        F: FnMut(usize, &str, Option<&str>) -> bool,
+    {
+        use std::time::Instant;
+
+        // Bind primary GPU context
+        if let Err(e) = self.device.bind_to_thread() {
+            log::error!("gpu_generate_stream_multi: failed to bind primary CUDA context: {:?}", e);
+            return 0;
+        }
+
+        let aux_store = unsafe { &mut *(aux_store_addr as *mut GpuDecodeStore) };
+
+        let vocab_size = match aux_store.graph.as_ref() {
+            Some(g) => g.vocab_size,
+            None => { log::error!("aux store graph not configured"); return 0; }
+        };
+        let num_layers = match self.graph.as_ref() {
+            Some(g) => g.layers.len(),
+            None => { log::error!("primary store graph not configured"); return 0; }
+        };
+
+        let stop_set: std::collections::HashSet<usize> = stop_ids.iter().copied().collect();
+
+        // RNG
+        let mut rng_state: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        if rng_state == 0 { rng_state = 0xDEADBEEF; }
+        let mut rng_next = move || -> u64 {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            rng_state
+        };
+
+        // Begin activation tracking on both stores
+        if let Some(ref mut hcs) = self.graph.as_mut().unwrap().hcs {
+            hcs.begin_prompt();
+        }
+        if let Some(ref mut hcs) = aux_store.graph.as_mut().unwrap().hcs {
+            hcs.begin_prompt();
+        }
+
+        let mut detok = crate::server::StreamDetokenizer::new(tokenizer);
+        let mut seen_tokens: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        seen_tokens.insert(first_token);
+
+        let mut next_token = first_token;
+        let mut generated = 0usize;
+        let decode_start = Instant::now();
+
+        log::info!("gpu_generate_stream_multi: split={}, gqa_offset={}, layers={}",
+            split_layer, gqa_cache_offset, num_layers);
+
+        // Per-GPU timing accumulators
+        let timing = self.graph.as_ref().map_or(false, |g| g.timing_enabled);
+        let mut t_gpu0_total = 0.0f64;
+        let mut t_gpu1_total = 0.0f64;
+        let mut t_transfer_total = 0.0f64;
+        let mut t_sample_total = 0.0f64;
+
+        // Initialize CUDA graph buffers on both stores
+        let no_graph = std::env::var("KRASIS_NO_GRAPH").map(|v| v != "0").unwrap_or(false);
+        {
+            // GPU0 graph buffers
+            if let Err(e) = self.device.bind_to_thread() {
+                log::error!("multi-gpu: bind GPU0 for graph init: {:?}", e);
+            } else {
+                let needs_init = self.graph.as_ref().map(|g| g.d_graph_token_id.is_none()).unwrap_or(false);
+                if needs_init {
+                    match self.init_cuda_graph_buffers() {
+                        Ok(()) => eprintln!("[krasis] GPU0 CUDA graph buffers initialized"),
+                        Err(e) => eprintln!("[krasis] GPU0 graph init failed: {}", e),
+                    }
+                }
+            }
+            // GPU1 graph buffers
+            if let Err(e) = aux_store.device.bind_to_thread() {
+                log::error!("multi-gpu: bind GPU1 for graph init: {:?}", e);
+            } else {
+                let needs_init = aux_store.graph.as_ref().map(|g| g.d_graph_token_id.is_none()).unwrap_or(false);
+                if needs_init {
+                    match aux_store.init_cuda_graph_buffers() {
+                        Ok(()) => eprintln!("[krasis] GPU1 CUDA graph buffers initialized"),
+                        Err(e) => eprintln!("[krasis] GPU1 graph init failed: {}", e),
+                    }
+                }
+            }
+        }
+
+        for step in 0..max_tokens {
+            let pos = start_position + step;
+
+            // Check if per-layer graphs are available on both GPUs
+            let gpu0_has_graphs = self.graph.as_ref()
+                .map(|g| g.per_layer_graphs_valid).unwrap_or(false);
+            let gpu1_has_graphs = aux_store.graph.as_ref()
+                .map(|g| g.per_layer_graphs_valid).unwrap_or(false);
+            let use_graphs = gpu0_has_graphs && gpu1_has_graphs && !no_graph;
+
+            if use_graphs {
+                // ── Per-layer graph replay path ──
+
+                // GPU0: replay graphs for layers [0..split_layer)
+                if let Err(e) = self.device.bind_to_thread() {
+                    log::error!("multi-gpu: bind GPU0 failed: {:?}", e);
+                    break;
+                }
+                let t_gpu0_start = Instant::now();
+                if let Err(e) = self.replay_per_layer_graphs(next_token, pos, false) {
+                    eprintln!("[krasis] GPU0 graph replay failed: {}, falling back", e);
+                    self.invalidate_cuda_graph();
+                    aux_store.invalidate_cuda_graph();
+                    // Fall through to ungraphed path on next iteration
+                    continue;
+                }
+                let t_gpu0_end = Instant::now();
+                t_gpu0_total += t_gpu0_end.duration_since(t_gpu0_start).as_secs_f64();
+
+                // Transfer hidden state GPU0 → GPU1 via host
+                let t_xfer_start = Instant::now();
+                let (h_hidden, h_residual) = match self.download_hidden_state() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::error!("multi-gpu download_hidden error: {}", e);
+                        break;
+                    }
+                };
+                if let Err(e) = aux_store.device.bind_to_thread() {
+                    log::error!("multi-gpu: bind GPU1 failed: {:?}", e);
+                    break;
+                }
+                if let Err(e) = aux_store.upload_hidden_state(&h_hidden, &h_residual) {
+                    log::error!("multi-gpu upload_hidden error: {}", e);
+                    break;
+                }
+                let t_xfer_end = Instant::now();
+                t_transfer_total += t_xfer_end.duration_since(t_xfer_start).as_secs_f64();
+
+                // GPU1: replay graphs for layers [split_layer..num_layers) + final
+                let t_gpu1_start = Instant::now();
+                if let Err(e) = aux_store.replay_per_layer_graphs(next_token, pos, true) {
+                    eprintln!("[krasis] GPU1 graph replay failed: {}, falling back", e);
+                    self.invalidate_cuda_graph();
+                    aux_store.invalidate_cuda_graph();
+                    continue;
+                }
+                let t_gpu1_end = Instant::now();
+                t_gpu1_total += t_gpu1_end.duration_since(t_gpu1_start).as_secs_f64();
+
+            } else {
+                // ── Ungraphed path (step 0, or after invalidation) ──
+
+                // GPU0: embedding + layers [0..split_layer)
+                if let Err(e) = self.device.bind_to_thread() {
+                    log::error!("multi-gpu: bind GPU0 failed: {:?}", e);
+                    break;
+                }
+                let t_gpu0_start = if timing {
+                    self.device.synchronize().ok();
+                    Instant::now()
+                } else { Instant::now() };
+
+                if let Err(e) = self.gpu_decode_segment(
+                    next_token, pos,
+                    true,           // do_embedding
+                    0,              // layer_start
+                    split_layer,    // layer_end
+                    false,          // do_final (not last segment)
+                    0,              // gqa_cache_offset (starts at 0)
+                ) {
+                    log::error!("multi-gpu GPU0 segment error: {}", e);
+                    break;
+                }
+
+                if timing { self.device.synchronize().ok(); }
+                let t_gpu0_end = Instant::now();
+                t_gpu0_total += t_gpu0_end.duration_since(t_gpu0_start).as_secs_f64();
+
+                // Transfer hidden state GPU0 → GPU1 via host
+                let t_xfer_start = Instant::now();
+                let (h_hidden, h_residual) = match self.download_hidden_state() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::error!("multi-gpu download_hidden error: {}", e);
+                        break;
+                    }
+                };
+
+                if let Err(e) = aux_store.device.bind_to_thread() {
+                    log::error!("multi-gpu: bind GPU1 failed: {:?}", e);
+                    break;
+                }
+                if let Err(e) = aux_store.upload_hidden_state(&h_hidden, &h_residual) {
+                    log::error!("multi-gpu upload_hidden error: {}", e);
+                    break;
+                }
+                if timing { aux_store.device.synchronize().ok(); }
+                let t_xfer_end = Instant::now();
+                t_transfer_total += t_xfer_end.duration_since(t_xfer_start).as_secs_f64();
+
+                let t_gpu1_start = Instant::now();
+                if let Err(e) = aux_store.gpu_decode_segment(
+                    next_token, pos,
+                    false,              // no embedding
+                    split_layer,        // layer_start
+                    num_layers,         // layer_end
+                    true,               // do_final (last segment)
+                    gqa_cache_offset,   // GQA layers before split
+                ) {
+                    log::error!("multi-gpu GPU1 segment error: {}", e);
+                    break;
+                }
+                if timing { aux_store.device.synchronize().ok(); }
+                let t_gpu1_end = Instant::now();
+                t_gpu1_total += t_gpu1_end.duration_since(t_gpu1_start).as_secs_f64();
+
+                // Capture per-layer graphs after step 0
+                if step == 0 && !no_graph {
+                    let gpu0_has_bufs = self.graph.as_ref()
+                        .map(|g| g.d_graph_token_id.is_some()).unwrap_or(false);
+                    let gpu1_has_bufs = aux_store.graph.as_ref()
+                        .map(|g| g.d_graph_token_id.is_some()).unwrap_or(false);
+
+                    if gpu0_has_bufs && gpu1_has_bufs {
+                        // Capture GPU0 graphs: layers [0..split_layer), embedding, no final
+                        if let Err(e) = self.device.bind_to_thread() {
+                            log::error!("multi-gpu: bind GPU0 for capture: {:?}", e);
+                        } else {
+                            match self.capture_per_layer_graphs(
+                                Some((0, split_layer)), true, false, 0,
+                            ) {
+                                Ok(()) => eprintln!("[krasis] GPU0 per-layer graphs captured"),
+                                Err(e) => eprintln!("[krasis] GPU0 graph capture failed: {}", e),
+                            }
+                        }
+
+                        // Capture GPU1 graphs: layers [split_layer..num_layers), no embedding, final
+                        if let Err(e) = aux_store.device.bind_to_thread() {
+                            log::error!("multi-gpu: bind GPU1 for capture: {:?}", e);
+                        } else {
+                            match aux_store.capture_per_layer_graphs(
+                                Some((split_layer, num_layers)), false, true, gqa_cache_offset,
+                            ) {
+                                Ok(()) => eprintln!("[krasis] GPU1 per-layer graphs captured"),
+                                Err(e) => eprintln!("[krasis] GPU1 graph capture failed: {}", e),
+                            }
+                        }
+                    }
+                }
+            }
+
+            let t_sample_start = Instant::now();
+            // Logits are now in aux_store's h_logits
+            let logits = &mut aux_store.graph.as_mut().unwrap().h_logits;
+
+            if presence_penalty != 0.0 {
+                for &tok in &seen_tokens {
+                    if tok < vocab_size { logits[tok] -= presence_penalty; }
+                }
+            }
+
+            let target_pred = crate::decode::sample_from_logits_pub(
+                logits, vocab_size, temperature, top_k, top_p, &mut rng_next);
+            seen_tokens.insert(target_pred);
+            generated += 1;
+            next_token = target_pred;
+
+            let mut text = detok.add(target_pred as u32);
+            let finish_reason = if stop_set.contains(&target_pred) { Some("stop") }
+                else if generated >= max_tokens { Some("length") }
+                else { None };
+            if finish_reason.is_some() { text.push_str(&detok.flush()); }
+            t_sample_total += Instant::now().duration_since(t_sample_start).as_secs_f64();
+
+            let finished = finish_reason.is_some();
+            let cont = on_token(target_pred, &text, finish_reason);
+            if finished || !cont { break; }
+        }
+
+        let elapsed = decode_start.elapsed().as_secs_f64();
+        if generated > 0 {
+            let tps = generated as f64 / elapsed;
+            log::info!("gpu_generate_stream_multi: {} tokens in {:.2}s ({:.1} tok/s)",
+                generated, elapsed, tps);
+        }
+        self.last_decode_elapsed = elapsed;
+
+        // Print multi-GPU timing summary
+        if timing && generated > 0 {
+            let n = generated as f64;
+            let avg_gpu0 = t_gpu0_total / n * 1000.0;
+            let avg_gpu1 = t_gpu1_total / n * 1000.0;
+            let avg_xfer = t_transfer_total / n * 1000.0;
+            let avg_sample = t_sample_total / n * 1000.0;
+            let avg_total = elapsed / n * 1000.0;
+            let avg_other = avg_total - avg_gpu0 - avg_gpu1 - avg_xfer - avg_sample;
+
+            eprintln!();
+            eprintln!("  \x1b[33m┌───────────────────────────────────────────────────────┐\x1b[0m");
+            eprintln!("  \x1b[33m│\x1b[0m  MULTI-GPU DECODE TIMING ({} tokens avg)              \x1b[33m│\x1b[0m", generated);
+            eprintln!("  \x1b[33m├───────────────────────────────────────────────────────┤\x1b[0m");
+            eprintln!("  \x1b[33m│\x1b[0m  Total:        {:7.2} ms/tok  ({:5.1} tok/s)         \x1b[33m│\x1b[0m", avg_total, 1000.0 / avg_total);
+            eprintln!("  \x1b[33m│\x1b[0m  GPU0 (L0-{}): {:7.2} ms  ({:4.1}%)  [{} layers]     \x1b[33m│\x1b[0m",
+                split_layer - 1, avg_gpu0, avg_gpu0 / avg_total * 100.0, split_layer);
+            eprintln!("  \x1b[33m│\x1b[0m  Transfer:     {:7.2} ms  ({:4.1}%)  [D2H+H2D]       \x1b[33m│\x1b[0m",
+                avg_xfer, avg_xfer / avg_total * 100.0);
+            eprintln!("  \x1b[33m│\x1b[0m  GPU1 (L{}-{}): {:7.2} ms  ({:4.1}%)  [{} layers]    \x1b[33m│\x1b[0m",
+                split_layer, num_layers - 1, avg_gpu1, avg_gpu1 / avg_total * 100.0, num_layers - split_layer);
+            eprintln!("  \x1b[33m│\x1b[0m  Sample:       {:7.2} ms  ({:4.1}%)                   \x1b[33m│\x1b[0m",
+                avg_sample, avg_sample / avg_total * 100.0);
+            if avg_other.abs() > 0.01 {
+                eprintln!("  \x1b[33m│\x1b[0m  Other:        {:7.2} ms  ({:4.1}%)                   \x1b[33m│\x1b[0m",
+                    avg_other, avg_other / avg_total * 100.0);
+            }
+            eprintln!("  \x1b[33m├───────────────────────────────────────────────────────┤\x1b[0m");
+
+            // Per-layer rate comparison
+            let gpu0_ms_per_layer = if split_layer > 0 { avg_gpu0 / split_layer as f64 } else { 0.0 };
+            let gpu1_layers = num_layers - split_layer;
+            let gpu1_ms_per_layer = if gpu1_layers > 0 { avg_gpu1 / gpu1_layers as f64 } else { 0.0 };
+            eprintln!("  \x1b[33m│\x1b[0m  GPU0 per-layer: {:5.3} ms                            \x1b[33m│\x1b[0m", gpu0_ms_per_layer);
+            eprintln!("  \x1b[33m│\x1b[0m  GPU1 per-layer: {:5.3} ms                            \x1b[33m│\x1b[0m", gpu1_ms_per_layer);
+            if gpu0_ms_per_layer > 0.001 {
+                eprintln!("  \x1b[33m│\x1b[0m  GPU1/GPU0 ratio: {:5.2}x                             \x1b[33m│\x1b[0m",
+                    gpu1_ms_per_layer / gpu0_ms_per_layer);
+            }
+
+            // HCS stats for both GPUs
+            eprintln!("  \x1b[33m├───────────────────────────────────────────────────────┤\x1b[0m");
+            if let Some(ref graph0) = self.graph {
+                if let Some(ref hcs) = graph0.hcs {
+                    let total = (hcs.total_hits + hcs.total_misses).max(1) as f64;
+                    let hit_pct = hcs.total_hits as f64 / total * 100.0;
+                    eprintln!("  \x1b[33m│\x1b[0m  GPU0 HCS: {} cached, {:.1}% hit ({}/{})           \x1b[33m│\x1b[0m",
+                        hcs.num_cached, hit_pct, hcs.total_hits, hcs.total_misses);
+                }
+            }
+            if let Some(ref graph1) = aux_store.graph {
+                if let Some(ref hcs) = graph1.hcs {
+                    let total = (hcs.total_hits + hcs.total_misses).max(1) as f64;
+                    let hit_pct = hcs.total_hits as f64 / total * 100.0;
+                    eprintln!("  \x1b[33m│\x1b[0m  GPU1 HCS: {} cached, {:.1}% hit ({}/{})           \x1b[33m│\x1b[0m",
+                        hcs.num_cached, hit_pct, hcs.total_hits, hcs.total_misses);
+                }
+            }
+            eprintln!("  \x1b[33m└───────────────────────────────────────────────────────┘\x1b[0m");
+
+            // Also print per-GPU detailed timing from each graph
+            eprintln!();
+            eprintln!("  \x1b[36m=== GPU0 Detail (layers 0-{}) ===\x1b[0m", split_layer - 1);
+            if let Some(ref graph0) = self.graph {
+                if graph0.timing_step_count > 0 {
+                    let n0 = graph0.timing_step_count as f64;
+                    let avg_attn = graph0.t_attn / n0 * 1000.0;
+                    let avg_moe = graph0.t_route / n0 * 1000.0;
+                    let avg_norm = graph0.t_norm / n0 * 1000.0;
+                    let avg_attn_la = graph0.t_attn_la / n0 * 1000.0;
+                    let avg_attn_gqa = graph0.t_attn_gqa / n0 * 1000.0;
+                    let avg_route_sync = graph0.t_moe_route_sync / n0 * 1000.0;
+                    let avg_expert_loop = graph0.t_moe_expert_loop / n0 * 1000.0;
+                    let avg_shared = graph0.t_moe_shared / n0 * 1000.0;
+                    let avg_exp_w13 = graph0.t_expert_w13 / n0 * 1000.0;
+                    let avg_exp_silu = graph0.t_expert_silu_w2 / n0 * 1000.0;
+                    let avg_cold = graph0.dma_cold_experts as f64 / n0;
+                    let avg_hcs = graph0.dma_hcs_experts as f64 / n0;
+                    eprintln!("    Attention:    {:6.2} ms (LA {:5.2}, GQA {:5.2})", avg_attn, avg_attn_la, avg_attn_gqa);
+                    eprintln!("    MoE:          {:6.2} ms (route {:5.2}, experts {:5.2}, shared {:5.2})",
+                        avg_moe, avg_route_sync, avg_expert_loop, avg_shared);
+                    eprintln!("      w13: {:5.2} ms, silu+w2: {:5.2} ms", avg_exp_w13, avg_exp_silu);
+                    eprintln!("    Norms+Emb:    {:6.2} ms", avg_norm);
+                    eprintln!("    Cold/HCS:     {:.1}/{:.1} experts/tok", avg_cold, avg_hcs);
+                }
+            }
+
+            eprintln!();
+            eprintln!("  \x1b[36m=== GPU1 Detail (layers {}-{}) ===\x1b[0m", split_layer, num_layers - 1);
+            if let Some(ref graph1) = aux_store.graph {
+                if graph1.timing_step_count > 0 {
+                    let n1 = graph1.timing_step_count as f64;
+                    let avg_attn = graph1.t_attn / n1 * 1000.0;
+                    let avg_moe = graph1.t_route / n1 * 1000.0;
+                    let avg_norm = graph1.t_norm / n1 * 1000.0;
+                    let avg_attn_la = graph1.t_attn_la / n1 * 1000.0;
+                    let avg_attn_gqa = graph1.t_attn_gqa / n1 * 1000.0;
+                    let avg_route_sync = graph1.t_moe_route_sync / n1 * 1000.0;
+                    let avg_expert_loop = graph1.t_moe_expert_loop / n1 * 1000.0;
+                    let avg_shared = graph1.t_moe_shared / n1 * 1000.0;
+                    let avg_exp_w13 = graph1.t_expert_w13 / n1 * 1000.0;
+                    let avg_exp_silu = graph1.t_expert_silu_w2 / n1 * 1000.0;
+                    let avg_cold = graph1.dma_cold_experts as f64 / n1;
+                    let avg_hcs = graph1.dma_hcs_experts as f64 / n1;
+                    let avg_lm = graph1.t_lm_head / n1 * 1000.0;
+                    eprintln!("    Attention:    {:6.2} ms (LA {:5.2}, GQA {:5.2})", avg_attn, avg_attn_la, avg_attn_gqa);
+                    eprintln!("    MoE:          {:6.2} ms (route {:5.2}, experts {:5.2}, shared {:5.2})",
+                        avg_moe, avg_route_sync, avg_expert_loop, avg_shared);
+                    eprintln!("      w13: {:5.2} ms, silu+w2: {:5.2} ms", avg_exp_w13, avg_exp_silu);
+                    eprintln!("    Norms+Emb:    {:6.2} ms", avg_norm);
+                    eprintln!("    LM Head:      {:6.2} ms", avg_lm);
+                    eprintln!("    Cold/HCS:     {:.1}/{:.1} experts/tok", avg_cold, avg_hcs);
+                }
+            }
+            eprintln!();
+        }
+
+        // End activation tracking
+        if let Some(ref mut hcs) = self.graph.as_mut().unwrap().hcs {
+            hcs.finish_prompt();
+        }
+        if let Some(ref mut hcs) = aux_store.graph.as_mut().unwrap().hcs {
+            hcs.finish_prompt();
+        }
+
+        generated
     }
 
     /// Batched GPU decode step: process multiple tokens through all layers.
@@ -6467,6 +9020,11 @@ impl GpuDecodeStore {
         hcs.soft_loaded = false;
         hcs.vram_bytes -= freed_bytes;
 
+        // NOTE: per-layer CUDA graphs remain valid across eviction/reload.
+        // Expert kernels dereference through d_batch_upload (fixed address),
+        // which CPU populates with fresh pointers before each graph replay.
+        // Eviction changes where experts live, but not the graph structure.
+
         let freed_mb = freed_bytes as f64 / (1024.0 * 1024.0);
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         eprintln!("  \x1b[33mHCS soft: evicted {} experts ({:.1} MB freed) in {:.1}ms for prefill (~{} tokens)\x1b[0m",
@@ -6830,6 +9388,8 @@ impl GpuDecodeStore {
     {
         use std::time::Instant;
 
+        eprintln!("[krasis] gpu_generate_stream called: first_token={}, start_pos={}, max_tokens={}", first_token, start_position, max_tokens);
+
         // Bind CUDA context to this thread. Required when called from
         // the server thread (which differs from the setup thread).
         if let Err(e) = self.device.bind_to_thread() {
@@ -6925,6 +9485,17 @@ impl GpuDecodeStore {
 
         // Track min VRAM free during decode
         let mut min_vram_free_bytes: usize = usize::MAX;
+
+        // Initialize CUDA graph infrastructure (GPU-side scalar buffers + dummy expert)
+        {
+            let needs_init = self.graph.as_ref().map(|g| g.d_graph_token_id.is_none()).unwrap_or(false);
+            if needs_init {
+                match self.init_cuda_graph_buffers() {
+                    Ok(()) => eprintln!("[krasis] CUDA graph buffers initialized"),
+                    Err(e) => eprintln!("[krasis] CUDA graph init failed: {}", e),
+                }
+            }
+        }
 
         let mut step = 0usize;
         while step < max_tokens {
@@ -7223,9 +9794,40 @@ impl GpuDecodeStore {
 
             } else {
                 // ── Normal (non-speculative) decode path ──
-                if let Err(e) = self.gpu_decode_step(next_token, pos) {
-                    log::error!("gpu_generate_stream: decode_step error: {}", e);
-                    break;
+                // Use per-layer CUDA graph replay when available, fall back to ungraphed.
+                let use_per_layer = self.graph.as_ref()
+                    .map(|g| g.per_layer_graphs_valid).unwrap_or(false);
+
+                if use_per_layer {
+                    // Per-layer graph replay: handles sync/routing/DMA between graphs internally
+                    if let Err(e) = self.replay_per_layer_graphs(next_token, pos, true) {
+                        eprintln!("[krasis] Per-layer graph replay failed: {}, falling back", e);
+                        self.invalidate_cuda_graph();
+                        if let Err(e) = self.gpu_decode_step(next_token, pos) {
+                            log::error!("gpu_generate_stream: decode_step error: {}", e);
+                            break;
+                        }
+                    }
+                    // logits already D2H'd inside replay_per_layer_graphs
+                } else {
+                    // First token (or after invalidation): run ungraphed, then capture per-layer graphs
+                    if let Err(e) = self.gpu_decode_step(next_token, pos) {
+                        log::error!("gpu_generate_stream: decode_step error: {}", e);
+                        break;
+                    }
+
+                    // Try to capture per-layer CUDA graphs after first token
+                    let _has_graph_bufs = self.graph.as_ref()
+                        .map(|g| g.d_graph_token_id.is_some()).unwrap_or(false);
+                    eprintln!("[krasis] step={} has_graph_bufs={}", step, _has_graph_bufs);
+                    let no_graph = std::env::var("KRASIS_NO_GRAPH").map(|v| v != "0").unwrap_or(false);
+                    if step == 0 && _has_graph_bufs && !no_graph
+                    {
+                        match self.capture_per_layer_graphs(None, true, true, 0) {
+                            Ok(()) => eprintln!("[krasis] Per-layer CUDA graphs captured after token 0"),
+                            Err(e) => eprintln!("[krasis] Per-layer graph capture failed: {}, continuing ungraphed", e),
+                        }
+                    }
                 }
 
                 // Track min VRAM free (after decode step, when expert buffers are at peak)
@@ -10278,6 +12880,8 @@ impl GpuDecodeStore {
         let mut hcs = HcsState::new();
         hcs.num_experts_per_layer = num_experts_per_layer;
         hcs.init_cache_fast(num_layers);
+        // Initialize GPU-side expert pointer table for CUDA graph support
+        hcs.init_gpu_expert_ptrs(&self.device, num_layers, num_experts_per_layer);
         // Populate flat cache from loaded entries
         for (&(layer_idx, expert_idx), entry) in &cache {
             hcs.cache_fast_set(layer_idx, expert_idx, entry);
