@@ -83,6 +83,7 @@ struct ServerState {
     py_model: Py<PyAny>,
     model_name: String,
     tokenizer: tokenizers::Tokenizer,
+    chat_template: crate::chat_template::ChatTemplateEngine,
     max_context_tokens: usize,
     default_enable_thinking: bool,
     /// Raw pointer to a GpuDecodeStore instance (set from Python during server init).
@@ -199,7 +200,7 @@ fn format_sse_token(
     finish_reason: Option<&str>,
     created: u64,
 ) -> String {
-    let delta = if finish_reason.is_some() {
+    let delta = if text.is_empty() {
         "{}".to_string()
     } else {
         let escaped = text.replace('\\', "\\\\").replace('"', "\\\"")
@@ -551,24 +552,35 @@ fn handle_chat_completion(
 
     // ── Estimate prompt tokens for soft-tier HCS eviction ──
     let estimated_tokens = {
-        // Extract text from messages JSON and tokenize with Rust tokenizer
-        let mut text = String::new();
-        if let Ok(msgs) = serde_json::from_str::<Vec<serde_json::Value>>(&messages_json) {
-            for msg in &msgs {
-                if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-                    text.push_str(content);
-                    text.push(' ');
+        // Apply actual chat template to get full rendered text, then tokenize
+        let rendered = state.chat_template.apply(&messages_json, true)
+            .unwrap_or_else(|e| {
+                log::warn!("Chat template failed ({}), falling back to raw content extraction", e);
+                // Fallback: extract raw content from messages
+                let mut text = String::new();
+                if let Ok(msgs) = serde_json::from_str::<Vec<serde_json::Value>>(&messages_json) {
+                    for msg in &msgs {
+                        if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                            text.push_str(content);
+                            text.push(' ');
+                        }
+                    }
                 }
-            }
-        }
-        let text_len = text.len();
-        let base_count = state.tokenizer.encode(text, false)
+                text
+            });
+        let token_count = state.tokenizer.encode(rendered.as_str(), false)
             .map(|e| e.len())
-            .unwrap_or(text_len / 4); // fallback: ~4 chars/token
-        let est = base_count + 200; // approximate chat template overhead
-        log::info!("Soft HCS: estimated {} tokens (text_len={}, base_count={})",
-            est, text_len, base_count);
-        est
+            .map_err(|e| {
+                log::error!("Tokenizer failed to encode prompt: {}", e);
+                e
+            })
+            .unwrap_or_else(|_| {
+                // Tokenizer failure is not fatal for HCS estimation -- use conservative estimate
+                // to avoid blocking requests. The actual prefill will tokenize correctly via Python.
+                rendered.len() / 3
+            });
+        log::info!("Soft HCS: estimated {} tokens (rendered_len={})", token_count, rendered.len());
+        token_count
     };
     let parse_ms = t_request.elapsed().as_secs_f64() * 1000.0;
 
@@ -671,12 +683,16 @@ fn handle_chat_completion(
     let tokenizer = &state.tokenizer;
 
     // ── Reload soft HCS after prefill (async — DMA overlaps with decode) ──
+    // Always attempt reload — soft pool may have been cancelled by a prior operation
+    // even if we didn't evict anything this time.
     let t_reload = Instant::now();
     let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
-    if evicted > 0 {
+    {
         let (queued, _alloc_mb) = store.hcs_reload_after_prefill_async();
-        log::info!("Request {}: HCS soft async reload queued {} experts (evicted {} for prefill)",
-            request_id, queued, evicted);
+        if queued > 0 {
+            log::info!("Request {}: HCS soft async reload queued {} experts",
+                request_id, queued);
+        }
     }
     // NOTE: aux GPU has no soft tier (100% hard), no eviction/reload needed
     // ── Multi-GPU: copy KV cache from GPU0 to GPU1 after prefill ──
@@ -1173,6 +1189,21 @@ impl RustServer {
                 }
             };
 
+            // Load chat template from tokenizer_config.json (same directory as tokenizer.json)
+            let tokenizer_config_path = {
+                let p = std::path::Path::new(&tokenizer_path);
+                p.parent().unwrap_or(p).join("tokenizer_config.json")
+            };
+            let chat_template = match crate::chat_template::ChatTemplateEngine::from_config(
+                tokenizer_config_path.to_str().unwrap_or("")
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    log::error!("Failed to load chat template: {}", e);
+                    return;
+                }
+            };
+
             let listener = match TcpListener::bind(&addr) {
                 Ok(l) => l,
                 Err(e) => {
@@ -1199,6 +1230,7 @@ impl RustServer {
                 py_model,
                 model_name,
                 tokenizer,
+                chat_template,
                 max_context_tokens,
                 default_enable_thinking,
                 gpu_store_addr,
@@ -1258,26 +1290,28 @@ impl RustServer {
         temperature: f32,
         enable_thinking: bool,
     ) -> PyResult<String> {
-        // Load tokenizer (same as server path)
+        // Load tokenizer and chat template (same as server path)
         let tokenizer = tokenizers::Tokenizer::from_file(&self.tokenizer_path)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                 format!("Failed to load tokenizer: {}", e)))?;
+        let tokenizer_config_path = {
+            let p = std::path::Path::new(&self.tokenizer_path);
+            p.parent().unwrap_or(p).join("tokenizer_config.json")
+        };
+        let chat_template = crate::chat_template::ChatTemplateEngine::from_config(
+            tokenizer_config_path.to_str().unwrap_or("")
+        ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+            format!("Failed to load chat template: {}", e)))?;
 
-        // Estimate tokens for HCS budget (same logic as server)
+        // Estimate tokens by applying actual chat template and tokenizing
         let estimated_tokens = {
-            let mut text = String::new();
-            if let Ok(msgs) = serde_json::from_str::<Vec<serde_json::Value>>(&messages_json) {
-                for msg in &msgs {
-                    if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-                        text.push_str(content);
-                        text.push(' ');
-                    }
-                }
-            }
-            let base_count = tokenizer.encode(text, false)
+            let rendered = chat_template.apply(&messages_json, true)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("Chat template failed: {}", e)))?;
+            tokenizer.encode(rendered.as_str(), false)
                 .map(|e| e.len())
-                .unwrap_or(200);
-            base_count + 200
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("Tokenizer failed: {}", e)))?
         };
 
         // Evict soft HCS before prefill (both stores in multi-GPU)
@@ -1323,10 +1357,9 @@ impl RustServer {
         }
 
         // Reload soft HCS after prefill (both stores)
+        // Always attempt reload — soft pool may have been cancelled/freed by a prior operation
         let t_reload = Instant::now();
-        if evicted > 0 {
-            store.hcs_reload_after_prefill_async();
-        }
+        store.hcs_reload_after_prefill_async();
         // NOTE: aux GPU has no soft tier (100% hard), no eviction/reload needed
         let reload_ms = t_reload.elapsed().as_secs_f64() * 1000.0;
 
@@ -1391,11 +1424,15 @@ impl RustServer {
             0.0
         };
 
+        // Collect HCS stats and min free VRAM
+        let (min_free_vram_mb, hcs_loaded, hcs_total, hcs_pct) = store.benchmark_stats();
+
         Ok(format!(
-            r#"{{"prefill_ms":{:.1},"prefill_tok_s":{:.1},"prompt_tokens":{},"decode_ms":{:.1},"decode_tok_s":{:.2},"decode_tokens":{},"evict_ms":{:.1},"reload_ms":{:.1}}}"#,
+            r#"{{"prefill_ms":{:.1},"prefill_tok_s":{:.1},"prompt_tokens":{},"decode_ms":{:.1},"decode_tok_s":{:.2},"decode_tokens":{},"evict_ms":{:.1},"reload_ms":{:.1},"min_free_vram_mb":{},"hcs_loaded":{},"hcs_total":{},"hcs_pct":{:.1}}}"#,
             prefill_ms, prefill_tok_s, prompt_len,
             decode_ms, decode_tok_s, decode_tokens,
-            evict_ms, reload_ms
+            evict_ms, reload_ms,
+            min_free_vram_mb, hcs_loaded, hcs_total, hcs_pct
         ))
     }
 

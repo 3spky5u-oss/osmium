@@ -513,6 +513,7 @@ def main():
             "CFG_SESSION_ENABLED": "session_enabled",
             "CFG_NUM_GPUS": "num_gpus",
             "CFG_CPU_DECODE": None,  # CPU decode removed, ignore config key
+            "CFG_ATTN_SKIP_AFTER": "attn_skip_after",
         }
         with open(config_path) as f:
             for line in f:
@@ -582,8 +583,8 @@ def main():
                         help="Marlin quantization bits for GPU prefill experts")
     parser.add_argument("--cpu-expert-bits", type=int, default=4, choices=[4, 8],
                         help="Quantization bits for CPU decode experts")
-    parser.add_argument("--attention-quant", default="bf16", choices=["bf16"],
-                        help="Quantization for attention weights (INT8 disabled — causes garbage output)")
+    parser.add_argument("--attention-quant", default="bf16", choices=["bf16", "int4", "int8"],
+                        help="Attention weight precision: bf16 (default), int4 Marlin W4A16, int8 Marlin W8A16")
     parser.add_argument("--shared-expert-quant", default="int8", choices=["bf16", "int8"],
                         help="Quantization for shared expert weights")
     parser.add_argument("--dense-mlp-quant", default="int8", choices=["bf16", "int8"],
@@ -787,6 +788,13 @@ def main():
         stream_attention=args.stream_attention,
     )
 
+    # Set attention skip layer if configured
+    attn_skip = getattr(args, 'attn_skip_after', None)
+    if attn_skip is not None and attn_skip != '':
+        from krasis.layer import TransformerLayer
+        TransformerLayer.attn_skip_after = int(attn_skip)
+        _detail(f"Attention skip: layers >= {attn_skip} will skip attention")
+
     _status("Loading model weights")
     _model.load(gpu_only=gpu_only)
 
@@ -846,10 +854,15 @@ def main():
     _status("Warmup (prefill + decode, no HCS)")
     _dim("Triggering lazy CUDA allocations (torch.compile, FlashInfer, cuBLAS)")
     t_warmup = time.time()
-    # TEMP: skip warmup (DMA pipeline hanging on layer-grouped prefill)
-    # _warmup_prefill(_model)
-    # _warmup_decode(_model, num_steps=1)
-    logger.info("Warmup SKIPPED (DMA pipeline issue)")
+    # Use layer_group_size=1 for warmup to avoid DMA pipeline issues with grouped prefill
+    _saved_layer_group_size = _model.layer_group_size
+    _model.layer_group_size = 1
+    _model._init_gpu_prefill()
+    _warmup_prefill(_model)
+    _warmup_decode(_model, num_steps=1)
+    # Restore original layer group size
+    _model.layer_group_size = _saved_layer_group_size
+    _model._init_gpu_prefill()
     warmup_elapsed = time.time() - t_warmup
     _detail(f"Warmup complete in {warmup_elapsed:.1f}s")
 
@@ -866,48 +879,128 @@ def main():
 
     # ── Phase 2: Four-point VRAM calibration ──
     # Measure min_free VRAM during: short prefill, short decode, long prefill, long decode.
-    # This gives us two linear models (prefill VRAM/token, decode VRAM/token) for
-    # proportional soft-tier HCS eviction at runtime.
-    # Do NOT gc.collect/empty_cache here — persistent allocations stay resident.
+    # This gives us two linear models (prefill VRAM/token, decode VRAM/token) so
+    # Rust can compute exact budgets at any prompt length.
     dev_idx = devices[0].index
     import torch
 
-    # TEMP: Skip VRAM calibration (DMA pipeline hanging). Use measured values from prior runs.
-    _status("VRAM calibration (using cached values)")
-    import torch
-    # Get current free VRAM for budget calculation
-    _free_mb, _total_mb = 0, 0
+    _status("VRAM calibration (4-point measurement)")
+    _detail(f"Safety margin: {SAFETY_MARGIN_MB:,} MB")
+    _detail(f"Using layer_group_size={_model.layer_group_size} (same as runtime)")
+
+    SHORT_REPEATS = 17    # ~500 tokens
+    # Calculate long prompt to use ~80% of KV cache capacity
+    # Each repeat of the base text is ~30 tokens
+    TOKENS_PER_REPEAT = 30
+    kv_cache = _model.kv_caches[0] if _model.kv_caches else None
+    if kv_cache is not None:
+        kv_max_tokens = kv_cache.max_pages * kv_cache.page_size
+        long_target_tokens = int(kv_max_tokens * 0.8)
+        LONG_REPEATS = max(SHORT_REPEATS * 2, long_target_tokens // TOKENS_PER_REPEAT)
+    else:
+        LONG_REPEATS = SHORT_REPEATS * 4  # minimal fallback, no KV cache info
+
+    prefill_short_free = None
+    prefill_long_free = None
+    decode_short_free = None
+    decode_long_free = None
+    short_tokens = 0
+    long_tokens = 0
+
     try:
-        import ctypes
-        _free = ctypes.c_size_t()
-        _total = ctypes.c_size_t()
         torch.cuda.synchronize()
         gc.collect()
         torch.cuda.empty_cache()
-        _free_mb = torch.cuda.mem_get_info(dev_idx)[0] // (1024 * 1024)
-        _total_mb = torch.cuda.mem_get_info(dev_idx)[1] // (1024 * 1024)
-    except Exception:
-        _free_mb = 25000
-        _total_mb = 32119
+        _baseline_free = torch.cuda.mem_get_info(dev_idx)[0] // (1024 * 1024)
+        _baseline_total = torch.cuda.mem_get_info(dev_idx)[1] // (1024 * 1024)
+        _detail(f"Baseline free VRAM: {_baseline_free:,} MB / {_baseline_total:,} MB")
 
-    # Conservative estimates based on prior calibration runs:
-    # Prefill uses ~2-4 GB temporary VRAM, decode uses ~1-2 GB less.
-    # Reserve 4 GB for prefill headroom + 1 GB safety.
-    short_tokens = 500
-    long_tokens = 51000
-    prefill_short_free = _free_mb - 4000  # ~4 GB headroom for prefill temporaries
-    prefill_long_free = prefill_short_free - 2000  # more VRAM used for long prompts
-    decode_short_free = _free_mb - 1000   # decode uses much less temporary VRAM
-    decode_long_free = decode_short_free - 500
+        # ── 2a: Short prompt prefill ──
+        vram_monitor.reset(dev_idx)
+        _dim("Capture: short prompt prefill (~500 tokens)")
+        short_prompt_len, short_result = _capture_prefill(_model, SHORT_REPEATS)
+        torch.cuda.synchronize()
+        time.sleep(0.1)  # let monitor poll
+        prefill_short_free = vram_monitor.min_free_mb(dev_idx)
+        short_tokens = short_prompt_len or 500
+        _dim(f"  short prefill: {short_tokens} tokens, min_free={prefill_short_free:,} MB")
 
-    hard_budget = max(0, min(prefill_short_free, prefill_long_free) - SAFETY_MARGIN_MB)
+        # ── 2b: Short prompt decode ──
+        if short_result is not None:
+            vram_monitor.reset(dev_idx)
+            _dim("Capture: short prompt decode")
+            _capture_decode_only(_model, short_result, num_steps=8)
+            torch.cuda.synchronize()
+            time.sleep(0.1)
+            decode_short_free = vram_monitor.min_free_mb(dev_idx)
+            _dim(f"  short decode: min_free={decode_short_free:,} MB")
+        else:
+            _model.server_cleanup()
+
+        # ── 2c: Long prompt prefill ──
+        vram_monitor.reset(dev_idx)
+        _long_est = LONG_REPEATS * TOKENS_PER_REPEAT
+        _dim(f"Capture: long prompt prefill (~{_long_est // 1000}K tokens)")
+        long_prompt_len, long_result = _capture_prefill(_model, LONG_REPEATS)
+        torch.cuda.synchronize()
+        time.sleep(0.1)
+        prefill_long_free = vram_monitor.min_free_mb(dev_idx)
+        long_tokens = long_prompt_len or 51000
+        _dim(f"  long prefill: {long_tokens} tokens, min_free={prefill_long_free:,} MB")
+
+        # ── 2d: Long prompt decode ──
+        if long_result is not None:
+            vram_monitor.reset(dev_idx)
+            _dim("Capture: long prompt decode")
+            _capture_decode_only(_model, long_result, num_steps=8)
+            torch.cuda.synchronize()
+            time.sleep(0.1)
+            decode_long_free = vram_monitor.min_free_mb(dev_idx)
+            _dim(f"  long decode: min_free={decode_long_free:,} MB")
+        else:
+            _model.server_cleanup()
+
+    except Exception as e:
+        logger.warning("VRAM calibration failed: %s", e)
+        try:
+            _model.server_cleanup()
+        except Exception:
+            pass
+
+    # ── Compute calibration ──
+    if (prefill_short_free is None or prefill_long_free is None
+            or decode_short_free is None or decode_long_free is None):
+        raise RuntimeError(
+            "VRAM calibration failed — cannot determine HCS budget without real measurements. "
+            "Fix the calibration issue before starting. Never hardcode VRAM budgets."
+        )
+
+    if long_tokens > short_tokens:
+        prefill_kb_per_tok = (prefill_short_free - prefill_long_free) / (long_tokens - short_tokens) * 1024
+        decode_kb_per_tok = (decode_short_free - decode_long_free) / (long_tokens - short_tokens) * 1024
+    else:
+        prefill_kb_per_tok = 0
+        decode_kb_per_tok = 0
+
+    # Hard budget = what survives worst-case (long) prefill
+    hard_budget = max(0, int(prefill_long_free) - SAFETY_MARGIN_MB)
+    # Soft budget = extra VRAM available during decode (short prompt = best case)
     decode_budget = max(0, int(decode_short_free) - SAFETY_MARGIN_MB)
     soft_budget = max(0, decode_budget - hard_budget)
 
-    _detail(f"Free VRAM: {_free_mb:,} MB / {_total_mb:,} MB")
+    torch.cuda.synchronize()
+    gc.collect()
+    torch.cuda.empty_cache()
+    _free_mb = torch.cuda.mem_get_info(dev_idx)[0] // (1024 * 1024)
+    _total_mb = torch.cuda.mem_get_info(dev_idx)[1] // (1024 * 1024)
+
+    _status("VRAM calibration complete")
+    _detail(f"Prefill: {prefill_kb_per_tok:.1f} KB/token ({prefill_short_free:,} MB @ {short_tokens} tok -> {prefill_long_free:,} MB @ {long_tokens} tok)")
+    _detail(f"Decode:  {decode_kb_per_tok:.1f} KB/token ({decode_short_free:,} MB @ short -> {decode_long_free:,} MB @ long)")
     _detail(f"Hard HCS budget: {hard_budget:,} MB  |  Soft HCS budget: {soft_budget:,} MB  |  Total: {hard_budget + soft_budget:,} MB")
-    logger.info("VRAM budget (cached): hard=%d MB, soft=%d MB, free=%d MB",
-                hard_budget, soft_budget, _free_mb)
+    _detail(f"Free VRAM: {_free_mb:,} MB / {_total_mb:,} MB")
+    logger.info("VRAM budget (4-point): hard=%d MB, soft=%d MB, free=%d MB, prefill=%.1f KB/tok, decode=%.1f KB/tok",
+                hard_budget, soft_budget, _free_mb, prefill_kb_per_tok, decode_kb_per_tok)
 
     # Free PyTorch's cached CUDA blocks before HCS allocation.
     # After calibration, PyTorch holds freed KV/expert blocks in its caching allocator.
@@ -1025,7 +1118,7 @@ def main():
 
             # ── Initialize tiered HCS: hard pool + soft pool ──
             # In multi-GPU mode, filter ranking to GPU0's layer segment only
-            # and include unranked experts to fill remaining budget.
+            # and include unranked experts to fill remaining VRAM (better than empty slots).
             gpu0_ranking = ranking
             gpu0_hard = hard_budget
             gpu0_soft = soft_budget
@@ -1034,14 +1127,14 @@ def main():
                 num_ranked = sum(1 for l, e in gpu0_ranking if (l, e) in set(ranking))
                 _dim(f"GPU0 HCS: {len(gpu0_ranking)} experts for layers [0..{_multi_gpu_split}) "
                      f"({num_ranked} ranked + {len(gpu0_ranking) - num_ranked} unranked), "
-                     f"budget: {gpu0_hard:,}+{gpu0_soft:,} MB")
+                     f"hard: {gpu0_hard:,} MB, soft: {gpu0_soft:,} MB")
             else:
                 # Single GPU: include all unranked experts too
                 gpu0_ranking = _full_ranking_for_layers(ranking, 0, len(_model.layers))
                 num_ranked = len(ranking)
                 _dim(f"GPU0 HCS: {len(gpu0_ranking)} experts "
                      f"({num_ranked} ranked + {len(gpu0_ranking) - num_ranked} unranked), "
-                     f"budget: {gpu0_hard:,}+{gpu0_soft:,} MB")
+                     f"hard: {gpu0_hard:,} MB, soft: {gpu0_soft:,} MB")
 
             t_hcs = time.time()
             _status("Loading HCS pool (hard + soft tier)")
@@ -1052,6 +1145,7 @@ def main():
                 soft_budget_mb=gpu0_soft,
                 window_size=10,
                 replacement_pct=25,
+                safety_margin_mb=SAFETY_MARGIN_MB,
             )
             hcs_elapsed = time.time() - t_hcs
 
@@ -1061,10 +1155,9 @@ def main():
             logger.info("HCS pool: %s (%.1fs)", result, hcs_elapsed)
 
     # ── Decode validation (after HCS) ──
-    # Must evict soft HCS before running prefill (layer groups need VRAM).
-    # TEMP: skip decode validation (prefill in _warmup_decode hangs on DMA pipeline)
-    _status("Skipping decode validation (DMA pipeline issue)")
-    _detail("Decode validation SKIPPED")
+    _status("Decode validation")
+    _warmup_decode(_model, num_steps=2)
+    _detail("Decode validation passed")
 
     # ── Enable VRAM monitor runtime warnings ──
     # enable_warnings() resets min-free tracking so the first poll captures
@@ -1234,6 +1327,7 @@ def main():
                         soft_budget_mb=aux_soft,
                         window_size=10,
                         replacement_pct=25,
+                        safety_margin_mb=SAFETY_MARGIN_MB,
                     )
                     _detail(f"Aux HCS: {result}")
 

@@ -3742,12 +3742,12 @@ mod tests {
         if store.has_unified() {
             moe_forward_unified(
                 &store, 0, &activation, &expert_indices, &expert_weights,
-                &mut output, &mut scratch, &mut scratch_pool, &mut shared_scratch, true, None, None, None,
+                &mut output, &mut scratch, &mut scratch_pool, &mut shared_scratch, true, None, None,
             );
         } else {
             moe_forward(
                 &store, 0, &activation, &expert_indices, &expert_weights,
-                &mut output, &mut scratch, &mut scratch_pool, &mut shared_scratch, true, None, None, None,
+                &mut output, &mut scratch, &mut scratch_pool, &mut shared_scratch, true, None,
             );
         }
         let moe_us = start.elapsed().as_micros();
@@ -3902,12 +3902,12 @@ mod tests {
         if store.has_unified() {
             moe_forward_unified(
                 &store, 0, &activation, &expert_indices, &expert_weights,
-                &mut output, &mut scratch, &mut scratch_pool, &mut shared_scratch, true, None, None, None,
+                &mut output, &mut scratch, &mut scratch_pool, &mut shared_scratch, true, None, None,
             );
         } else {
             moe_forward(
                 &store, 0, &activation, &expert_indices, &expert_weights,
-                &mut output, &mut scratch, &mut scratch_pool, &mut shared_scratch, true, None, None, None,
+                &mut output, &mut scratch, &mut scratch_pool, &mut shared_scratch, true, None,
             );
         }
         let moe_us = start.elapsed().as_micros();
@@ -3964,12 +3964,12 @@ mod tests {
         if store.has_unified() {
             moe_forward_unified(
                 &store, 0, &activation, &expert_indices, &expert_weights,
-                &mut ref_output, &mut scratch, &mut scratch_pool, &mut shared_scratch, true, None, None, None,
+                &mut ref_output, &mut scratch, &mut scratch_pool, &mut shared_scratch, true, None, None,
             );
         } else {
             moe_forward(
                 &store, 0, &activation, &expert_indices, &expert_weights,
-                &mut ref_output, &mut scratch, &mut scratch_pool, &mut shared_scratch, true, None, None, None,
+                &mut ref_output, &mut scratch, &mut scratch_pool, &mut shared_scratch, true, None,
             );
         }
 
@@ -4137,7 +4137,7 @@ mod tests {
             moe_forward(
                 &store, 0, &activation, &expert_indices, &expert_weights,
                 &mut output_no_shared, &mut scratch, &mut scratch_pool,
-                &mut no_shared, true, None, None,
+                &mut no_shared, true, None,
             );
         }
 
@@ -4154,7 +4154,7 @@ mod tests {
             moe_forward(
                 &store, 0, &activation, &expert_indices, &expert_weights,
                 &mut output_with_shared, &mut scratch, &mut scratch_pool,
-                &mut shared_scratch, true, None, None,
+                &mut shared_scratch, true, None,
             );
         }
 

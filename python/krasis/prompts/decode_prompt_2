@@ -1,1 +1,1 @@
-Explain the differences between TCP and UDP, and when you would choose each protocol for a networked application.
+Write a detailed 1000-word explanation of how the internet routes a packet from a browser to a server and back, covering DNS resolution, TCP handshake, TLS negotiation, BGP routing, NAT traversal, congestion control, and error handling at every layer.

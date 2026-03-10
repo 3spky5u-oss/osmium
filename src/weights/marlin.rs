@@ -1156,4 +1156,145 @@ mod tests {
             "Marlin INT8 repack changed values! max_diff={max_diff}"
         );
     }
+
+    /// Phase 0 blocker test: verify Marlin INT4 and INT8 work with QCN attention projection shapes.
+    /// QCN GQA layers (12 layers): Q=[4096,2048], K=[512,2048], V=[512,2048], O=[2048,4096]
+    /// QCN linear attn (36 layers): different shapes via in_proj_qkvz, in_proj_ba, out_proj
+    #[test]
+    fn test_marlin_attention_shapes_qcn() {
+        // Use the safetensors file that contains GQA layer 11
+        let path = Path::new("/home/main/.krasis/models/Qwen3-Coder-Next/model-00010-of-00040.safetensors");
+        if !path.exists() {
+            eprintln!("Skipping — QCN model not downloaded");
+            return;
+        }
+
+        let st = MmapSafetensors::open(path).expect("Failed to open");
+
+        let attn_tensors = [
+            "model.layers.11.self_attn.q_proj.weight",
+            "model.layers.11.self_attn.k_proj.weight",
+            "model.layers.11.self_attn.v_proj.weight",
+            "model.layers.11.self_attn.o_proj.weight",
+        ];
+
+        for tensor_name in &attn_tensors {
+            let info = match st.tensor_info(tensor_name) {
+                Some(i) => i,
+                None => {
+                    eprintln!("  {tensor_name}: not in this shard, skipping");
+                    continue;
+                }
+            };
+            let bf16_data: &[u16] = st.tensor_as_slice(tensor_name).expect("Failed to read");
+            let n = info.shape[0];
+            let k = info.shape[1];
+
+            // === INT4 ===
+            let q4 = quantize_int4(bf16_data, n, k, DEFAULT_GROUP_SIZE);
+            let deq4_ours = dequantize_int4(&q4);
+            let m4 = marlin_repack(&q4);
+            let deq4_marlin = dequantize_marlin(&m4);
+
+            let mut max_diff4: f32 = 0.0;
+            let mut sum_sq_err4: f64 = 0.0;
+            let mut sum_sq_orig: f64 = 0.0;
+            for i in 0..(n * k) {
+                let diff = (deq4_ours[i] - deq4_marlin[i]).abs();
+                max_diff4 = max_diff4.max(diff);
+                let orig = bf16_to_f32(bf16_data[i]);
+                let err = (orig - deq4_marlin[i]).abs();
+                sum_sq_err4 += (err as f64) * (err as f64);
+                sum_sq_orig += (orig as f64) * (orig as f64);
+            }
+            let rmse4 = (sum_sq_err4 / (n * k) as f64).sqrt();
+            let rms_orig = (sum_sq_orig / (n * k) as f64).sqrt();
+            let snr4 = 20.0 * (rms_orig / rmse4).log10();
+
+            assert!(max_diff4 == 0.0, "INT4 Marlin repack changed values for {tensor_name}! max_diff={max_diff4}");
+
+            // === INT8 ===
+            let q8 = quantize_int8(bf16_data, n, k, DEFAULT_GROUP_SIZE);
+            let deq8_ours = dequantize_int8(&q8);
+            let m8 = marlin_repack_int8(&q8);
+            let deq8_marlin = dequantize_marlin_int8(&m8);
+
+            let mut max_diff8: f32 = 0.0;
+            let mut sum_sq_err8: f64 = 0.0;
+            for i in 0..(n * k) {
+                let diff = (deq8_ours[i] - deq8_marlin[i]).abs();
+                max_diff8 = max_diff8.max(diff);
+                let orig = bf16_to_f32(bf16_data[i]);
+                let err = (orig - deq8_marlin[i]).abs();
+                sum_sq_err8 += (err as f64) * (err as f64);
+            }
+            let rmse8 = (sum_sq_err8 / (n * k) as f64).sqrt();
+            let snr8 = 20.0 * (rms_orig / rmse8).log10();
+
+            assert!(max_diff8 == 0.0, "INT8 Marlin repack changed values for {tensor_name}! max_diff={max_diff8}");
+
+            eprintln!(
+                "  {tensor_name} [{n}x{k}]: INT4 SNR={snr4:.1}dB  INT8 SNR={snr8:.1}dB  repack OK",
+            );
+        }
+    }
+
+    /// Phase 0: also test with Q235 attention shapes (different dimensions)
+    #[test]
+    fn test_marlin_attention_shapes_q235() {
+        let path = Path::new("/home/main/.krasis/models/Qwen3-235B-A22B/model-00001-of-00197.safetensors");
+        if !path.exists() {
+            eprintln!("Skipping — Q235 model not downloaded");
+            return;
+        }
+
+        let st = MmapSafetensors::open(path).expect("Failed to open");
+
+        // Q235 GQA layers start at layer 0
+        let attn_tensors = [
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+            "model.layers.0.self_attn.o_proj.weight",
+        ];
+
+        for tensor_name in &attn_tensors {
+            let info = match st.tensor_info(tensor_name) {
+                Some(i) => i,
+                None => {
+                    eprintln!("  {tensor_name}: not in this shard, skipping");
+                    continue;
+                }
+            };
+            let bf16_data: &[u16] = st.tensor_as_slice(tensor_name).expect("Failed to read");
+            let n = info.shape[0];
+            let k = info.shape[1];
+
+            // INT4
+            let q4 = quantize_int4(bf16_data, n, k, DEFAULT_GROUP_SIZE);
+            let deq4_ours = dequantize_int4(&q4);
+            let m4 = marlin_repack(&q4);
+            let deq4_marlin = dequantize_marlin(&m4);
+
+            let mut max_diff4: f32 = 0.0;
+            for i in 0..(n * k) {
+                max_diff4 = max_diff4.max((deq4_ours[i] - deq4_marlin[i]).abs());
+            }
+            assert!(max_diff4 == 0.0, "INT4 repack error for {tensor_name}: {max_diff4}");
+
+            // INT8
+            let q8 = quantize_int8(bf16_data, n, k, DEFAULT_GROUP_SIZE);
+            let deq8_ours = dequantize_int8(&q8);
+            let m8 = marlin_repack_int8(&q8);
+            let deq8_marlin = dequantize_marlin_int8(&m8);
+
+            let mut max_diff8: f32 = 0.0;
+            for i in 0..(n * k) {
+                max_diff8 = max_diff8.max((deq8_ours[i] - deq8_marlin[i]).abs());
+            }
+            assert!(max_diff8 == 0.0, "INT8 repack error for {tensor_name}: {max_diff8}");
+
+            eprintln!("  {tensor_name} [{n}x{k}]: INT4+INT8 Marlin repack OK");
+        }
+    }
 }

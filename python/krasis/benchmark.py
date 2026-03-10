@@ -1,10 +1,9 @@
 """Standardized benchmark for Krasis model + hardware combinations.
 
-Two measurement tiers:
-  1. Engine — calls Rust engine directly (no HTTP/SSE). Rust Instant timing.
-     Reports: prefill tok/s, decode tok/s.
-  2. Client — sends HTTP requests to the Rust server. Client-side wall clock.
-     Reports: TTFT (time to first token).
+Reports three numbers:
+  1. Prefill (internal)    — Rust Instant timing, tok/s
+  2. Decode (internal)     — Rust Instant timing, tok/s
+  3. Round trip (network)  — HTTP client wall clock, tok/s (full prefill + decode)
 
 Usage (from server.py):
     from krasis.benchmark import KrasisBenchmark
@@ -40,9 +39,10 @@ def _section(label: str) -> str:
 
 
 class KrasisBenchmark:
-    """Standardized benchmark suite — engine timing + HTTP TTFT."""
+    """Standardized benchmark suite — Prefill (internal), Decode (internal), Round trip (network)."""
 
     PREFILL_LENGTHS = [1000, 5000, 10000, 20000, 35000, 50000]
+    DECODE_LENGTHS = [50, 100, 250]
     WARMUP_MAX_CHARS = 125000  # ~25K tokens
 
     def __init__(self, model, rust_server=None, host: str = "127.0.0.1",
@@ -51,19 +51,15 @@ class KrasisBenchmark:
         self.rust_server = rust_server  # for engine benchmarks
         self.host = host
         self.port = port
+        # Respect env var KRASIS_DECODE_TIMING=1 even if timing=False was passed
+        if os.environ.get("KRASIS_DECODE_TIMING", "") == "1":
+            timing = True
         self.timing = timing
 
-        self.decode_tokens = 64
-        self.n_runs = int(os.environ.get("KRASIS_BENCH_RUNS", "3"))
+        self.decode_tokens = 64  # legacy, kept for compatibility
+        self.n_runs = len(self.DECODE_LENGTHS)  # 3 runs = 3 decode lengths
 
-        if timing:
-            from krasis.timing import TIMING
-            TIMING.decode = True
-            TIMING.prefill = False
-        else:
-            from krasis.timing import TIMING
-            TIMING.decode = False
-            TIMING.prefill = False
+        if not timing:
             os.environ.pop("KRASIS_DECODE_TIMING", None)
 
     # ──────────────────────────────────────────────────────────
@@ -237,6 +233,32 @@ class KrasisBenchmark:
                 return cache.max_pages * cache.page_size
         return 100000
 
+    def _truncate_content_to_tokens(self, content: str, max_tokens: int) -> str:
+        """Truncate content so that wrapping in chat template produces <= max_tokens.
+
+        Uses binary search on content length since character-to-token ratio
+        varies across different text regions and models.
+        """
+        messages = [{"role": "user", "content": content}]
+        tokens = self.model.tokenizer.apply_chat_template(messages, enable_thinking=False)
+        if len(tokens) <= max_tokens:
+            return content
+
+        # Binary search for the right content length
+        lo, hi = 0, len(content)
+        best = 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            trial = content[:mid]
+            msgs = [{"role": "user", "content": trial}]
+            n_tok = len(self.model.tokenizer.apply_chat_template(msgs, enable_thinking=False))
+            if n_tok <= max_tokens:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return content[:best]
+
     def _discover_prefill_files(self) -> List[str]:
         """Discover available prefill_prompt_N files."""
         files = []
@@ -250,7 +272,9 @@ class KrasisBenchmark:
 
     def _make_prefill_prompts(self, n: int, max_tokens_override: int = 0) -> tuple:
         """Build n different prefill prompts from separate numbered files."""
-        kv_limit = self._kv_cache_max_tokens() - 200
+        kv_max = self._kv_cache_max_tokens()
+        # Reserve headroom for tokenization variance between truncation and re-tokenization
+        kv_limit = kv_max - 100
         cap = max_tokens_override if max_tokens_override > 0 else kv_limit
         cap = min(cap, kv_limit)
 
@@ -264,13 +288,9 @@ class KrasisBenchmark:
         content_texts = []
         for i in range(n):
             content = self._load_prompt_file(files[i % len(files)])
+            content = self._truncate_content_to_tokens(content, cap)
             messages = [{"role": "user", "content": content}]
             tokens = self.model.tokenizer.apply_chat_template(messages, enable_thinking=False)
-            if len(tokens) > cap:
-                orig_len = len(tokens)
-                tokens = tokens[:cap]
-                ratio = cap / orig_len
-                content = content[:int(len(content) * ratio)]
             prompts.append(tokens)
             content_texts.append(content)
         return prompts, content_texts
@@ -279,7 +299,8 @@ class KrasisBenchmark:
         self, lengths: List[int], file_offset: int = 0,
     ) -> tuple:
         """Build one prefill prompt per target length from different files."""
-        kv_limit = self._kv_cache_max_tokens() - 200
+        kv_max = self._kv_cache_max_tokens()
+        kv_limit = kv_max - 100
         files = self._discover_prefill_files()
 
         if not files:
@@ -291,17 +312,10 @@ class KrasisBenchmark:
         content_texts = []
         for i, target in enumerate(lengths):
             content = self._load_prompt_file(files[(i + file_offset) % len(files)])
-            char_limit = target * 6
-            if len(content) > char_limit:
-                content = content[:char_limit]
+            cap = min(target, kv_limit)
+            content = self._truncate_content_to_tokens(content, cap)
             messages = [{"role": "user", "content": content}]
             tokens = self.model.tokenizer.apply_chat_template(messages, enable_thinking=False)
-            cap = min(target, kv_limit)
-            if len(tokens) > cap:
-                orig_len = len(tokens)
-                tokens = tokens[:cap]
-                ratio = cap / orig_len
-                content = content[:int(len(content) * ratio)]
             prompts.append(tokens)
             content_texts.append(content)
         return prompts, content_texts
@@ -347,18 +361,18 @@ class KrasisBenchmark:
         return json.loads(result_json)
 
     # ──────────────────────────────────────────────────────────
-    # HTTP TTFT measurement (client-side wall clock)
+    # Round trip (network) measurement
     # ──────────────────────────────────────────────────────────
 
-    def _http_ttft(self, content_text: str) -> Dict:
-        """Send an HTTP request and measure client-side TTFT only.
+    def _http_round_trip(self, content_text: str, max_tokens: int) -> Dict:
+        """Full HTTP round trip — prefill + decode via streaming SSE.
 
-        TTFT = wall clock from HTTP request sent to first SSE content token.
-        This is what the user actually experiences.
+        Measures wall clock from HTTP request sent to last token received.
+        Reports effective decode tok/s as seen by the network client.
         """
         req_body = {
             "messages": [{"role": "user", "content": content_text}],
-            "max_tokens": 1,
+            "max_tokens": max_tokens,
             "temperature": 0.6,
             "stream": True,
             "enable_thinking": False,
@@ -372,7 +386,7 @@ class KrasisBenchmark:
         resp = conn.getresponse()
 
         t_first = None
-        prompt_tokens = 0
+        token_count = 0
         buf = b""
 
         while True:
@@ -389,18 +403,39 @@ class KrasisBenchmark:
                     try:
                         data = json.loads(line[6:])
                         if "krasis_timing" in data:
-                            prompt_tokens = data["krasis_timing"].get("prompt_tokens", 0)
                             continue
                         delta = data.get("choices", [{}])[0].get("delta", {})
-                        if "content" in delta and t_first is None:
-                            t_first = time.perf_counter()
+                        if delta.get("content"):
+                            now = time.perf_counter()
+                            if t_first is None:
+                                t_first = now
+                            token_count += 1
                     except json.JSONDecodeError:
                         pass
 
         conn.close()
 
-        ttft = (t_first - t_start) if t_first else 0
-        return {"ttft": round(ttft, 3), "prompt_tokens": prompt_tokens}
+        t_end = time.perf_counter()
+        total_s = t_end - t_start
+
+        # Decode tok/s: tokens after first / time from first to last
+        if t_first and token_count > 1:
+            decode_time = t_end - t_first
+            decode_tokens = token_count - 1
+            decode_tok_s = decode_tokens / decode_time
+        else:
+            decode_tok_s = 0
+
+        # EOS hit early
+        failed = token_count < max_tokens
+
+        return {
+            "total_s": round(total_s, 2),
+            "decode_tok_s": round(decode_tok_s, 2),
+            "tokens": token_count,
+            "target_tokens": max_tokens,
+            "failed": failed,
+        }
 
     def _wait_for_server(self) -> bool:
         """Wait for HTTP server to be ready (up to 10s)."""
@@ -455,44 +490,101 @@ class KrasisBenchmark:
             "runs": runs,
         }
 
-    def _benchmark_decode_engine(self, prompt_texts: List[str]) -> Dict:
-        """Engine decode benchmark — Rust Instant timing, no HTTP."""
-        runs = []
-        for text in prompt_texts:
-            r = self._engine_request(text, max_new_tokens=self.decode_tokens)
+    def _benchmark_decode_engine(self, prompt_texts: List[str],
+                                 decode_lengths: List[int]) -> Dict:
+        """Engine decode benchmark — Rust Instant timing, no HTTP.
 
+        Runs one prompt per decode length. If the model hits EOS before
+        generating enough tokens, that run is reported as -1 (failure).
+        The headline speed is the max across all successful runs.
+
+        Also tracks min free VRAM across all runs and HCS coverage.
+        """
+        runs = []
+        min_free_vram_mb = None  # track minimum across all runs
+        hcs_loaded = 0
+        hcs_total = 0
+        hcs_pct = 0.0
+
+        for text, target_tokens in zip(prompt_texts, decode_lengths):
+            r = self._engine_request(text, max_new_tokens=target_tokens)
+
+            generated = r["decode_tokens"]  # includes first_token from prefill
             tok_s = r["decode_tok_s"]
             decode_ms = r["decode_ms"]
-            # decode_tokens includes first_token; decode_tok_s excludes it
-            ms_per_tok = (1000.0 / tok_s) if tok_s > 0 else 0
-            runs.append({
-                "tok_s": round(tok_s, 2),
-                "ms_per_tok": round(ms_per_tok, 1),
-                "n_gen": r["decode_tokens"],
-            })
 
-        avg_tok_s = sum(r["tok_s"] for r in runs) / len(runs) if runs else 0
-        avg_ms = sum(r["ms_per_tok"] for r in runs) / len(runs) if runs else 0
+            # Track min free VRAM (minimum across all runs)
+            run_min_free = r.get("min_free_vram_mb", 0)
+            if min_free_vram_mb is None or run_min_free < min_free_vram_mb:
+                min_free_vram_mb = run_min_free
+
+            # HCS stats (same across runs, just take the latest)
+            hcs_loaded = r.get("hcs_loaded", 0)
+            hcs_total = r.get("hcs_total", 0)
+            hcs_pct = r.get("hcs_pct", 0.0)
+
+            # EOS hit early — not enough output, discard this run
+            if generated < target_tokens:
+                runs.append({
+                    "tok_s": -1,
+                    "ms_per_tok": -1,
+                    "target_tokens": target_tokens,
+                    "actual_tokens": generated,
+                    "failed": True,
+                })
+            else:
+                ms_per_tok = (1000.0 / tok_s) if tok_s > 0 else 0
+                runs.append({
+                    "tok_s": round(tok_s, 2),
+                    "ms_per_tok": round(ms_per_tok, 1),
+                    "target_tokens": target_tokens,
+                    "actual_tokens": generated,
+                    "failed": False,
+                })
+
+        successful = [r for r in runs if not r["failed"]]
+        if successful:
+            best_run = max(successful, key=lambda r: r["tok_s"])
+            best_tok_s = best_run["tok_s"]
+            best_ms = best_run["ms_per_tok"]
+        else:
+            best_tok_s = -1
+            best_ms = -1
 
         return {
-            "num_tokens": self.decode_tokens,
-            "avg_tok_s": round(avg_tok_s, 2),
-            "avg_ms_per_tok": round(avg_ms, 1),
+            "decode_lengths": decode_lengths,
+            "best_tok_s": best_tok_s,
+            "best_ms_per_tok": best_ms,
             "runs": runs,
+            "min_free_vram_mb": min_free_vram_mb or 0,
+            "hcs_loaded": hcs_loaded,
+            "hcs_total": hcs_total,
+            "hcs_pct": round(hcs_pct, 1),
         }
 
-    def _benchmark_http_ttft(self, prompt_tokens: List[List[int]],
-                             prompt_texts: List[str]) -> Dict:
-        """HTTP TTFT benchmark — client-side wall clock at different lengths."""
+    def _benchmark_round_trip(self, decode_texts: List[str],
+                              decode_lengths: List[int]) -> Dict:
+        """Round trip (network) benchmark — full HTTP prefill + decode.
+
+        Uses the same decode prompts/lengths as the engine benchmark.
+        Reports effective decode tok/s as seen by the network client.
+        """
         runs = []
-        for tokens, text in zip(prompt_tokens, prompt_texts):
-            n_tokens = len(tokens)
-            r = self._http_ttft(text)
-            runs.append({
-                "ttft": r["ttft"],
-                "num_tokens": r["prompt_tokens"] or n_tokens,
-            })
-        return {"runs": runs}
+        for text, target_tokens in zip(decode_texts, decode_lengths):
+            r = self._http_round_trip(text, target_tokens)
+            runs.append(r)
+
+        successful = [r for r in runs if not r["failed"]]
+        if successful:
+            best_tok_s = max(r["decode_tok_s"] for r in successful)
+        else:
+            best_tok_s = -1
+
+        return {
+            "decode_lengths": decode_lengths,
+            "best_tok_s": best_tok_s,
+            "runs": runs,
+        }
 
     # ──────────────────────────────────────────────────────────
     # Output formatting
@@ -500,7 +592,7 @@ class KrasisBenchmark:
 
     def _format_results(self, sys_info, model_info, vram_usage,
                         prefill_result, decode_result,
-                        ttft_result) -> str:
+                        round_trip_result) -> str:
         """Format results as a human-readable block."""
         lines = []
         sep = "=" * 64
@@ -556,27 +648,44 @@ class KrasisBenchmark:
         lines.append(f"  Prefill threshold: {model_info['gpu_prefill_threshold']}")
         lines.append(f"  Mode:           {model_info['decode_mode']}")
 
-        # Engine prefill
+        # Prefill (internal)
         n_prefill_runs = len(prefill_result["runs"])
         lines.append("")
-        lines.append(f"Engine Prefill ({n_prefill_runs} runs at different lengths):")
+        lines.append(f"Prefill (internal) — {n_prefill_runs} runs at different lengths:")
         for i, run in enumerate(prefill_result["runs"]):
             lines.append(f"  Run {i+1}:  {run['tok_s']:,.1f} tok/s ({run['num_tokens']:,} tokens in {run['ms']:.1f}ms)")
         lines.append(f"  Best:   {prefill_result['best_tok_s']:,.1f} tok/s ({prefill_result['best_num_tokens']:,} tokens)")
 
-        # Engine decode
+        # Decode (internal)
+        decode_len_str = "/".join(str(l) for l in decode_result.get("decode_lengths", [50, 100, 250]))
         lines.append("")
-        lines.append(f"Engine Decode ({self.decode_tokens} tokens, {self.n_runs} runs, different prompts):")
-        for i, run in enumerate(decode_result["runs"]):
-            lines.append(f"  Run {i+1}:  {run['tok_s']:.2f} tok/s ({run['ms_per_tok']:.1f}ms/tok)")
-        lines.append(f"  Average: {decode_result['avg_tok_s']:.2f} tok/s ({decode_result['avg_ms_per_tok']:.1f}ms/tok)")
+        lines.append(f"Decode (internal) — {decode_len_str} tokens, 3 separate prompts:")
+        for run in decode_result["runs"]:
+            if run["failed"]:
+                lines.append(f"  {run['target_tokens']:>3} tokens: FAILED (EOS at {run['actual_tokens']} tokens) -> -1 tok/s")
+            else:
+                lines.append(f"  {run['target_tokens']:>3} tokens: {run['tok_s']:.2f} tok/s ({run['ms_per_tok']:.1f}ms/tok)")
+        if decode_result["best_tok_s"] > 0:
+            lines.append(f"  Best:    {decode_result['best_tok_s']:.2f} tok/s")
+        else:
+            lines.append(f"  Best:    FAILED (all runs hit EOS early)")
+        lines.append(f"  HCS:     {decode_result.get('hcs_loaded', 0)}/{decode_result.get('hcs_total', 0)} experts ({decode_result.get('hcs_pct', 0):.1f}%)")
+        lines.append(f"  Min free VRAM: {decode_result.get('min_free_vram_mb', 0)} MB")
 
-        # Client TTFT
-        if ttft_result:
+        # Round trip (network)
+        if round_trip_result:
+            rt_len_str = "/".join(str(l) for l in round_trip_result.get("decode_lengths", [50, 100, 250]))
             lines.append("")
-            lines.append(f"Client TTFT ({len(ttft_result['runs'])} runs via HTTP at different lengths):")
-            for run in ttft_result["runs"]:
-                lines.append(f"  {run['num_tokens']:>6,} tokens:  {run['ttft']:.2f}s")
+            lines.append(f"Round trip (network) — {rt_len_str} tokens via HTTP:")
+            for run in round_trip_result["runs"]:
+                if run["failed"]:
+                    lines.append(f"  {run['target_tokens']:>3} tokens: FAILED (EOS at {run['tokens']} tokens) -> -1 tok/s")
+                else:
+                    lines.append(f"  {run['target_tokens']:>3} tokens: {run['decode_tok_s']:.2f} tok/s ({run['total_s']:.2f}s total)")
+            if round_trip_result["best_tok_s"] > 0:
+                lines.append(f"  Best:    {round_trip_result['best_tok_s']:.2f} tok/s")
+            else:
+                lines.append(f"  Best:    FAILED (all runs hit EOS early)")
 
         lines.append(sep)
         return "\n".join(lines)
@@ -646,62 +755,80 @@ class KrasisBenchmark:
         warmup_prefill_tokens, warmup_prefill_texts = self._make_prefill_prompts(self.n_runs, max_tokens_override=25000)
         timed_prefill_tokens, timed_prefill_texts = self._make_prefill_prompts_at_lengths(
             self.PREFILL_LENGTHS, file_offset=self.n_runs)
-        decode_tokens_all, decode_texts_all = self._make_decode_prompts(self.n_runs * 2)
+        n_decode_prompts = len(self.DECODE_LENGTHS) * 2  # warmup + timed
+        decode_tokens_all, decode_texts_all = self._make_decode_prompts(n_decode_prompts)
 
+        decode_len_str = "/".join(str(l) for l in self.DECODE_LENGTHS)
         print(f"  Warmup prefill:  {self.n_runs} prompts, ~{len(warmup_prefill_tokens[0]):,} tokens each")
         print(f"  Timed prefill:   {n_timed_prefill} prompts at {lengths_str} tokens")
         for i, p in enumerate(timed_prefill_tokens):
             print(f"    [{i+1}] {len(p):,} tokens")
-        print(f"  Decode:          {len(decode_tokens_all)} prompts")
+        print(f"  Decode:          {n_decode_prompts} prompts ({decode_len_str} tokens, warmup + timed)")
 
-        warmup_decode_texts = decode_texts_all[:self.n_runs]
-        timed_decode_texts = decode_texts_all[self.n_runs:]
+        warmup_decode_texts = decode_texts_all[:len(self.DECODE_LENGTHS)]
+        timed_decode_texts = decode_texts_all[len(self.DECODE_LENGTHS):]
 
         # 3. Warmup — compile kernels + warm caches (engine path)
-        print(_section(f"Warmup ({self.n_runs} prefill + {self.n_runs} decode via engine)"))
+        print(_section(f"Warmup ({self.n_runs} prefill + {len(self.DECODE_LENGTHS)} decode via engine)"))
         self._warmup_engine()
         t0 = time.perf_counter()
         print(f"  Prefill warmup ({self.n_runs} runs, ~25K tokens each)...")
         for i, (tokens, text) in enumerate(zip(warmup_prefill_tokens, warmup_prefill_texts)):
             self._engine_request(text, max_new_tokens=1)
             print(f"    [{i+1}/{self.n_runs}] {len(tokens):,} tokens")
-        print(f"  Decode warmup ({self.n_runs} runs, different prompts)...")
-        for i, text in enumerate(warmup_decode_texts):
-            self._engine_request(text, max_new_tokens=8)
+        print(f"  Decode warmup ({decode_len_str} tokens, 3 separate prompts)...")
+        for text, length in zip(warmup_decode_texts, self.DECODE_LENGTHS):
+            self._engine_request(text, max_new_tokens=length)
+            print(f"    {length} tokens done")
         warmup_s = time.perf_counter() - t0
         print(f"  Warmup complete ({warmup_s:.1f}s). All kernels compiled.")
 
-        # 4. Engine prefill benchmark
-        print(_section(f"Engine prefill benchmark ({lengths_str} tokens, {n_timed_prefill} runs)"))
+        # 4. Prefill (internal)
+        print(_section(f"Prefill (internal) — {lengths_str} tokens, {n_timed_prefill} runs"))
         prefill_result = self._benchmark_prefill_engine(timed_prefill_tokens, timed_prefill_texts)
         for i, run in enumerate(prefill_result["runs"]):
             print(f"  Run {i+1}: {run['tok_s']:,.1f} tok/s ({run['num_tokens']:,} tokens in {run['ms']:.1f}ms)")
         print(f"  {BOLD}Best: {prefill_result['best_tok_s']:,.1f} tok/s ({prefill_result['best_num_tokens']:,} tokens){NC}")
 
-        # 5. Engine decode benchmark
-        print(_section(f"Engine decode benchmark ({self.decode_tokens} tokens, {self.n_runs} runs, different prompts)"))
-        decode_result = self._benchmark_decode_engine(timed_decode_texts)
-        for i, run in enumerate(decode_result["runs"]):
-            print(f"  Run {i+1}: {run['tok_s']:.2f} tok/s ({run['ms_per_tok']:.1f}ms/tok)")
-        print(f"  {BOLD}Average: {decode_result['avg_tok_s']:.2f} tok/s ({decode_result['avg_ms_per_tok']:.1f}ms/tok){NC}")
+        # 5. Decode (internal)
+        print(_section(f"Decode (internal) — {decode_len_str} tokens, 3 separate prompts"))
+        decode_result = self._benchmark_decode_engine(timed_decode_texts, self.DECODE_LENGTHS)
+        for run in decode_result["runs"]:
+            if run["failed"]:
+                print(f"  {run['target_tokens']:>3} tokens: {YELLOW}FAILED (EOS at {run['actual_tokens']} tokens){NC}")
+            else:
+                print(f"  {run['target_tokens']:>3} tokens: {run['tok_s']:.2f} tok/s ({run['ms_per_tok']:.1f}ms/tok)")
+        if decode_result["best_tok_s"] > 0:
+            print(f"  {BOLD}Best: {decode_result['best_tok_s']:.2f} tok/s{NC}")
+        else:
+            print(f"  {YELLOW}{BOLD}All decode runs failed (EOS too early){NC}")
+        print(f"  HCS:  {decode_result['hcs_loaded']}/{decode_result['hcs_total']} experts loaded ({decode_result['hcs_pct']:.1f}%)")
+        print(f"  VRAM: {decode_result['min_free_vram_mb']} MB min free during benchmark")
 
-        # 6. Client TTFT benchmark (requires HTTP server)
-        ttft_result = None
-        print(_section(f"Client TTFT benchmark ({lengths_str} tokens via HTTP)"))
+        # 6. Round trip (network) — full HTTP prefill + decode
+        round_trip_result = None
+        print(_section(f"Round trip (network) — {decode_len_str} tokens via HTTP"))
         if self._wait_for_server():
             # HTTP warmup
-            self._http_ttft("warmup")
-            ttft_result = self._benchmark_http_ttft(timed_prefill_tokens, timed_prefill_texts)
-            for run in ttft_result["runs"]:
-                print(f"  {run['num_tokens']:>6,} tokens:  {run['ttft']:.2f}s")
+            self._http_round_trip("warmup", 8)
+            round_trip_result = self._benchmark_round_trip(timed_decode_texts, self.DECODE_LENGTHS)
+            for run in round_trip_result["runs"]:
+                if run["failed"]:
+                    print(f"  {run['target_tokens']:>3} tokens: {YELLOW}FAILED (EOS at {run['tokens']} tokens){NC}")
+                else:
+                    print(f"  {run['target_tokens']:>3} tokens: {run['decode_tok_s']:.2f} tok/s ({run['total_s']:.2f}s total)")
+            if round_trip_result["best_tok_s"] > 0:
+                print(f"  {BOLD}Best: {round_trip_result['best_tok_s']:.2f} tok/s{NC}")
+            else:
+                print(f"  {YELLOW}{BOLD}All round trip runs failed (EOS too early){NC}")
         else:
-            print(f"  {YELLOW}Server not ready — skipping HTTP TTFT benchmark{NC}")
+            print(f"  {YELLOW}Server not ready — skipping round trip benchmark{NC}")
 
         # 7. Format and write report
         print(_section("Writing results"))
         report = self._format_results(
             sys_info, model_info, vram_usage,
-            prefill_result, decode_result, ttft_result,
+            prefill_result, decode_result, round_trip_result,
         )
 
         # 8. Archive to benchmarks/ directory
@@ -711,19 +838,17 @@ class KrasisBenchmark:
         print(f"\n{BOLD}{'─' * 48}")
         print(f"  BENCHMARK COMPLETE")
         print(f"{'─' * 48}{NC}")
-        print(f"  Prefill: {GREEN}{BOLD}{prefill_result['best_tok_s']:,.1f} tok/s{NC}  (engine, best of {lengths_str})")
-        print(f"  Decode:  {GREEN}{BOLD}{decode_result['avg_tok_s']:.2f} tok/s{NC}  (engine, {decode_result['avg_ms_per_tok']:.1f}ms/tok)")
-        if ttft_result:
-            # Show TTFT for ~10K tokens if available, else middle run
-            ttft_runs = ttft_result["runs"]
-            ttft_show = None
-            for r in ttft_runs:
-                if 8000 <= r["num_tokens"] <= 12000:
-                    ttft_show = r
-                    break
-            if not ttft_show:
-                ttft_show = ttft_runs[len(ttft_runs) // 2]
-            print(f"  TTFT:    {GREEN}{BOLD}{ttft_show['ttft']:.2f}s{NC}  (client HTTP, {ttft_show['num_tokens']:,} tokens)")
+        print(f"  Prefill (internal):    {GREEN}{BOLD}{prefill_result['best_tok_s']:,.1f} tok/s{NC}  (best of {lengths_str})")
+        if decode_result["best_tok_s"] > 0:
+            print(f"  Decode (internal):     {GREEN}{BOLD}{decode_result['best_tok_s']:.2f} tok/s{NC}  (best of {decode_len_str})")
+        else:
+            print(f"  Decode (internal):     {YELLOW}{BOLD}FAILED{NC}  (all runs hit EOS early)")
+        if round_trip_result and round_trip_result["best_tok_s"] > 0:
+            print(f"  Round trip (network):  {GREEN}{BOLD}{round_trip_result['best_tok_s']:.2f} tok/s{NC}  (best of {decode_len_str})")
+        elif round_trip_result:
+            print(f"  Round trip (network):  {YELLOW}{BOLD}FAILED{NC}  (all runs hit EOS early)")
+        print(f"  HCS coverage:          {decode_result.get('hcs_loaded', 0)}/{decode_result.get('hcs_total', 0)} ({decode_result.get('hcs_pct', 0):.1f}%)")
+        print(f"  Min free VRAM:         {decode_result.get('min_free_vram_mb', 0)} MB")
         if archive_path:
             print(f"  Log:     {DIM}{archive_path}{NC}")
         print()
@@ -735,5 +860,5 @@ class KrasisBenchmark:
             "vram": vram_usage,
             "prefill": prefill_result,
             "decode": decode_result,
-            "ttft": ttft_result,
+            "round_trip": round_trip_result,
         }

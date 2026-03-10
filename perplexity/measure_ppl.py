@@ -358,6 +358,60 @@ def save_results(results: dict, config: dict, output_dir: Path):
 # CLI
 # ---------------------------------------------------------------------------
 
+def parse_config_file(config_path: str) -> dict:
+    """Parse a Krasis .conf file into a dict of settings.
+
+    Uses the same key mapping as server.py so any testconfig .conf file works.
+    """
+    _CFG_KEY_MAP = {
+        "MODEL_PATH": "model_path",
+        "CFG_SELECTED_GPUS": "_selected_gpus",
+        "CFG_LAYER_GROUP_SIZE": "layer_group_size",
+        "CFG_KV_DTYPE": "kv_dtype",
+        "CFG_GPU_EXPERT_BITS": "gpu_expert_bits",
+        "CFG_CPU_EXPERT_BITS": "cpu_expert_bits",
+        "CFG_ATTENTION_QUANT": "attention_quant",
+        "CFG_SHARED_EXPERT_QUANT": "shared_expert_quant",
+        "CFG_DENSE_MLP_QUANT": "dense_mlp_quant",
+        "CFG_LM_HEAD_QUANT": "lm_head_quant",
+        "CFG_KRASIS_THREADS": "krasis_threads",
+        "CFG_KV_CACHE_MB": "kv_cache_mb",
+    }
+    defaults = {}
+    with open(config_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if key in _CFG_KEY_MAP:
+                dest = _CFG_KEY_MAP[key]
+                if dest is None:
+                    continue
+                if key == "CFG_SELECTED_GPUS":
+                    gpu_list = [x.strip() for x in val.split(",") if x.strip()]
+                    if gpu_list:
+                        defaults["num_gpus"] = len(gpu_list)
+                    continue
+            else:
+                dest = key.replace("-", "_").lower()
+            # Type conversion
+            try:
+                defaults[dest] = int(val)
+            except ValueError:
+                try:
+                    defaults[dest] = float(val)
+                except ValueError:
+                    defaults[dest] = val
+    if "model_path" in defaults and isinstance(defaults["model_path"], str):
+        defaults["model_path"] = os.path.expanduser(defaults["model_path"])
+    return defaults
+
+
 def parse_args():
     ds_names = ", ".join(DATASETS.keys())
     p = argparse.ArgumentParser(
@@ -365,8 +419,12 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
+    # Config file (loads defaults, CLI overrides)
+    p.add_argument("--config", default=None,
+                   help="Path to .conf file (same format as testconfigs). CLI args override.")
+
     # Model
-    p.add_argument("--model-path", required=True, help="Path to HF model directory")
+    p.add_argument("--model-path", default=None, help="Path to HF model directory")
     p.add_argument("--num-gpus", type=int, default=None, help="Number of GPUs (auto-detect if omitted)")
 
     # Dataset
@@ -379,18 +437,65 @@ def parse_args():
     p.add_argument("--max-tokens", type=int, default=None, help="Truncate dataset to N tokens (for quick tests)")
 
     # Quantization
-    p.add_argument("--gpu-expert-bits", type=int, default=4, choices=[4, 8], help="GPU Marlin expert bits (default: 4)")
-    p.add_argument("--cpu-expert-bits", type=int, default=4, choices=[4, 8], help="CPU expert bits (default: 4)")
-    p.add_argument("--attention-quant", default="bf16", choices=["bf16"], help="Attention quantization (INT8 disabled — causes garbage)")
-    p.add_argument("--lm-head-quant", default="int8", choices=["bf16", "int8"], help="LM head quantization (default: int8)")
+    p.add_argument("--gpu-expert-bits", type=int, default=None, help="GPU Marlin expert bits (default: 4)")
+    p.add_argument("--cpu-expert-bits", type=int, default=None, help="CPU expert bits (default: 4)")
+    p.add_argument("--attention-quant", default=None, choices=["bf16", "adaptive_fp8"], help="Attention quantization")
+    p.add_argument("--lm-head-quant", default=None, choices=["bf16", "int8"], help="LM head quantization")
 
     # Paths
     p.add_argument("--cpu-only", action="store_true", help="Disable GPU prefill — measure through CPU-only path")
-    p.add_argument("--layer-group-size", type=int, default=2, help="Layers per group for prefill DMA (default: 2)")
-    p.add_argument("--kv-cache-mb", type=int, default=1000, help="KV cache size in MB (default: 1000)")
-    p.add_argument("--krasis-threads", type=int, default=48, help="CPU threads for Rust engine (default: 48)")
+    p.add_argument("--layer-group-size", type=int, default=None, help="Layers per group for prefill DMA")
+    p.add_argument("--kv-cache-mb", type=int, default=None, help="KV cache size in MB")
+    p.add_argument("--krasis-threads", type=int, default=None, help="CPU threads for Rust engine")
 
-    return p.parse_args()
+    args = p.parse_args()
+
+    # Load config file defaults, then apply CLI overrides
+    if args.config:
+        if not os.path.isfile(args.config):
+            print(f"Error: config file not found: {args.config}", file=sys.stderr)
+            sys.exit(1)
+        cfg = parse_config_file(args.config)
+        # Only override if CLI arg was not explicitly set
+        if args.model_path is None:
+            args.model_path = cfg.get("model_path")
+        if args.num_gpus is None:
+            args.num_gpus = cfg.get("num_gpus")
+        if args.gpu_expert_bits is None:
+            args.gpu_expert_bits = cfg.get("gpu_expert_bits", 4)
+        if args.cpu_expert_bits is None:
+            args.cpu_expert_bits = cfg.get("cpu_expert_bits", 4)
+        if args.attention_quant is None:
+            args.attention_quant = cfg.get("attention_quant", "bf16")
+        if args.lm_head_quant is None:
+            args.lm_head_quant = cfg.get("lm_head_quant", "int8")
+        if args.layer_group_size is None:
+            args.layer_group_size = cfg.get("layer_group_size", 2)
+        if args.kv_cache_mb is None:
+            args.kv_cache_mb = cfg.get("kv_cache_mb", 1000)
+        if args.krasis_threads is None:
+            args.krasis_threads = cfg.get("krasis_threads", 48)
+
+    # Apply defaults for anything still None
+    if args.model_path is None:
+        print("Error: --model-path or --config required", file=sys.stderr)
+        sys.exit(1)
+    if args.gpu_expert_bits is None:
+        args.gpu_expert_bits = 4
+    if args.cpu_expert_bits is None:
+        args.cpu_expert_bits = 4
+    if args.attention_quant is None:
+        args.attention_quant = "bf16"
+    if args.lm_head_quant is None:
+        args.lm_head_quant = "int8"
+    if args.layer_group_size is None:
+        args.layer_group_size = 2
+    if args.kv_cache_mb is None:
+        args.kv_cache_mb = 1000
+    if args.krasis_threads is None:
+        args.krasis_threads = 48
+
+    return args
 
 
 def run_perplexity(
@@ -495,6 +600,8 @@ def main():
 
     print(f"Krasis Perplexity Measurement")
     print(f"{'=' * 50}")
+    if args.config:
+        print(f"Config:      {args.config}")
     print(f"Model:       {args.model_path}")
     print(f"Dataset:     {args.dataset}")
     print(f"Mode:        {'CPU-only' if args.cpu_only else 'GPU prefill (Marlin)'}")

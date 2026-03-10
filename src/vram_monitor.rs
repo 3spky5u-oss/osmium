@@ -280,6 +280,16 @@ impl VramMonitor {
         0
     }
 
+    /// Reset min-free tracking for a single device (used by 4-point VRAM calibration).
+    fn reset(&self, device_index: i32) {
+        for dev in self.devices.iter() {
+            if dev.device_id == device_index {
+                dev.min_free_bytes.store(u64::MAX, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+
     /// Reset min-free tracking on all devices (e.g. after warmup, before runtime).
     fn reset_min_free(&self) {
         for dev in self.devices.iter() {

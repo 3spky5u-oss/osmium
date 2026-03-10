@@ -206,7 +206,7 @@ class QuantConfig:
     layernorms, gate weight. These are either too quality-critical or too small.
     """
     lm_head: str = "int8"          # "bf16" or "int8"
-    attention: str = "bf16"        # always "bf16" — INT8 disabled (catastrophic PPL, see DEBUGLOG)
+    attention: str = "bf16" # "bf16", "int8" (Marlin INT8), or "int4" (Marlin INT4)
     shared_expert: str = "int8"    # "bf16" or "int8"
     dense_mlp: str = "int8"        # "bf16" or "int8"
     gpu_expert_bits: int = 4       # 4 or 8 for Marlin kernel
@@ -414,10 +414,7 @@ class ModelConfig:
             routed_scaling_factor=cfg.get("routed_scaling_factor", 1.0),
             scoring_func=cfg.get("scoring_func", "softmax"),
             topk_method=cfg.get("topk_method", "greedy"),
-            # Qwen3.5 MoE router always renormalizes top-k weights (hardcoded in HF),
-            # but the config.json doesn't include norm_topk_prob.  Default to True for
-            # qwen3_5_moe_text so softmax routing weights sum to 1.0 after top-k selection.
-            norm_topk_prob=cfg.get("norm_topk_prob", arch == "qwen3_5_moe_text"),
+            norm_topk_prob=cfg.get("norm_topk_prob", False),
             rms_norm_eps=cfg.get("rms_norm_eps", 1e-6),
             hidden_act=cfg.get("hidden_act", "silu"),
             rope_theta=rope_theta,

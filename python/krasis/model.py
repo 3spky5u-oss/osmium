@@ -35,6 +35,16 @@ from krasis.tokenizer import Tokenizer
 
 logger = logging.getLogger(__name__)
 
+
+def _weight_dtype_code(t: torch.Tensor) -> int:
+    """Map torch dtype to Rust GpuWeight dtype code: 0=BF16, 1=FP32, 2=FP16."""
+    if t.dtype == torch.float32:
+        return 1
+    elif t.dtype == torch.float16:
+        return 2
+    return 0  # BF16 (default)
+
+
 # GPU-to-GPU P2P transfer may silently fail on some systems (returns zeros).
 # Detect this once at import time and use CPU bounce if needed.
 _p2p_works: Optional[bool] = None
@@ -447,6 +457,12 @@ class KrasisModel:
         self.gpu_prefill_threshold = gpu_prefill_threshold
         self.attention_backend = attention_backend
         self.force_load = force_load
+        # When attention is quantized, it's permanently VRAM-resident (much smaller),
+        # so streaming from CPU is unnecessary and would overwrite MarlinWeight attrs.
+        if stream_attention and quant_cfg.attention != "bf16":
+            logger.info("Disabling stream_attention: quantized attention (%s) is permanently VRAM-resident",
+                        quant_cfg.attention)
+            stream_attention = False
         self.stream_attention = stream_attention
 
         # Double-buffered streaming attention needs layer_group_size >= 2
@@ -541,7 +557,22 @@ class KrasisModel:
 
         _vram_checkpoint("before-load")
 
-        # Phase 0: System RAM budget check (skip in gpu_only — no CPU experts loaded)
+        # Phase 0a: GPU VRAM sanity check — abort early if GPU is occupied
+        # (e.g. zombie process holding memory after a crash)
+        for dev in self.all_devices:
+            free_mb, total_mb = torch.cuda.mem_get_info(dev)
+            free_mb //= (1024 * 1024)
+            total_mb //= (1024 * 1024)
+            used_pct = 100 * (1 - free_mb / total_mb)
+            if used_pct > 50:
+                msg = (f"GPU {dev} has only {free_mb} MB free ({used_pct:.0f}% used). "
+                       f"A zombie process may be holding GPU memory. "
+                       f"Try: sudo kill -9 $(nvidia-smi --query-compute-apps=pid --format=csv,noheader) "
+                       f"or reboot to clear stuck GPU memory.")
+                logger.error(msg)
+                raise RuntimeError(msg)
+
+        # Phase 0b: System RAM budget check (skip in gpu_only — no CPU experts loaded)
         if self.cfg.n_routed_experts > 0 and not gpu_only:
             _check_system_ram(
                 self.cfg,
@@ -917,12 +948,15 @@ class KrasisModel:
         self.embedding = loader.load_embedding(primary_dev)
 
         if self.stream_attention:
-            # Incremental load: load each layer to GPU, immediately offload
-            # attention to CPU to avoid accumulating all layers on GPU.
-            # Norms, gates, and shared experts stay on GPU (small, permanent).
+            # Incremental load: attention goes directly to CPU (never touches GPU),
+            # while norms, gates, and shared experts go to GPU (small, permanent).
+            # This avoids the GPU roundtrip and ensures no OOM from accumulating
+            # attention weights on GPU during loading.
             self._attn_cpu_weights = {}
+            import torch as _torch
+            _cpu = _torch.device('cpu')
             for layer_idx in range(L):
-                weights = loader.load_layer(layer_idx, primary_dev)
+                weights = loader.load_layer(layer_idx, primary_dev, attn_device=_cpu)
                 layer = TransformerLayer(
                     self.cfg, layer_idx, weights, primary_dev,
                     krasis_engine=None,
@@ -3808,30 +3842,132 @@ class KrasisModel:
         # always sees correct weights for every layer.
         self._rust_decode_weights = []  # prevent GC of permanent GPU copies
 
+        attn_quant = self.quant_cfg.attention  # "bf16", "int8", or "int4"
+        marlin_gs = 128  # Marlin group size for both INT8 and INT4
+
+        # Marlin quantization helpers (lazy import, only when quantizing)
+        _marlin_workspace = None
+        _marlin_scalar_type = None
+        _marlin_num_bits = 0
+        if attn_quant in ("int8", "int4"):
+            from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
+            from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import get_scalar_type
+            _marlin_workspace = marlin_make_workspace(device)
+            _marlin_num_bits = 4 if attn_quant == "int4" else 8
+            _marlin_scalar_type = get_scalar_type(_marlin_num_bits, False)
+
+        def _register_attn_weight(w: torch.Tensor) -> int:
+            """Register an attention weight as BF16, Marlin INT8, or Marlin INT4.
+
+            For Marlin quantization: Rust does quantize + repack on CPU,
+            Python uploads packed result to GPU as PyTorch tensors (shared
+            between prefill GEMM and Rust decode GEMV). Same repack format
+            for both paths. No BF16 ever touches VRAM.
+
+            For BF16: weight must already be on GPU.
+
+            Returns weight ID in the Rust store. For quantized weights, also
+            stores (packed, scales, workspace, scalar_type, N, K) on
+            self._marlin_attn_weights[wid] for prefill GEMM."""
+            if attn_quant in ("int8", "int4") and w.dtype == torch.bfloat16:
+                n, k = w.shape[0], w.shape[1]
+                if n % 64 == 0 and k % 16 == 0 and k % marlin_gs == 0:
+                    # Step 1: Get contiguous CPU BF16 data
+                    w_cpu = w.cpu().contiguous() if w.is_cuda else w.contiguous()
+
+                    # Step 2: Rust quantizes + repacks on CPU (same format as expert weights)
+                    if attn_quant == "int4":
+                        packed_bytes, scales_bytes, rn, rk = store.repack_marlin_int4_cpu(
+                            w_cpu.data_ptr(), n, k, marlin_gs)
+                    else:
+                        packed_bytes, scales_bytes, rn, rk = store.repack_marlin_int8_cpu(
+                            w_cpu.data_ptr(), n, k, marlin_gs)
+                    del w_cpu
+
+                    # Step 3: Create GPU tensors from Rust-repacked data
+                    import numpy as np
+                    packed_np = np.frombuffer(packed_bytes, dtype=np.uint32)
+                    scales_np = np.frombuffer(scales_bytes, dtype=np.uint16)
+                    repacked = torch.from_numpy(packed_np.copy()).to(
+                        dtype=torch.int32, device=device)
+                    scale_perm = torch.from_numpy(scales_np.copy()).to(
+                        dtype=torch.bfloat16, device=device)
+                    # Reshape for gptq_marlin_gemm: packed [K/16, pack_factor*N], scales [K/gs, N]
+                    if attn_quant == "int4":
+                        repacked = repacked.reshape(k // 16, 2 * n)
+                    else:
+                        repacked = repacked.reshape(k // 16, 4 * n)
+                    scale_perm = scale_perm.reshape(k // marlin_gs, n)
+
+                    # Step 4: Register GPU pointer with Rust store
+                    if attn_quant == "int8":
+                        wid = store.register_marlin_int8_weight(
+                            repacked.data_ptr(), scale_perm.data_ptr(),
+                            n, k, marlin_gs)
+                    else:
+                        wid = store.register_marlin_int4_weight(
+                            repacked.data_ptr(), scale_perm.data_ptr(),
+                            n, k, marlin_gs)
+
+                    # Step 5: Keep PyTorch tensors alive and accessible for prefill
+                    self._marlin_attn_weights[wid] = (
+                        repacked, scale_perm, _marlin_workspace,
+                        _marlin_scalar_type, n, k,
+                    )
+                    return wid
+                else:
+                    logger.warning("Attention weight [%d×%d] not Marlin-compatible "
+                                   "(need N%%64==0, K%%16==0, K%%gs==0), using BF16", n, k)
+            # BF16 path: weight must be on GPU
+            if not w.is_cuda:
+                w = w.to(device, non_blocking=True)
+            return store.register_weight(
+                w.data_ptr(), w.shape[0], w.shape[1], _weight_dtype_code(w))
+
+        self._marlin_attn_weights = {}  # wid -> (packed, scales, workspace, scalar_type, N, K)
+
         for layer_idx, layer in enumerate(self.layers):
             attn = layer.attention
             inp_norm = layer.input_norm_weight
             post_norm = layer.post_attn_norm_weight
 
             if layer.layer_type == "linear_attention":
-                # If streaming, copy from CPU-pinned source; otherwise use GPU tensor directly
+                # Source projection weights — when quantizing, keep on CPU to avoid
+                # putting full BF16 in VRAM. Only upload to GPU for BF16 mode.
                 if self._stream_attn_enabled and layer_idx in self._stream_attn_cpu:
                     cpu_w = self._stream_attn_cpu[layer_idx]
-                    qkvz_w = cpu_w.get("in_proj_qkvz", attn.in_proj_qkvz).to(device, non_blocking=True)
-                    ba_w = cpu_w.get("in_proj_ba", attn.in_proj_ba).to(device, non_blocking=True)
-                    out_w = cpu_w.get("out_proj", attn.out_proj).to(device, non_blocking=True)
-                    self._rust_decode_weights.extend([qkvz_w, ba_w, out_w])
+                    if attn_quant == "bf16":
+                        qkvz_w = cpu_w.get("in_proj_qkvz", attn.in_proj_qkvz).to(device, non_blocking=True)
+                        ba_w = cpu_w.get("in_proj_ba", attn.in_proj_ba).to(device, non_blocking=True)
+                        out_w = cpu_w.get("out_proj", attn.out_proj).to(device, non_blocking=True)
+                        self._rust_decode_weights.extend([qkvz_w, ba_w, out_w])
+                    else:
+                        # Quantizing: pass CPU tensors directly, never touch VRAM with BF16
+                        qkvz_w = cpu_w.get("in_proj_qkvz", attn.in_proj_qkvz)
+                        ba_w = cpu_w.get("in_proj_ba", attn.in_proj_ba)
+                        out_w = cpu_w.get("out_proj", attn.out_proj)
                 else:
                     qkvz_w = attn.in_proj_qkvz
                     ba_w = attn.in_proj_ba
                     out_w = attn.out_proj
-                qkvz_wid = store.register_weight(
-                    qkvz_w.data_ptr(), qkvz_w.shape[0], qkvz_w.shape[1], 0)
-                ba_wid = store.register_weight(
-                    ba_w.data_ptr(), ba_w.shape[0], ba_w.shape[1], 0)
-                out_wid = store.register_weight(
-                    out_w.data_ptr(), out_w.shape[0], out_w.shape[1], 0)
+                qkvz_wid = _register_attn_weight(qkvz_w)
+                ba_wid = _register_attn_weight(ba_w)
+                out_wid = _register_attn_weight(out_w)
                 self._la_wids[layer_idx] = (qkvz_wid, ba_wid, out_wid)
+
+                # Replace attention weight attributes with MarlinWeight for prefill
+                if qkvz_wid in self._marlin_attn_weights:
+                    from krasis.attention import MarlinWeight
+                    mw = self._marlin_attn_weights[qkvz_wid]
+                    attn.in_proj_qkvz = MarlinWeight(*mw)
+                if ba_wid in self._marlin_attn_weights:
+                    from krasis.attention import MarlinWeight
+                    mw = self._marlin_attn_weights[ba_wid]
+                    attn.in_proj_ba = MarlinWeight(*mw)
+                if out_wid in self._marlin_attn_weights:
+                    from krasis.attention import MarlinWeight
+                    mw = self._marlin_attn_weights[out_wid]
+                    attn.out_proj = MarlinWeight(*mw)
 
                 # Conv weight: [conv_dim, 1, kernel_dim] -> [conv_dim, kernel_dim]
                 # Rust LA kernels work in FP32, so create FP32 copies of BF16 tensors.
@@ -3847,19 +3983,19 @@ class KrasisModel:
                     a_log_src = attn.A_log
                     dt_bias_src = attn.dt_bias
                     norm_w_src = attn.norm_weight
-                conv_w = conv_src.squeeze(1).contiguous().float()
+                conv_w = conv_src.squeeze(1).contiguous().float().to(device)
                 attn._rust_conv_weight = conv_w
 
                 attn._init_state(batch_size=1)
                 # conv_state is BF16 from _init_state, Rust kernel needs FP32
                 attn._rust_conv_state = attn._conv_state.squeeze(0).float().contiguous()
                 # norm_weight is BF16, Rust gated_rmsnorm_silu kernel needs FP32
-                attn._rust_norm_weight = norm_w_src.float().contiguous()
+                attn._rust_norm_weight = norm_w_src.float().contiguous().to(device)
                 # recurrent_state may need FP32 conversion for Rust kernel
                 attn._rust_recur_state = attn._recurrent_state.squeeze(0).float().contiguous()
                 # A_log and dt_bias are BF16 from weight loader, Rust kernel needs FP32
-                attn._rust_a_log = a_log_src.float().contiguous()
-                attn._rust_dt_bias = dt_bias_src.float().contiguous()
+                attn._rust_a_log = a_log_src.float().contiguous().to(device)
+                attn._rust_dt_bias = dt_bias_src.float().contiguous().to(device)
 
                 store.register_la_layer(
                     layer_idx=layer_idx,
@@ -3879,27 +4015,39 @@ class KrasisModel:
                     scale=attn.scale,
                 )
             else:
-                # GQA attention — same streaming fix as LA above
+                # GQA attention — when quantizing, keep on CPU to avoid putting
+                # full BF16 in VRAM. Only upload to GPU for BF16 mode.
                 if self._stream_attn_enabled and layer_idx in self._stream_attn_cpu:
                     cpu_w = self._stream_attn_cpu[layer_idx]
-                    q_w = cpu_w.get("q_proj", attn.q_proj).to(device, non_blocking=True)
-                    k_w = cpu_w.get("k_proj", attn.k_proj).to(device, non_blocking=True)
-                    v_w = cpu_w.get("v_proj", attn.v_proj).to(device, non_blocking=True)
-                    o_w = cpu_w.get("o_proj", attn.o_proj).to(device, non_blocking=True)
-                    self._rust_decode_weights.extend([q_w, k_w, v_w, o_w])
+                    if attn_quant == "bf16":
+                        q_w = cpu_w.get("q_proj", attn.q_proj).to(device, non_blocking=True)
+                        k_w = cpu_w.get("k_proj", attn.k_proj).to(device, non_blocking=True)
+                        v_w = cpu_w.get("v_proj", attn.v_proj).to(device, non_blocking=True)
+                        o_w = cpu_w.get("o_proj", attn.o_proj).to(device, non_blocking=True)
+                        self._rust_decode_weights.extend([q_w, k_w, v_w, o_w])
+                    else:
+                        # Quantizing: pass CPU tensors directly, never touch VRAM with BF16
+                        q_w = cpu_w.get("q_proj", attn.q_proj)
+                        k_w = cpu_w.get("k_proj", attn.k_proj)
+                        v_w = cpu_w.get("v_proj", attn.v_proj)
+                        o_w = cpu_w.get("o_proj", attn.o_proj)
                 else:
                     q_w = attn.q_proj
                     k_w = attn.k_proj
                     v_w = attn.v_proj
                     o_w = attn.o_proj
-                q_wid = store.register_weight(
-                    q_w.data_ptr(), q_w.shape[0], q_w.shape[1], 0)
-                k_wid = store.register_weight(
-                    k_w.data_ptr(), k_w.shape[0], k_w.shape[1], 0)
-                v_wid = store.register_weight(
-                    v_w.data_ptr(), v_w.shape[0], v_w.shape[1], 0)
-                o_wid = store.register_weight(
-                    o_w.data_ptr(), o_w.shape[0], o_w.shape[1], 0)
+                q_wid = _register_attn_weight(q_w)
+                k_wid = _register_attn_weight(k_w)
+                v_wid = _register_attn_weight(v_w)
+                o_wid = _register_attn_weight(o_w)
+
+                # Replace attention weight attributes with MarlinWeight for prefill
+                if q_wid in self._marlin_attn_weights:
+                    from krasis.attention import MarlinWeight
+                    attn.q_proj = MarlinWeight(*self._marlin_attn_weights[q_wid])
+                    attn.k_proj = MarlinWeight(*self._marlin_attn_weights[k_wid])
+                    attn.v_proj = MarlinWeight(*self._marlin_attn_weights[v_wid])
+                    attn.o_proj = MarlinWeight(*self._marlin_attn_weights[o_wid])
 
                 # QK norm weights are BF16, Rust per_head_rmsnorm kernel needs FP32
                 # When streaming, use CPU-pinned source for these small weights
@@ -3911,12 +4059,12 @@ class KrasisModel:
                     q_norm_src = attn.q_norm
                     k_norm_src = attn.k_norm
                 if q_norm_src is not None:
-                    attn._rust_q_norm = q_norm_src.float().contiguous()
+                    attn._rust_q_norm = q_norm_src.float().contiguous().to(device)
                     q_norm_ptr = attn._rust_q_norm.data_ptr()
                 else:
                     q_norm_ptr = 0
                 if k_norm_src is not None:
-                    attn._rust_k_norm = k_norm_src.float().contiguous()
+                    attn._rust_k_norm = k_norm_src.float().contiguous().to(device)
                     k_norm_ptr = attn._rust_k_norm.data_ptr()
                 else:
                     k_norm_ptr = 0
@@ -4093,9 +4241,9 @@ class KrasisModel:
                     ba_w = attn.in_proj_ba.to(aux_device, non_blocking=True)
                     out_w = attn.out_proj.to(aux_device, non_blocking=True)
                     self._aux_decode_weights.extend([qkvz_w, ba_w, out_w])
-                    qkvz_wid = store.register_weight(qkvz_w.data_ptr(), qkvz_w.shape[0], qkvz_w.shape[1], 0)
-                    ba_wid = store.register_weight(ba_w.data_ptr(), ba_w.shape[0], ba_w.shape[1], 0)
-                    out_wid = store.register_weight(out_w.data_ptr(), out_w.shape[0], out_w.shape[1], 0)
+                    qkvz_wid = _register_attn_weight(qkvz_w)
+                    ba_wid = _register_attn_weight(ba_w)
+                    out_wid = _register_attn_weight(out_w)
 
                     # Copy norm weights to aux GPU
                     inp_norm_aux = inp_norm.to(aux_device, non_blocking=True)
@@ -4134,9 +4282,9 @@ class KrasisModel:
                         layer_idx=layer_idx,
                         input_norm_ptr=inp_norm.data_ptr(), input_norm_size=inp_norm.numel(),
                         post_attn_norm_ptr=post_norm.data_ptr(), post_attn_norm_size=post_norm.numel(),
-                        in_proj_qkvz_wid=store.register_weight(attn.in_proj_qkvz.data_ptr(), attn.in_proj_qkvz.shape[0], attn.in_proj_qkvz.shape[1], 0),
-                        in_proj_ba_wid=store.register_weight(attn.in_proj_ba.data_ptr(), attn.in_proj_ba.shape[0], attn.in_proj_ba.shape[1], 0),
-                        out_proj_wid=store.register_weight(attn.out_proj.data_ptr(), attn.out_proj.shape[0], attn.out_proj.shape[1], 0),
+                        in_proj_qkvz_wid=_register_attn_weight(attn.in_proj_qkvz),
+                        in_proj_ba_wid=_register_attn_weight(attn.in_proj_ba),
+                        out_proj_wid=_register_attn_weight(attn.out_proj),
                         conv_weight_ptr=attn._rust_conv_weight.data_ptr() if hasattr(attn, '_rust_conv_weight') else 0,
                         a_log_ptr=attn._rust_a_log.data_ptr() if hasattr(attn, '_rust_a_log') else 0,
                         dt_bias_ptr=attn._rust_dt_bias.data_ptr() if hasattr(attn, '_rust_dt_bias') else 0,
@@ -4158,10 +4306,10 @@ class KrasisModel:
                     v_w = attn.v_proj.to(aux_device, non_blocking=True)
                     o_w = attn.o_proj.to(aux_device, non_blocking=True)
                     self._aux_decode_weights.extend([q_w, k_w, v_w, o_w])
-                    q_wid = store.register_weight(q_w.data_ptr(), q_w.shape[0], q_w.shape[1], 0)
-                    k_wid = store.register_weight(k_w.data_ptr(), k_w.shape[0], k_w.shape[1], 0)
-                    v_wid = store.register_weight(v_w.data_ptr(), v_w.shape[0], v_w.shape[1], 0)
-                    o_wid = store.register_weight(o_w.data_ptr(), o_w.shape[0], o_w.shape[1], 0)
+                    q_wid = store.register_weight(q_w.data_ptr(), q_w.shape[0], q_w.shape[1], _weight_dtype_code(q_w))
+                    k_wid = store.register_weight(k_w.data_ptr(), k_w.shape[0], k_w.shape[1], _weight_dtype_code(k_w))
+                    v_wid = store.register_weight(v_w.data_ptr(), v_w.shape[0], v_w.shape[1], _weight_dtype_code(v_w))
+                    o_wid = store.register_weight(o_w.data_ptr(), o_w.shape[0], o_w.shape[1], _weight_dtype_code(o_w))
 
                     # Copy norm weights to aux GPU
                     inp_norm_aux = inp_norm.to(aux_device, non_blocking=True)
@@ -4212,10 +4360,10 @@ class KrasisModel:
                         aux_rope_set = True
                 else:
                     # Layers before split — register placeholder
-                    q_wid = store.register_weight(attn.q_proj.data_ptr(), attn.q_proj.shape[0], attn.q_proj.shape[1], 0)
-                    k_wid = store.register_weight(attn.k_proj.data_ptr(), attn.k_proj.shape[0], attn.k_proj.shape[1], 0)
-                    v_wid = store.register_weight(attn.v_proj.data_ptr(), attn.v_proj.shape[0], attn.v_proj.shape[1], 0)
-                    o_wid = store.register_weight(attn.o_proj.data_ptr(), attn.o_proj.shape[0], attn.o_proj.shape[1], 0)
+                    q_wid = _register_attn_weight(attn.q_proj)
+                    k_wid = _register_attn_weight(attn.k_proj)
+                    v_wid = _register_attn_weight(attn.v_proj)
+                    o_wid = _register_attn_weight(attn.o_proj)
                     if attn.q_norm is not None:
                         q_norm_ptr = attn._rust_q_norm.data_ptr() if hasattr(attn, '_rust_q_norm') else 0
                     else:

@@ -43,6 +43,9 @@ def _linear(x: torch.Tensor, weight_data) -> torch.Tensor:
 class TransformerLayer:
     """One transformer layer: attention + MLP (dense or MoE)."""
 
+    # Class-level: skip attention for layers >= this index (None = no skip)
+    attn_skip_after: int | None = None
+
     def __init__(
         self,
         cfg: ModelConfig,
@@ -225,7 +228,11 @@ class TransformerLayer:
             )
 
         # ── Attention ──
-        if self.layer_type == "linear_attention":
+        skip_attn = (TransformerLayer.attn_skip_after is not None
+                     and self.layer_idx >= TransformerLayer.attn_skip_after)
+        if skip_attn:
+            attn_out = torch.zeros_like(hidden)
+        elif self.layer_type == "linear_attention":
             attn_out = self.attention.forward(hidden, is_decode=(M == 1))
         else:
             attn_out = self.attention.forward(
@@ -289,7 +296,12 @@ class TransformerLayer:
             t_after_norm1 = time.perf_counter()
 
         # ── Attention ──
-        if self.layer_type == "linear_attention":
+        skip_attn = (TransformerLayer.attn_skip_after is not None
+                     and self.layer_idx >= TransformerLayer.attn_skip_after)
+        if skip_attn:
+            # Skip attention: zero hidden so residual passes through unchanged
+            attn_out = torch.zeros_like(hidden)
+        elif self.layer_type == "linear_attention":
             # Linear attention: no KV cache, uses internal recurrent state
             attn_out = self.attention.forward(hidden, is_decode=(M == 1))
         else:

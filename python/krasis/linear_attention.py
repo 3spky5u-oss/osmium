@@ -105,7 +105,28 @@ def warmup_compiled_chunk_step(device, nv, dk, dv, chunk_size=64):
 
 
 def _linear(x: torch.Tensor, weight_data) -> torch.Tensor:
-    """Dispatch to INT8 or BF16 linear based on weight type."""
+    """Dispatch to Marlin GEMM, INT8, or BF16 linear based on weight type."""
+    from krasis.attention import MarlinWeight
+    if isinstance(weight_data, MarlinWeight):
+        import sgl_kernel
+        M = x.shape[0]
+        return sgl_kernel.gptq_marlin_gemm(
+            a=x.contiguous(),
+            c=None,
+            b_q_weight=weight_data.packed,
+            b_scales=weight_data.scales,
+            global_scale=None,
+            b_zeros=None,
+            g_idx=None,
+            perm=None,
+            workspace=weight_data.workspace,
+            b_q_type=weight_data.scalar_type,
+            size_m=M,
+            size_n=weight_data.n,
+            size_k=weight_data.k,
+            is_k_full=True,
+            use_fp32_reduce=True,
+        )
     if isinstance(weight_data, tuple):
         return int8_linear(x, *weight_data)
     return torch.nn.functional.linear(x, weight_data)
@@ -463,19 +484,10 @@ class GatedDeltaNetAttention:
         Matches HF torch_recurrent_gated_delta_rule exactly.
         """
         M = hidden.shape[0]
-        timing = TIMING.decode and M == 1
-
-        if timing:
-            torch.cuda.synchronize()
-            _t0 = time.perf_counter()
 
         # Project to qkvz and ba
         qkvz = _linear(hidden, self.in_proj_qkvz)  # [M, q+k+v+z]
         ba = _linear(hidden, self.in_proj_ba)       # [M, b+a]
-
-        if timing:
-            torch.cuda.synchronize()
-            _t1 = time.perf_counter()
 
         # Un-interleave
         q, k, v, z, b, a = self._fix_query_key_value_ordering(qkvz, ba)
@@ -510,10 +522,6 @@ class GatedDeltaNetAttention:
         conv_out = conv_out.to(hidden.dtype)
         conv_out = conv_out.transpose(1, 2).squeeze(0)  # [M, conv_dim]
 
-        if timing:
-            torch.cuda.synchronize()
-            _t2 = time.perf_counter()
-
         # Split back to q, k, v and reshape to heads
         q_out = conv_out[:, :self.key_dim].reshape(M, self.num_k_heads, self.k_head_dim)
         k_out = conv_out[:, self.key_dim:self.key_dim * 2].reshape(M, self.num_k_heads, self.k_head_dim)
@@ -534,10 +542,6 @@ class GatedDeltaNetAttention:
 
         # Scale query
         q_out = q_out * self.scale
-
-        if timing:
-            torch.cuda.synchronize()
-            _t3 = time.perf_counter()
 
         # Recurrent delta rule (matches HF torch_recurrent_gated_delta_rule)
         outputs = []
@@ -560,10 +564,6 @@ class GatedDeltaNetAttention:
             out_t = (self._recurrent_state.squeeze(0) * q_t.unsqueeze(-1)).sum(dim=-2)  # [nv, dv]
             outputs.append(out_t)
 
-        if timing:
-            torch.cuda.synchronize()
-            _t4 = time.perf_counter()
-
         # Stack outputs: [M, nv, dv]
         attn_out = torch.stack(outputs, dim=0)
 
@@ -573,20 +573,6 @@ class GatedDeltaNetAttention:
         # Flatten and project (cast back to BF16 for out_proj)
         attn_flat = attn_out.reshape(M, self.num_v_heads * self.v_head_dim).to(torch.bfloat16)
         result = _linear(attn_flat, self.out_proj)  # [M, hidden]
-
-        if timing:
-            torch.cuda.synchronize()
-            _t5 = time.perf_counter()
-            logger.info(
-                "  LA-DETAIL L%d: proj=%.2fms conv=%.2fms prep=%.2fms recur=%.2fms norm+out=%.2fms total=%.2fms",
-                self.layer_idx,
-                (_t1 - _t0) * 1000,
-                (_t2 - _t1) * 1000,
-                (_t3 - _t2) * 1000,
-                (_t4 - _t3) * 1000,
-                (_t5 - _t4) * 1000,
-                (_t5 - _t0) * 1000,
-            )
 
         return result
 

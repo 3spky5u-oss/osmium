@@ -29,14 +29,50 @@ import flashinfer
 
 from krasis.config import ModelConfig
 from krasis.kv_cache import PagedKVCache, SequenceKVState
-from krasis.timing import TIMING
 from krasis.weight_loader import int8_linear
 
 logger = logging.getLogger(__name__)
 
 
+class MarlinWeight:
+    """Marlin-packed weight for use with gptq_marlin_gemm.
+
+    Stores packed quantized weight, permuted scales, workspace buffer,
+    scalar type, and original dimensions (N=output, K=input).
+    """
+    __slots__ = ('packed', 'scales', 'workspace', 'scalar_type', 'n', 'k')
+
+    def __init__(self, packed, scales, workspace, scalar_type, n, k):
+        self.packed = packed
+        self.scales = scales
+        self.workspace = workspace
+        self.scalar_type = scalar_type
+        self.n = n
+        self.k = k
+
+
 def _linear(x: torch.Tensor, weight_data) -> torch.Tensor:
-    """Dispatch to INT8 or BF16 linear based on weight type."""
+    """Dispatch to Marlin GEMM, INT8, or BF16 linear based on weight type."""
+    if isinstance(weight_data, MarlinWeight):
+        import sgl_kernel
+        M = x.shape[0]
+        return sgl_kernel.gptq_marlin_gemm(
+            a=x.contiguous(),
+            c=None,
+            b_q_weight=weight_data.packed,
+            b_scales=weight_data.scales,
+            global_scale=None,
+            b_zeros=None,
+            g_idx=None,
+            perm=None,
+            workspace=weight_data.workspace,
+            b_q_type=weight_data.scalar_type,
+            size_m=M,
+            size_n=weight_data.n,
+            size_k=weight_data.k,
+            is_k_full=True,
+            use_fp32_reduce=True,
+        )
     if isinstance(weight_data, tuple):
         return int8_linear(x, *weight_data)
     return torch.nn.functional.linear(x, weight_data)
@@ -516,11 +552,6 @@ class GQAAttention:
             [M, hidden_size] BF16 attention output
         """
         M = hidden.shape[0]
-        _timing = TIMING.prefill and M > 1
-
-        if _timing:
-            torch.cuda.synchronize(self.device)
-            _gqa_t0 = time.perf_counter()
 
         # ── Step 1: Q/K/V projections ──
         q_raw = _linear(hidden, self.q_proj)  # [M, num_heads * head_dim (* 2 if gated)]
@@ -560,10 +591,6 @@ class GQAAttention:
 
         # ── Step 3: RoPE ──
         q, k = self._apply_rope(q, k, positions)
-
-        if _timing:
-            torch.cuda.synchronize(self.device)
-            _gqa_t1 = time.perf_counter()
 
         # ── Step 4: Append K, V to paged cache ──
         k_layer, v_layer = kv_cache.get_gqa_layer_caches(layer_offset)
@@ -627,10 +654,6 @@ class GQAAttention:
             plan_kwargs["window_left"] = self.sliding_window - 1
         self._prefill_wrapper.plan(**plan_kwargs)
 
-        if _timing:
-            torch.cuda.synchronize(self.device)
-            _gqa_t2 = time.perf_counter()
-
         # Request LSE (log-sum-exp) if sinks are present — needed for post-correction
         run_kwargs = dict(
             q=q.to(torch.bfloat16),
@@ -654,10 +677,6 @@ class GQAAttention:
             # attn_out: [M, num_heads, head_dim]
             attn_out = run_result
 
-        if _timing:
-            torch.cuda.synchronize(self.device)
-            _gqa_t_flash = time.perf_counter()
-
         # ── Step 6: O projection ──
         attn_flat = attn_out.reshape(M, self.num_heads * self.head_dim)
 
@@ -672,16 +691,5 @@ class GQAAttention:
         output = _linear(attn_flat, self.o_proj)
         if self.o_proj_bias is not None:
             output = output + self.o_proj_bias
-
-        if _timing:
-            torch.cuda.synchronize(self.device)
-            _gqa_t3 = time.perf_counter()
-            logger.info(
-                "GQA-PREFILL L%d(%s) M=%d: qkv+rope=%.1fms cache+plan=%.1fms "
-                "flashinfer=%.1fms gate+oproj=%.1fms total=%.1fms",
-                self.layer_idx, self.device, M,
-                (_gqa_t1 - _gqa_t0) * 1000, (_gqa_t2 - _gqa_t1) * 1000,
-                (_gqa_t_flash - _gqa_t2) * 1000, (_gqa_t3 - _gqa_t_flash) * 1000,
-                (_gqa_t3 - _gqa_t0) * 1000)
 
         return output

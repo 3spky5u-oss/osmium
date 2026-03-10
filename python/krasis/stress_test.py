@@ -27,7 +27,6 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from krasis.timing import TIMING
 
 logger = logging.getLogger("krasis.stress_test")
 
@@ -217,9 +216,6 @@ class StressTest:
         self.shuffle = shuffle
         self.max_prompts = max_prompts
 
-        # Disable instrumentation
-        TIMING.decode = False
-        TIMING.prefill = False
 
     def _build_prompt_tokens(self, prompt: str) -> List[int]:
         """Tokenize a prompt using the model's tokenizer with chat template."""
@@ -467,8 +463,8 @@ def main():
     parser.add_argument("--kv-dtype", default="fp8_e4m3")
     parser.add_argument("--gpu-expert-bits", type=int, default=4)
     parser.add_argument("--cpu-expert-bits", type=int, default=4)
-    parser.add_argument("--attention-quant", default="bf16", choices=["bf16"],
-                        help="Attention quant (INT8 disabled — causes garbage output)")
+    parser.add_argument("--attention-quant", default="bf16", choices=["bf16", "int4", "int8"],
+                        help="Attention weight precision: bf16 (default), int4 Marlin W4A16, int8 Marlin W8A16")
     parser.add_argument("--shared-expert-quant", default="int8")
     parser.add_argument("--dense-mlp-quant", default="int8")
     parser.add_argument("--lm-head-quant", default="int8")

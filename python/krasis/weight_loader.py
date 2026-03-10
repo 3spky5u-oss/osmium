@@ -110,11 +110,6 @@ class WeightLoader:
     def __init__(self, cfg: ModelConfig, quant_cfg: QuantConfig = None):
         self.cfg = cfg
         self.quant_cfg = quant_cfg or QuantConfig()
-        # INT8 attention is disabled — causes catastrophic PPL (~5600 vs ~10).
-        # Override silently in case old config files still have int8.
-        if self.quant_cfg.attention == "int8":
-            logger.warning("INT8 attention is disabled (causes garbage output). Forcing bf16.")
-            self.quant_cfg.attention = "bf16"
         self.model_path = cfg.model_path
 
         # Load safetensors index
@@ -153,6 +148,8 @@ class WeightLoader:
         """Read a weight tensor and place on GPU as BF16."""
         w = self._read_tensor(name).to(torch.bfloat16)
         return w.to(device)
+
+
 
     def load_embedding(self, device: torch.device) -> torch.Tensor:
         """Load embedding table (BF16, ~2.2 GB for Kimi K2.5)."""
@@ -206,7 +203,9 @@ class WeightLoader:
         """
         prefix = f"{self.cfg.layers_prefix}.layers.{layer_idx}.self_attn"
         weights = {}
-        load_proj = self._load_and_quantize if self.quant_cfg.attention == "int8" else self._load_bf16
+        # Attention weights always loaded as BF16 — adaptive FP8 conversion
+        # for decode is handled separately in model.py after loading.
+        load_proj = self._load_bf16
 
         if self.cfg.has_q_lora:
             for proj in ["q_a_proj", "q_b_proj"]:
@@ -242,7 +241,9 @@ class WeightLoader:
         """
         prefix = f"{self.cfg.layers_prefix}.layers.{layer_idx}.self_attn"
         weights = {}
-        load_proj = self._load_and_quantize if self.quant_cfg.attention == "int8" else self._load_bf16
+        # Attention weights always loaded as BF16 — adaptive FP8 conversion
+        # for decode is handled separately in model.py after loading.
+        load_proj = self._load_bf16
 
         for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]:
             weights[proj] = load_proj(f"{prefix}.{proj}.weight", device)
@@ -376,7 +377,9 @@ class WeightLoader:
         """
         prefix = f"{self.cfg.layers_prefix}.layers.{layer_idx}.linear_attn"
         weights = {}
-        load_proj = self._load_and_quantize if self.quant_cfg.attention == "int8" else self._load_bf16
+        # Attention weights always loaded as BF16 — adaptive FP8 conversion
+        # for decode is handled separately in model.py after loading.
+        load_proj = self._load_bf16
 
         # Quantizable projections — handle fused (QCN) or separate (Qwen3.5) format
         fused_qkvz = f"{prefix}.in_proj_qkvz.weight"
@@ -426,9 +429,15 @@ class WeightLoader:
         return weights
 
     def load_layer(
-        self, layer_idx: int, device: torch.device
+        self, layer_idx: int, device: torch.device,
+        attn_device: torch.device = None,
     ) -> Dict[str, any]:
         """Load all GPU weights for one layer.
+
+        Args:
+            device: Device for norms, gate, shared expert, dense MLP.
+            attn_device: Device for attention weights. Defaults to device.
+                         Pass torch.device('cpu') to keep attention in system RAM.
 
         Returns a dict with:
         - "norms": {input_layernorm, post_attention_layernorm}
@@ -437,6 +446,8 @@ class WeightLoader:
         - "mlp": dense MLP weights (if dense layer) OR MoE gate + shared expert
         - "is_moe": bool
         """
+        if attn_device is None:
+            attn_device = device
         start = time.perf_counter()
 
         is_linear = self.cfg.is_linear_attention_layer(layer_idx)
@@ -455,9 +466,9 @@ class WeightLoader:
 
         # Load attention weights based on layer type
         if is_linear:
-            result["linear_attention"] = self.load_linear_attention_weights(layer_idx, device)
+            result["linear_attention"] = self.load_linear_attention_weights(layer_idx, attn_device)
         else:
-            result["attention"] = self.load_attention_weights(layer_idx, device)
+            result["attention"] = self.load_attention_weights(layer_idx, attn_device)
 
         if result["is_moe"]:
             result["gate"] = self.load_moe_gate(layer_idx, device)

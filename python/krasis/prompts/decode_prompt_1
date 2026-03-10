@@ -1,1 +1,1 @@
-Write a poem about recursion in programming at least 100 words long.
+Write a comprehensive 1000-word technical explanation of how a modern CPU executes instructions, covering the complete pipeline from fetch through retirement, including branch prediction, out-of-order execution, register renaming, cache hierarchy, and memory ordering.

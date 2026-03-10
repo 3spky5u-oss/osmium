@@ -63,6 +63,7 @@ const KERNEL_NAMES: &[&str] = &[
     "marlin_gemv_int4_fused_silu_accum",
     "marlin_gemv_int4_v2",
     "reduce_ksplits_bf16",
+    "reduce_ksplits_f32",
     "marlin_gemv_int4_fused_silu_accum_v2",
     "reduce_ksplits_weighted_accum_bf16",
     "sigmoid_gate_inplace_bf16",
@@ -72,6 +73,12 @@ const KERNEL_NAMES: &[&str] = &[
     "reduce_ksplits_bf16_batched",
     "fused_silu_w2_batched",
     "multi_expert_weighted_add_bf16",
+    "marlin_gemv_int4_f32",
+    "marlin_gemv_int8",
+    "marlin_gemv_int8_f32",
+    "marlin_gemv_int4_v2_fused_f32",
+    "marlin_gemv_int8_v2",
+    "marlin_gemv_int8_v2_fused_f32",
     // Graphable kernel variants (read position/token from GPU pointers for CUDA graph capture)
     "embedding_lookup_g",
     "apply_rope_g",
@@ -137,6 +144,60 @@ impl PrefetchSlot {
     }
     fn w2_scales_ptr(&self) -> u64 {
         *self.d_buf.device_ptr() + self.w2_scales_offset as u64
+    }
+}
+
+/// Four-point VRAM calibration data from startup measurements.
+/// Used to interpolate expected free VRAM at any prompt length.
+struct VramCalibration {
+    short_tokens: usize,
+    long_tokens: usize,
+    /// min_free VRAM (MB) during short prompt prefill (no HCS loaded)
+    prefill_short_free_mb: u64,
+    /// min_free VRAM (MB) during long prompt prefill (no HCS loaded)
+    prefill_long_free_mb: u64,
+    /// min_free VRAM (MB) during short prompt decode (no HCS loaded)
+    decode_short_free_mb: u64,
+    /// min_free VRAM (MB) during long prompt decode (no HCS loaded)
+    decode_long_free_mb: u64,
+    safety_margin_mb: u64,
+}
+
+impl VramCalibration {
+    /// Interpolate expected min_free VRAM (MB) during prefill for a given prompt length.
+    fn prefill_free_mb(&self, tokens: usize) -> u64 {
+        if self.long_tokens <= self.short_tokens {
+            return self.prefill_long_free_mb;
+        }
+        let t = (tokens.saturating_sub(self.short_tokens) as f64)
+            / (self.long_tokens - self.short_tokens) as f64;
+        let t = t.clamp(0.0, 1.5); // allow slight extrapolation
+        let free = self.prefill_short_free_mb as f64
+            - t * (self.prefill_short_free_mb as f64 - self.prefill_long_free_mb as f64);
+        (free.max(0.0)) as u64
+    }
+
+    /// Interpolate expected min_free VRAM (MB) during decode for a given prompt length.
+    fn decode_free_mb(&self, tokens: usize) -> u64 {
+        if self.long_tokens <= self.short_tokens {
+            return self.decode_long_free_mb;
+        }
+        let t = (tokens.saturating_sub(self.short_tokens) as f64)
+            / (self.long_tokens - self.short_tokens) as f64;
+        let t = t.clamp(0.0, 1.5);
+        let free = self.decode_short_free_mb as f64
+            - t * (self.decode_short_free_mb as f64 - self.decode_long_free_mb as f64);
+        (free.max(0.0)) as u64
+    }
+
+    /// Max HCS budget for prefill of N tokens (what survives prefill).
+    fn prefill_hcs_budget_mb(&self, tokens: usize) -> u64 {
+        self.prefill_free_mb(tokens).saturating_sub(self.safety_margin_mb)
+    }
+
+    /// Max HCS budget for decode after prefill of N tokens.
+    fn decode_hcs_budget_mb(&self, tokens: usize) -> u64 {
+        self.decode_free_mb(tokens).saturating_sub(self.safety_margin_mb)
     }
 }
 
@@ -290,61 +351,6 @@ impl HcsCacheEntry {
     }
 }
 
-/// VRAM calibration from four-point startup measurement.
-/// Enables proportional soft-tier HCS eviction based on prompt length.
-#[derive(Clone, Debug)]
-struct VramCalibration {
-    short_tokens: usize,
-    long_tokens: usize,
-    /// min_free VRAM (MB) during short prompt prefill (no HCS loaded)
-    prefill_short_free_mb: u64,
-    /// min_free VRAM (MB) during long prompt prefill (no HCS loaded)
-    prefill_long_free_mb: u64,
-    /// min_free VRAM (MB) during short prompt decode (no HCS loaded)
-    decode_short_free_mb: u64,
-    /// min_free VRAM (MB) during long prompt decode (no HCS loaded)
-    decode_long_free_mb: u64,
-    safety_margin_mb: u64,
-}
-
-impl VramCalibration {
-    /// Interpolate expected min_free VRAM (MB) during prefill for a given prompt length.
-    fn prefill_free_mb(&self, tokens: usize) -> u64 {
-        if self.long_tokens <= self.short_tokens {
-            return self.prefill_long_free_mb; // fallback
-        }
-        let t = (tokens.saturating_sub(self.short_tokens) as f64)
-            / (self.long_tokens - self.short_tokens) as f64;
-        let t = t.clamp(0.0, 1.5); // allow slight extrapolation
-        let free = self.prefill_short_free_mb as f64
-            - t * (self.prefill_short_free_mb as f64 - self.prefill_long_free_mb as f64);
-        (free.max(0.0)) as u64
-    }
-
-    /// Interpolate expected min_free VRAM (MB) during decode for a given prompt length.
-    fn decode_free_mb(&self, tokens: usize) -> u64 {
-        if self.long_tokens <= self.short_tokens {
-            return self.decode_long_free_mb;
-        }
-        let t = (tokens.saturating_sub(self.short_tokens) as f64)
-            / (self.long_tokens - self.short_tokens) as f64;
-        let t = t.clamp(0.0, 1.5);
-        let free = self.decode_short_free_mb as f64
-            - t * (self.decode_short_free_mb as f64 - self.decode_long_free_mb as f64);
-        (free.max(0.0)) as u64
-    }
-
-    /// Max HCS budget for prefill of N tokens (what survives prefill).
-    fn prefill_hcs_budget_mb(&self, tokens: usize) -> u64 {
-        self.prefill_free_mb(tokens).saturating_sub(self.safety_margin_mb)
-    }
-
-    /// Max HCS budget for decode after prefill of N tokens.
-    fn decode_hcs_budget_mb(&self, tokens: usize) -> u64 {
-        self.decode_free_mb(tokens).saturating_sub(self.safety_margin_mb)
-    }
-}
-
 /// HCS state: resident expert cache + activation heatmap + dynamic eviction.
 struct HcsState {
     /// (layer_idx, expert_idx) → cache entry (for management operations).
@@ -406,6 +412,8 @@ struct HcsState {
     soft_reload_stream: Option<CudaStream>,
     /// Pending cache entries to activate when async reload completes.
     soft_reload_entries: Vec<(usize, usize, HcsCacheEntry)>,
+    /// Safety margin in MB — minimum free VRAM to maintain.
+    safety_margin_mb: usize,
 
     // ── Dynamic eviction: sliding window activation tracking ──
     /// Bitset for current prompt: 1 bit per (layer_idx * num_experts + expert_idx).
@@ -466,6 +474,7 @@ impl HcsState {
             soft_reload_event: None,  // CudaEvent
             soft_reload_stream: None, // CudaStream
             soft_reload_entries: Vec::new(),
+            safety_margin_mb: 1000,
             current_activations: Vec::new(),
             num_experts_per_layer: 0,
             prompt_history: std::collections::VecDeque::new(),
@@ -658,6 +667,10 @@ struct ExpertDataPtr {
     w2_packed_bytes: usize,
     w2_scales_ptr: usize,
     w2_scales_bytes: usize,
+    /// Contiguous pinned buffer: [w13_packed | w13_scales | w2_packed | w2_scales]
+    /// When set, DMA can use a single cuMemcpyHtoDAsync call.
+    contiguous_ptr: usize,
+    contiguous_bytes: usize,
 }
 
 /// Per-layer expert data for DMA.
@@ -688,11 +701,31 @@ struct GpuWeight {
     ptr: u64,
     rows: usize,
     cols: usize,
-    /// Data type: 0 = BF16, 1 = FP32, 2 = FP16.
+    /// Data type: 0 = BF16, 1 = FP32, 2 = FP16, 4 = Marlin INT8, 5 = Marlin INT4.
     dtype: u8,
+    /// For Marlin INT8/INT4 (dtype=4/5): pointer to BF16 scales on GPU.
+    /// Layout: [K/group_size, N] where N=rows, K=cols.
+    scales_ptr: u64,
+    /// Quantization group size for Marlin INT8/INT4 (typically 128).
+    group_size: usize,
 }
 
 impl GpuWeight {
+    /// Create a standard weight (BF16/FP32/FP16/FP8).
+    fn new(ptr: u64, rows: usize, cols: usize, dtype: u8) -> Self {
+        Self { ptr, rows, cols, dtype, scales_ptr: 0, group_size: 0 }
+    }
+
+    /// Create a Marlin INT8 weight with packed data and scales.
+    fn new_marlin_int8(packed_ptr: u64, scales_ptr: u64, rows: usize, cols: usize, group_size: usize) -> Self {
+        Self { ptr: packed_ptr, rows, cols, dtype: 4, scales_ptr, group_size }
+    }
+
+    /// Create a Marlin INT4 weight with packed data and scales.
+    fn new_marlin_int4(packed_ptr: u64, scales_ptr: u64, rows: usize, cols: usize, group_size: usize) -> Self {
+        Self { ptr: packed_ptr, rows, cols, dtype: 5, scales_ptr, group_size }
+    }
+
     fn cublas_data_type(&self) -> cublas_sys::cudaDataType {
         match self.dtype {
             0 => cublas_sys::cudaDataType::CUDA_R_16BF,
@@ -700,6 +733,18 @@ impl GpuWeight {
             2 => cublas_sys::cudaDataType::CUDA_R_16F,
             _ => cublas_sys::cudaDataType::CUDA_R_16BF,
         }
+    }
+
+    fn is_marlin_int8(&self) -> bool {
+        self.dtype == 4
+    }
+
+    fn is_marlin_int4(&self) -> bool {
+        self.dtype == 5
+    }
+
+    fn is_marlin(&self) -> bool {
+        self.dtype == 4 || self.dtype == 5
     }
 
     #[allow(dead_code)]
@@ -869,6 +914,10 @@ struct CachedKernels {
     gqa_attention_tiled: cudarc::driver::CudaFunction,
     gqa_attention_reduce: cudarc::driver::CudaFunction,
     apply_gated_attn: cudarc::driver::CudaFunction,
+    // Fused v2 kernels with inline atomic reduction (no separate reduce kernel)
+    marlin_gemv_int4_v2_fused_f32: cudarc::driver::CudaFunction,
+    marlin_gemv_int8_v2: cudarc::driver::CudaFunction,
+    marlin_gemv_int8_v2_fused_f32: cudarc::driver::CudaFunction,
     // Batched expert kernels — reduce launch overhead from 30/layer to 4/layer
     marlin_gemv_int4_v2_batched: cudarc::driver::CudaFunction,
     reduce_ksplits_bf16_batched: cudarc::driver::CudaFunction,
@@ -934,8 +983,8 @@ struct GpuDecodeGraph {
     expert_buf_w2p_offset: usize,
     expert_buf_w2s_offset: usize,
 
-    // Legacy fields kept for compatibility with existing resize_expert_buffers callers.
-    // TODO: remove once all callers updated.
+    // Per-component expert buffers (w13_packed, w13_scales, w2_packed, w2_scales).
+    // Used by DMA upload and GEMV kernel dispatch.
     d_expert_buf_a0: cudarc::driver::CudaSlice<u8>,
     d_expert_buf_b0: cudarc::driver::CudaSlice<u8>,
     d_expert_buf_a1: cudarc::driver::CudaSlice<u8>,
@@ -959,9 +1008,11 @@ struct GpuDecodeGraph {
     // Expert intermediate scratch (intermediate_size, BF16) — after SiLU*mul
     d_expert_scratch: cudarc::driver::CudaSlice<u16>,
 
-    // Marlin GEMV inverse permutation tables (on GPU)
+    // Marlin GEMV inverse permutation tables (on GPU) — INT4
     d_inv_weight_perm: cudarc::driver::CudaSlice<i32>,
     d_inv_scale_perm: cudarc::driver::CudaSlice<i32>,
+    // Marlin GEMV inverse permutation tables (on GPU) — INT8
+    d_inv_weight_perm_int8: cudarc::driver::CudaSlice<i32>,
 
     // v2 K-split partial sum buffer: [max_k_splits * max_N] FP32
     // max_N = max(2*intermediate_size, hidden_size), max_k_splits = 8
@@ -1097,6 +1148,9 @@ struct GpuDecodeGraph {
     // Expert loop sub-component timing
     t_expert_w13: f64,       // w13 GEMV (gate+up projection)
     t_expert_silu_w2: f64,   // fused silu_mul + w2 GEMV + weighted_add
+    // DMA expert sub-timing (Phase 3 cold experts)
+    t_dma_expert_wait: f64,  // time waiting for DMA events (cuStreamWaitEvent + actual DMA)
+    t_dma_expert_compute: f64, // compute time for DMA'd experts (w13+silu+w2)
     // DMA instrumentation (accumulated across all layers per token, then across tokens)
     dma_bytes_total: u64,    // total bytes DMA'd (cold experts only)
     dma_call_count: u64,     // number of cuMemcpyHtoDAsync calls
@@ -1220,6 +1274,15 @@ pub struct GpuDecodeStore {
     prefetch_stream: CudaStream,
     graph: Option<Box<GpuDecodeGraph>>,
     kernels_loaded: bool,
+    /// Cached Marlin perm table device pointers (set during configure, never change).
+    /// Used by attention Marlin GEMV launchers which can't access graph (it's .take()d).
+    perm_inv_weight_int4: u64,
+    perm_inv_weight_int8: u64,
+    perm_inv_scale: u64,
+    /// Cached v2 partial sum buffer pointer (for attention Marlin GEMV v2).
+    /// Set during configure, never changes. Used by gemv_bf16_internal.
+    v2_partial_ptr: u64,
+    v2_num_sms: usize,
     /// Max opt-in shared memory for GQA attention (bytes). Set during PTX load.
     gqa_max_smem_bytes: u32,
     last_decode_elapsed: f64,
@@ -1236,7 +1299,9 @@ pub struct GpuDecodeStore {
     /// Lower = more lenient (fewer bailouts), higher = stricter (more bailouts).
     /// Default 0.15 ≈ at least 2-3 shared experts out of topk=10.
     spec_jaccard_threshold: f32,
-    /// Four-point VRAM calibration for proportional soft-tier HCS.
+    /// Min free VRAM (MB) observed during the most recent decode run.
+    last_min_free_vram_mb: usize,
+    /// Four-point VRAM calibration data for runtime budget decisions.
     vram_calibration: Option<VramCalibration>,
     #[cfg(feature = "gpu-debug")]
     debug_stop_layer: usize,
@@ -1431,12 +1496,18 @@ impl GpuDecodeStore {
             prefetch_stream: CudaStream(prefetch_stream),
             graph: None,
             kernels_loaded,
+            perm_inv_weight_int4: 0,
+            perm_inv_weight_int8: 0,
+            perm_inv_scale: 0,
+            v2_partial_ptr: 0,
+            v2_num_sms: 0,
             gqa_max_smem_bytes: gqa_smem_limit,
             last_decode_elapsed: 0.0,
             draft: None,
             draft_k: 3,
             draft_context_window: 512,
             spec_jaccard_threshold: 0.15,
+            last_min_free_vram_mb: 0,
             vram_calibration: None,
             #[cfg(feature = "gpu-debug")]
             debug_stop_layer: 0,
@@ -1504,8 +1575,9 @@ impl GpuDecodeStore {
         let d_expert_scratch = self.device.alloc_zeros::<u16>(intermediate)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
 
-        // v2 K-split partial sum buffer: max_k_splits=8, max_N = max(2*intermediate, hidden_size)
-        let max_n_v2 = (intermediate * 2).max(hidden_size);
+        // v2 K-split partial sum buffer: max_k_splits=8, max_N = max(2*intermediate, hidden_size, qkv_size)
+        // qkv_size included so attention projections can also use v2 GEMV
+        let max_n_v2 = (intermediate * 2).max(hidden_size).max(qkv_size);
         let max_k_splits = 8;
         let d_v2_partial = self.device.alloc_zeros::<f32>(max_k_splits * max_n_v2)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
@@ -1553,8 +1625,14 @@ impl GpuDecodeStore {
         };
         log::info!("GpuDecodeStore: GPU has {} SMs", num_sms);
 
-        // Compute and upload inverse Marlin permutation tables
-        let (d_inv_weight_perm, d_inv_scale_perm) = Self::upload_marlin_perm_tables(&self.device)?;
+        // Compute and upload inverse Marlin permutation tables (INT4 + INT8)
+        let (d_inv_weight_perm, d_inv_scale_perm, d_inv_weight_perm_int8) = Self::upload_marlin_perm_tables(&self.device)?;
+
+        // Cache perm table pointers on self so Marlin attention GEMV launchers
+        // can access them even when graph is .take()d during decode_step.
+        self.perm_inv_weight_int4 = *d_inv_weight_perm.device_ptr();
+        self.perm_inv_weight_int8 = *d_inv_weight_perm_int8.device_ptr();
+        self.perm_inv_scale = *d_inv_scale_perm.device_ptr();
 
         let d_gqa_q = self.device.alloc_zeros::<f32>(qkv_size)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
@@ -1618,6 +1696,7 @@ impl GpuDecodeStore {
             d_expert_scratch,
             d_inv_weight_perm,
             d_inv_scale_perm,
+            d_inv_weight_perm_int8,
             d_v2_partial,
             num_sms,
             d_batch_gate_ups,
@@ -1701,6 +1780,8 @@ impl GpuDecodeStore {
             t_gqa_out: 0.0,
             t_expert_w13: 0.0,
             t_expert_silu_w2: 0.0,
+            t_dma_expert_wait: 0.0,
+            t_dma_expert_compute: 0.0,
             dma_bytes_total: 0,
             dma_call_count: 0,
             dma_cold_experts: 0,
@@ -1782,6 +1863,10 @@ impl GpuDecodeStore {
                 gqa_attention_tiled: get("gqa_attention_tiled")?,
                 gqa_attention_reduce: get("gqa_attention_reduce")?,
                 apply_gated_attn: get("apply_gated_attn")?,
+                // Fused v2 kernels (inline atomic reduction)
+                marlin_gemv_int4_v2_fused_f32: get("marlin_gemv_int4_v2_fused_f32")?,
+                marlin_gemv_int8_v2: get("marlin_gemv_int8_v2")?,
+                marlin_gemv_int8_v2_fused_f32: get("marlin_gemv_int8_v2_fused_f32")?,
                 marlin_gemv_int4_v2_batched: get("marlin_gemv_int4_v2_batched")?,
                 reduce_ksplits_bf16_batched: get("reduce_ksplits_bf16_batched")?,
                 fused_silu_w2_batched: get("fused_silu_w2_batched")?,
@@ -1793,7 +1878,7 @@ impl GpuDecodeStore {
                 gqa_attention_g: get("gqa_attention_g")?,
             };
             self.graph.as_mut().unwrap().kernels = Some(kernels);
-            log::info!("GpuDecodeStore: cached 37 kernel function handles");
+            log::info!("GpuDecodeStore: cached 40 kernel function handles");
         }
 
         // Pre-allocate CUDA events (reuse across MoE forward calls)
@@ -1818,6 +1903,13 @@ impl GpuDecodeStore {
             log::info!("GpuDecodeStore: pre-allocated 4 CUDA events");
         }
 
+        // Cache v2 partial buffer pointer on self for attention Marlin GEMV v2
+        {
+            let g = self.graph.as_ref().unwrap();
+            self.v2_partial_ptr = *g.d_v2_partial.device_ptr();
+            self.v2_num_sms = g.num_sms;
+        }
+
         log::info!("GpuDecodeStore: configured hidden={}, layers={}, vocab={}, intermediate={}, qkv={}, gs={}",
                    hidden_size, num_layers, vocab_size, intermediate, qkv_size, group_size);
         Ok(())
@@ -1829,8 +1921,221 @@ impl GpuDecodeStore {
         let graph = self.graph.as_mut()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
         let id = graph.weights.len();
-        graph.weights.push(GpuWeight { ptr: ptr as u64, rows, cols, dtype });
+        graph.weights.push(GpuWeight::new(ptr as u64, rows, cols, dtype));
         Ok(id)
+    }
+
+    /// Register a Marlin INT8 weight (packed + scales already on GPU).
+    /// Returns the weight ID.
+    fn register_marlin_int8_weight(
+        &mut self, packed_ptr: usize, scales_ptr: usize,
+        rows: usize, cols: usize, group_size: usize,
+    ) -> PyResult<usize> {
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let id = graph.weights.len();
+        graph.weights.push(GpuWeight::new_marlin_int8(packed_ptr as u64, scales_ptr as u64, rows, cols, group_size));
+        Ok(id)
+    }
+
+    /// Register a Marlin INT4 weight (packed + scales already on GPU).
+    /// Returns the weight ID. Used when Python does the quantization/repacking
+    /// so both prefill (gptq_marlin_gemm) and decode (Rust GEMV) share the same data.
+    fn register_marlin_int4_weight(
+        &mut self, packed_ptr: usize, scales_ptr: usize,
+        rows: usize, cols: usize, group_size: usize,
+    ) -> PyResult<usize> {
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let id = graph.weights.len();
+        graph.weights.push(GpuWeight::new_marlin_int4(packed_ptr as u64, scales_ptr as u64, rows, cols, group_size));
+        Ok(id)
+    }
+
+    /// Quantize a BF16 weight tensor to Marlin INT8 format and register it.
+    /// Takes a GPU BF16 tensor, copies to CPU, quantizes to INT8, repacks to
+    /// Marlin format, uploads packed + scales back to GPU, and registers.
+    /// Returns the weight ID.
+    ///
+    /// This is the main entry point for converting attention weights to Marlin INT8.
+    /// N = rows (output dim), K = cols (input dim).
+    fn quantize_and_register_marlin_int8(
+        &mut self, gpu_bf16_ptr: usize, rows: usize, cols: usize, group_size: usize,
+    ) -> PyResult<usize> {
+        use crate::weights::marlin::{quantize_int8, marlin_repack_int8};
+
+        let n = rows;
+        let k = cols;
+        let total_elements = n * k;
+
+        // Step 1: Copy BF16 data from GPU to CPU
+        let bf16_data: Vec<u16> = unsafe {
+            let mut buf = vec![0u16; total_elements];
+            let result = cuda_sys::lib().cuMemcpyDtoH_v2(
+                buf.as_mut_ptr() as *mut std::ffi::c_void,
+                gpu_bf16_ptr as cuda_sys::CUdeviceptr,
+                (total_elements * 2) as usize,
+            );
+            if result != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("Failed to copy BF16 from GPU: {:?}", result)));
+            }
+            buf
+        };
+
+        // Step 2: Quantize INT8 + Marlin repack (CPU)
+        let q = quantize_int8(&bf16_data, n, k, group_size);
+        let m = marlin_repack_int8(&q);
+
+        self._finish_register_marlin_int8(m, n, k, group_size)
+    }
+
+    /// Quantize a CPU BF16 weight tensor to Marlin INT8 format and register it.
+    /// Takes a CPU BF16 pointer directly — no GPU→CPU copy needed.
+    /// This avoids ever putting the full BF16 weight on GPU.
+    fn quantize_cpu_and_register_marlin_int8(
+        &mut self, cpu_bf16_ptr: usize, rows: usize, cols: usize, group_size: usize,
+    ) -> PyResult<usize> {
+        use crate::weights::marlin::{quantize_int8, marlin_repack_int8};
+
+        let n = rows;
+        let k = cols;
+        let total_elements = n * k;
+
+        // Read BF16 data directly from CPU memory
+        let bf16_data: Vec<u16> = unsafe {
+            std::slice::from_raw_parts(cpu_bf16_ptr as *const u16, total_elements).to_vec()
+        };
+
+        let q = quantize_int8(&bf16_data, n, k, group_size);
+        let m = marlin_repack_int8(&q);
+
+        self._finish_register_marlin_int8(m, n, k, group_size)
+    }
+
+    /// Quantize a BF16 weight tensor to Marlin INT4 format and register it.
+    /// Takes a GPU BF16 tensor, copies to CPU, quantizes to INT4, repacks to
+    /// Marlin format, uploads packed + scales back to GPU, and registers.
+    /// Returns the weight ID.
+    fn quantize_and_register_marlin_int4(
+        &mut self, gpu_bf16_ptr: usize, rows: usize, cols: usize, group_size: usize,
+    ) -> PyResult<usize> {
+        use crate::weights::marlin::{quantize_int4, marlin_repack};
+
+        let n = rows;
+        let k = cols;
+        let total_elements = n * k;
+
+        // Step 1: Copy BF16 data from GPU to CPU
+        let bf16_data: Vec<u16> = unsafe {
+            let mut buf = vec![0u16; total_elements];
+            let result = cuda_sys::lib().cuMemcpyDtoH_v2(
+                buf.as_mut_ptr() as *mut std::ffi::c_void,
+                gpu_bf16_ptr as cuda_sys::CUdeviceptr,
+                (total_elements * 2) as usize,
+            );
+            if result != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("Failed to copy BF16 from GPU: {:?}", result)));
+            }
+            buf
+        };
+
+        // Step 2: Quantize INT4 + Marlin repack (CPU)
+        let q = quantize_int4(&bf16_data, n, k, group_size);
+        let m = marlin_repack(&q);
+
+        self._finish_register_marlin_int4(m, n, k, group_size)
+    }
+
+    /// Quantize a CPU BF16 weight tensor to Marlin INT4 format and register it.
+    /// Takes a CPU BF16 pointer directly — no GPU→CPU copy needed.
+    /// This avoids ever putting the full BF16 weight on GPU.
+    fn quantize_cpu_and_register_marlin_int4(
+        &mut self, cpu_bf16_ptr: usize, rows: usize, cols: usize, group_size: usize,
+    ) -> PyResult<usize> {
+        use crate::weights::marlin::{quantize_int4, marlin_repack};
+
+        let n = rows;
+        let k = cols;
+        let total_elements = n * k;
+
+        // Read BF16 data directly from CPU memory
+        let bf16_data: Vec<u16> = unsafe {
+            std::slice::from_raw_parts(cpu_bf16_ptr as *const u16, total_elements).to_vec()
+        };
+
+        let q = quantize_int4(&bf16_data, n, k, group_size);
+        let m = marlin_repack(&q);
+
+        self._finish_register_marlin_int4(m, n, k, group_size)
+    }
+
+    /// Quantize a CPU BF16 weight to Marlin INT4 format using Rust repack.
+    /// Returns (packed_bytes, scales_bytes, n, k) — caller uploads to GPU and registers.
+    /// This ensures decode GEMV and prefill GEMM use the same Marlin repack format.
+    fn repack_marlin_int4_cpu(
+        &self, cpu_bf16_ptr: usize, rows: usize, cols: usize, group_size: usize,
+    ) -> PyResult<(pyo3::Py<pyo3::types::PyBytes>, pyo3::Py<pyo3::types::PyBytes>, usize, usize)> {
+        use crate::weights::marlin::{quantize_int4, marlin_repack};
+
+        let n = rows;
+        let k = cols;
+        let total_elements = n * k;
+
+        let bf16_data: Vec<u16> = unsafe {
+            std::slice::from_raw_parts(cpu_bf16_ptr as *const u16, total_elements).to_vec()
+        };
+
+        let q = quantize_int4(&bf16_data, n, k, group_size);
+        let m = marlin_repack(&q);
+
+        // Convert packed u32 vec to bytes
+        let packed_bytes: Vec<u8> = m.packed.iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        // Convert scales u16 vec to bytes
+        let scales_bytes: Vec<u8> = m.scales.iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+
+        pyo3::Python::with_gil(|py| {
+            let pb = pyo3::types::PyBytes::new(py, &packed_bytes);
+            let sb = pyo3::types::PyBytes::new(py, &scales_bytes);
+            Ok((pb.into(), sb.into(), n, k))
+        })
+    }
+
+    /// Quantize a CPU BF16 weight to Marlin INT8 format using Rust repack.
+    /// Returns (packed_bytes, scales_bytes, n, k) — caller uploads to GPU and registers.
+    fn repack_marlin_int8_cpu(
+        &self, cpu_bf16_ptr: usize, rows: usize, cols: usize, group_size: usize,
+    ) -> PyResult<(pyo3::Py<pyo3::types::PyBytes>, pyo3::Py<pyo3::types::PyBytes>, usize, usize)> {
+        use crate::weights::marlin::{quantize_int8, marlin_repack_int8};
+
+        let n = rows;
+        let k = cols;
+        let total_elements = n * k;
+
+        let bf16_data: Vec<u16> = unsafe {
+            std::slice::from_raw_parts(cpu_bf16_ptr as *const u16, total_elements).to_vec()
+        };
+
+        let q = quantize_int8(&bf16_data, n, k, group_size);
+        let m = marlin_repack_int8(&q);
+
+        let packed_bytes: Vec<u8> = m.packed.iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let scales_bytes: Vec<u8> = m.scales.iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+
+        pyo3::Python::with_gil(|py| {
+            let pb = pyo3::types::PyBytes::new(py, &packed_bytes);
+            let sb = pyo3::types::PyBytes::new(py, &scales_bytes);
+            Ok((pb.into(), sb.into(), n, k))
+        })
     }
 
     fn set_embedding(&mut self, ptr: usize) -> PyResult<()> {
@@ -1856,27 +2161,13 @@ impl GpuDecodeStore {
     }
 
     /// BF16 GEMV: output[N] = weight[N,K] @ input[K]
+    /// Supports BF16, FP8, and Marlin INT8 weights.
     fn gemv_bf16(&self, weight_id: usize, input_ptr: usize, output_ptr: usize) -> PyResult<()> {
         let graph = self.graph.as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
         let w = &graph.weights[weight_id];
-        let alpha: f32 = 1.0;
-        let beta: f32 = 0.0;
-        unsafe {
-            cublas_result::gemm_ex(
-                *self.blas.handle(),
-                cublas_sys::cublasOperation_t::CUBLAS_OP_T,
-                cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-                w.rows as i32, 1, w.cols as i32,
-                &alpha as *const f32 as *const std::ffi::c_void,
-                w.ptr as *const std::ffi::c_void, w.cublas_data_type(), w.cols as i32,
-                input_ptr as *const std::ffi::c_void, w.cublas_data_type(), w.cols as i32,
-                &beta as *const f32 as *const std::ffi::c_void,
-                output_ptr as *mut std::ffi::c_void, w.cublas_data_type(), w.rows as i32,
-                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
-            ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("cuBLAS: {:?}", e)))?;
-        }
+        self.gemv_bf16_internal(w, input_ptr as u64, output_ptr as u64)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
         Ok(())
     }
 
@@ -2036,6 +2327,8 @@ impl GpuDecodeStore {
                 graph.t_gqa_out = 0.0;
                 graph.t_expert_w13 = 0.0;
                 graph.t_expert_silu_w2 = 0.0;
+                graph.t_dma_expert_wait = 0.0;
+                graph.t_dma_expert_compute = 0.0;
                 graph.dma_bytes_total = 0;
                 graph.dma_call_count = 0;
                 graph.dma_cold_experts = 0;
@@ -2977,9 +3270,10 @@ impl GpuDecodeStore {
 
     /// Initialize HCS with hard + soft tiers based on VRAM calibration.
     /// hard_budget_mb: experts that survive worst-case prefill
-    /// soft_budget_mb: additional experts loaded during decode, evicted for prefill
+    /// soft_budget_mb: additional experts loaded during decode, evicted for prefill.
+    /// safety_margin_mb: minimum free VRAM to maintain (default 1000).
     #[pyo3(signature = (ranking, hard_budget_mb, soft_budget_mb,
-                        window_size=10, replacement_pct=25))]
+                        window_size=10, replacement_pct=25, safety_margin_mb=1000))]
     fn hcs_pool_init_tiered(
         &mut self,
         ranking: Vec<(usize, usize)>,
@@ -2987,14 +3281,19 @@ impl GpuDecodeStore {
         soft_budget_mb: usize,
         window_size: usize,
         replacement_pct: usize,
+        safety_margin_mb: usize,
     ) -> PyResult<String> {
         // First, init the hard pool using existing logic
         let result = self.hcs_pool_init_internal(
             ranking.clone(), hard_budget_mb, 0, window_size, replacement_pct,
         )?;
 
-        if soft_budget_mb == 0 {
-            return Ok(result);
+        {
+            let graph = self.graph.as_mut()
+                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+            let hcs = graph.hcs.as_mut()
+                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("HCS not initialized"))?;
+            hcs.safety_margin_mb = safety_margin_mb;
         }
 
         // Now allocate and fill the soft tier
@@ -3957,6 +4256,93 @@ impl GpuDecodeStore {
 // ── Pure-Rust methods for GPU decode (no PyO3, used by Rust HTTP server) ──
 
 impl GpuDecodeStore {
+    /// Upload Marlin INT8 repacked weights to GPU and register.
+    fn _finish_register_marlin_int8(
+        &mut self, m: crate::weights::marlin::MarlinRepacked,
+        n: usize, k: usize, group_size: usize,
+    ) -> pyo3::PyResult<usize> {
+        let d_packed = self.device.htod_copy(m.packed)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("Failed to upload Marlin INT8 packed: {:?}", e)))?;
+        let packed_ptr = *d_packed.device_ptr();
+
+        let d_scales = self.device.htod_copy(m.scales)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("Failed to upload Marlin INT8 scales: {:?}", e)))?;
+        let scales_ptr = *d_scales.device_ptr();
+
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let id = graph.weights.len();
+        graph.weights.push(GpuWeight::new_marlin_int8(packed_ptr, scales_ptr, n, k, group_size));
+
+        std::mem::forget(d_packed);
+        std::mem::forget(d_scales);
+
+        log::info!(
+            "Registered Marlin INT8 weight id={}: [{n}×{k}] gs={group_size}, packed={:.1} MB, scales={:.1} KB",
+            id,
+            (n * k / 4) as f64 * 4.0 / 1024.0 / 1024.0,
+            (k / group_size * n) as f64 * 2.0 / 1024.0,
+        );
+
+        Ok(id)
+    }
+
+    /// Upload Marlin INT4 repacked weights to GPU and register.
+    fn _finish_register_marlin_int4(
+        &mut self, m: crate::weights::marlin::MarlinRepacked,
+        n: usize, k: usize, group_size: usize,
+    ) -> pyo3::PyResult<usize> {
+        let d_packed = self.device.htod_copy(m.packed)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("Failed to upload Marlin INT4 packed: {:?}", e)))?;
+        let packed_ptr = *d_packed.device_ptr();
+
+        let d_scales = self.device.htod_copy(m.scales)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("Failed to upload Marlin INT4 scales: {:?}", e)))?;
+        let scales_ptr = *d_scales.device_ptr();
+
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let id = graph.weights.len();
+        graph.weights.push(GpuWeight::new_marlin_int4(packed_ptr, scales_ptr, n, k, group_size));
+
+        std::mem::forget(d_packed);
+        std::mem::forget(d_scales);
+
+        log::info!(
+            "Registered Marlin INT4 weight id={}: [{n}×{k}] gs={group_size}, packed={:.1} MB, scales={:.1} KB",
+            id,
+            (n * k / 8) as f64 * 4.0 / 1024.0 / 1024.0,
+            (k / group_size * n) as f64 * 2.0 / 1024.0,
+        );
+
+        Ok(id)
+    }
+
+    /// Return benchmark stats: (min_free_vram_mb, hcs_loaded, hcs_total, hcs_pct)
+    pub fn benchmark_stats(&self) -> (usize, usize, usize, f64) {
+        let min_free = self.last_min_free_vram_mb;
+        let (loaded, total, pct) = if let Some(graph) = self.graph.as_ref() {
+            if let Some(hcs) = graph.hcs.as_ref() {
+                let total: usize = graph.moe_layers.iter()
+                    .filter_map(|m: &Option<MoeLayerData>| m.as_ref())
+                    .map(|m| m.num_experts)
+                    .sum();
+                let loaded = hcs.num_cached;
+                let pct = if total > 0 { loaded as f64 / total as f64 * 100.0 } else { 0.0 };
+                (loaded, total, pct)
+            } else {
+                (0, 0, 0.0)
+            }
+        } else {
+            (0, 0, 0.0)
+        };
+        (min_free, loaded, total, pct)
+    }
+
     /// Allocate batch buffers for speculative decode batched verification.
     /// Called when draft model is loaded. batch_max = draft_k + 1.
     fn allocate_batch_buffers(&mut self, batch_max: usize) -> pyo3::PyResult<()> {
@@ -7534,6 +7920,20 @@ impl GpuDecodeStore {
                 }
             }
             eprintln!();
+
+            // Also emit to structured log
+            log::info!(
+                "MULTI-GPU DECODE TIMING ({} tokens avg): \
+                 Total: {:.2} ms/tok ({:.1} tok/s) | \
+                 GPU0 (L0-{}): {:.2} ms ({:.1}%) | Transfer: {:.2} ms ({:.1}%) | \
+                 GPU1 (L{}-{}): {:.2} ms ({:.1}%) | Sample: {:.2} ms ({:.1}%)",
+                generated,
+                avg_total, 1000.0 / avg_total,
+                split_layer - 1, avg_gpu0, avg_gpu0 / avg_total * 100.0,
+                avg_xfer, avg_xfer / avg_total * 100.0,
+                split_layer, num_layers - 1, avg_gpu1, avg_gpu1 / avg_total * 100.0,
+                avg_sample, avg_sample / avg_total * 100.0
+            );
         }
 
         // End activation tracking
@@ -8830,10 +9230,17 @@ impl GpuDecodeStore {
         Ok(active_batch)
     }
 
-    /// BF16 GEMV: output_bf16[N] = weight_bf16[N,K] @ input_bf16[K]
+    /// BF16 GEMV: output_bf16[N] = weight[N,K] @ input_bf16[K]
+    /// Supports BF16, Marlin INT8, and Marlin INT4 weights.
     fn gemv_bf16_internal(&self, w: &GpuWeight, input_ptr: u64, output_ptr: u64) -> Result<(), String> {
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;
+        if w.is_marlin_int8() {
+            return self.launch_marlin_gemv_int8_bf16(w, input_ptr, output_ptr);
+        }
+        if w.is_marlin_int4() {
+            return self.launch_marlin_gemv_int4_bf16(w, input_ptr, output_ptr);
+        }
         unsafe {
             cublas_result::gemm_ex(
                 *self.blas.handle(),
@@ -8852,10 +9259,17 @@ impl GpuDecodeStore {
         Ok(())
     }
 
-    /// BF16 input GEMV with FP32 output: output_f32[N] = weight_bf16[N,K] @ input_bf16[K]
+    /// GEMV with FP32 output: output_f32[N] = weight[N,K] @ input_bf16[K]
+    /// Supports BF16, Marlin INT8, and Marlin INT4 weights.
     fn gemv_bf16_to_f32(&self, w: &GpuWeight, input_ptr: u64, output_ptr: u64) -> Result<(), String> {
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;
+        if w.is_marlin_int8() {
+            return self.launch_marlin_gemv_int8_f32(w, input_ptr, output_ptr);
+        }
+        if w.is_marlin_int4() {
+            return self.launch_marlin_gemv_int4_f32(w, input_ptr, output_ptr);
+        }
         unsafe {
             cublas_result::gemm_ex(
                 *self.blas.handle(),
@@ -8978,24 +9392,8 @@ impl GpuDecodeStore {
             return (0, 0.0);
         }
 
-        // Calculate how much of the soft tier needs to be evicted
-        let evict_all = if let Some(ref cal) = self.vram_calibration {
-            // Available VRAM during prefill of this prompt (without HCS)
-            let prefill_free = cal.prefill_free_mb(estimated_tokens);
-            // Current total HCS VRAM
-            let total_hcs_mb = hcs.vram_bytes as u64 / (1024 * 1024);
-            // We need: total_hcs_mb <= prefill_free - safety
-            let safe_hcs = prefill_free.saturating_sub(cal.safety_margin_mb);
-            total_hcs_mb > safe_hcs
-        } else {
-            true // no calibration, evict everything to be safe
-        };
-
-        if !evict_all {
-            // Short prompt: soft tier survives prefill, no eviction needed
-            eprintln!("  \x1b[2mHCS soft: no eviction needed (~{} tokens)\x1b[0m", estimated_tokens);
-            return (0, 0.0);
-        }
+        // Always evict soft tier before prefill — prefill needs the VRAM headroom.
+        // Soft tier is reloaded asynchronously after prefill completes.
 
         let t0 = std::time::Instant::now();
 
@@ -9440,6 +9838,7 @@ impl GpuDecodeStore {
                 g.t_la_recur = 0.0; g.t_la_out = 0.0;
                 g.t_gqa_proj = 0.0; g.t_gqa_attn = 0.0; g.t_gqa_out = 0.0;
                 g.t_expert_w13 = 0.0; g.t_expert_silu_w2 = 0.0;
+                g.t_dma_expert_wait = 0.0; g.t_dma_expert_compute = 0.0;
                 g.dma_bytes_total = 0; g.dma_call_count = 0;
                 g.dma_cold_experts = 0; g.dma_hcs_experts = 0;
             }
@@ -9473,11 +9872,8 @@ impl GpuDecodeStore {
         let mut spec_failfast_count: u64 = 0;
         let mut spec_tokens_saved: u64 = 0;
 
-        // Warm up the draft model with tail of prompt context
+        // Reset draft model KV cache for speculative decode
         if use_speculative && start_position > 0 {
-            // We don't have the prompt tokens here, but we can feed the first_token
-            // as a starting point. The draft model's context will improve as we generate.
-            // TODO: pass prompt tokens for full warmup
             if let Some(ref mut draft) = self.draft {
                 draft.reset_kv();
             }
@@ -9906,8 +10302,10 @@ impl GpuDecodeStore {
             } else {
                 free_mb
             };
+            self.last_min_free_vram_mb = min_free_mb;
             eprintln!("  \x1b[32mdecode: {} tokens in {:.2}s ({:.1} tok/s)  VRAM: {} MB free now, {} MB min free during decode\x1b[0m",
                 generated, elapsed, tps, free_mb, min_free_mb);
+
         }
 
         // Print speculative decode stats
@@ -10000,8 +10398,15 @@ impl GpuDecodeStore {
                 let avg_exp_other = avg_expert_loop - avg_exp_w13 - avg_exp_silu;
                 eprintln!("  \x1b[36m│\x1b[0m      w13 GEMV: {:7.2} ms  ({:4.1}%)             \x1b[36m│\x1b[0m", avg_exp_w13, if avg_expert_loop > 0.001 { avg_exp_w13 / avg_expert_loop * 100.0 } else { 0.0 });
                 eprintln!("  \x1b[36m│\x1b[0m      silu+w2:  {:7.2} ms  ({:4.1}%)             \x1b[36m│\x1b[0m", avg_exp_silu, if avg_expert_loop > 0.001 { avg_exp_silu / avg_expert_loop * 100.0 } else { 0.0 });
+                let avg_dma_wait = graph.t_dma_expert_wait / n * 1000.0;
+                let avg_dma_compute = graph.t_dma_expert_compute / n * 1000.0;
+                if avg_dma_wait > 0.01 || avg_dma_compute > 0.01 {
+                    eprintln!("  \x1b[36m│\x1b[0m      DMA wait: {:7.2} ms  (cold expert DMA)    \x1b[36m│\x1b[0m", avg_dma_wait);
+                    eprintln!("  \x1b[36m│\x1b[0m      DMA comp: {:7.2} ms  (cold expert GEMV)   \x1b[36m│\x1b[0m", avg_dma_compute);
+                }
                 if avg_exp_other.abs() > 0.01 {
-                    eprintln!("  \x1b[36m│\x1b[0m      Other:    {:7.2} ms                        \x1b[36m│\x1b[0m", avg_exp_other);
+                    let avg_exp_other_adj = avg_expert_loop - avg_exp_w13 - avg_exp_silu - avg_dma_wait - avg_dma_compute;
+                    eprintln!("  \x1b[36m│\x1b[0m      Other:    {:7.2} ms                        \x1b[36m│\x1b[0m", avg_exp_other_adj);
                 }
                 eprintln!("  \x1b[36m│\x1b[0m    Shared exp:  {:7.2} ms  ({:4.1}%)             \x1b[36m│\x1b[0m", avg_shared, avg_shared / avg_moe * 100.0);
                 eprintln!("  \x1b[36m│\x1b[0m    MoE other:   {:7.2} ms  ({:4.1}%)             \x1b[36m│\x1b[0m", avg_moe_other, avg_moe_other / avg_moe * 100.0);
@@ -10047,6 +10452,26 @@ impl GpuDecodeStore {
                 eprintln!("  \x1b[36m│\x1b[0m    Min PCIe BW:      {:.1} GB/s (bytes/loop_time)\x1b[36m│\x1b[0m", min_pcie_bw);
                 eprintln!("  \x1b[36m│\x1b[0m    Est PCIe BW:      {:.1} GB/s (cold fraction)  \x1b[36m│\x1b[0m", est_pcie_bw);
                 eprintln!("  \x1b[36m└─────────────────────────────────────────────────┘\x1b[0m");
+
+                // Also emit to structured log (no ANSI escapes)
+                log::info!(
+                    "DECODE TIMING SUMMARY ({} tokens avg): \
+                     Total: {:.2} ms/tok ({:.1} tok/s) | \
+                     Attention: {:.2} ms ({:.1}%) [LA: {:.2} ms (Proj {:.2}, Conv {:.2}, Recur {:.2}, Out {:.2}), GQA: {:.2} ms (Proj {:.2}, Attn {:.2}, Out {:.2})] | \
+                     MoE: {:.2} ms ({:.1}%) [Route {:.2}, Experts {:.2} (HCS w13 {:.2}, silu+w2 {:.2}, DMA wait {:.2}, DMA comp {:.2}), Shared {:.2}] | \
+                     Norms+Emb: {:.2} ms | Dense MLP: {:.2} ms | LM Head: {:.2} ms | \
+                     PCIe: {:.1} cold exp/tok, {:.2} MB/tok, est {:.1} GB/s",
+                    graph.timing_step_count,
+                    avg_total, 1000.0 / avg_total,
+                    avg_attn, avg_attn / avg_total * 100.0,
+                    avg_attn_la, avg_la_proj, avg_la_conv, avg_la_recur, avg_la_out,
+                    avg_attn_gqa, avg_gqa_proj, avg_gqa_attn, avg_gqa_out,
+                    avg_moe, avg_moe / avg_total * 100.0,
+                    avg_route_sync, avg_expert_loop, avg_exp_w13, avg_exp_silu,
+                    avg_dma_wait, avg_dma_compute, avg_shared,
+                    avg_norm, avg_dense, avg_lm,
+                    avg_cold, dma_mb, est_pcie_bw
+                );
             }
         }
 
@@ -10068,37 +10493,47 @@ impl GpuDecodeStore {
 // ── Marlin perm table computation + GPU decode internals ──────────────
 
 impl GpuDecodeStore {
-    /// Compute inverse Marlin INT4 weight perm and scale perm tables,
-    /// upload both to GPU device memory.
+    /// Compute inverse Marlin INT4 + INT8 weight perm and scale perm tables,
+    /// upload all to GPU device memory.
     fn upload_marlin_perm_tables(
         device: &Arc<CudaDevice>,
-    ) -> PyResult<(cudarc::driver::CudaSlice<i32>, cudarc::driver::CudaSlice<i32>)> {
-        use crate::weights::marlin::{generate_weight_perm_int4, generate_scale_perms};
+    ) -> PyResult<(cudarc::driver::CudaSlice<i32>, cudarc::driver::CudaSlice<i32>, cudarc::driver::CudaSlice<i32>)> {
+        use crate::weights::marlin::{generate_weight_perm_int4, generate_weight_perm_int8, generate_scale_perms};
 
-        // Compute forward tables
-        let fwd_weight = generate_weight_perm_int4();
+        // INT4 forward tables
+        let fwd_weight_int4 = generate_weight_perm_int4();
         let (fwd_scale, _) = generate_scale_perms();
 
-        // Compute inverse: inv[fwd[i]] = i
-        let mut inv_weight = [0i32; 1024];
-        for (i, &src) in fwd_weight.iter().enumerate() {
-            inv_weight[src] = i as i32;
+        // INT4 inverse: inv[fwd[i]] = i
+        let mut inv_weight_int4 = [0i32; 1024];
+        for (i, &src) in fwd_weight_int4.iter().enumerate() {
+            inv_weight_int4[src] = i as i32;
         }
         let mut inv_scale = [0i32; 64];
         for (i, &src) in fwd_scale.iter().enumerate() {
             inv_scale[src] = i as i32;
         }
 
+        // INT8 forward tables (different interleave pattern)
+        let fwd_weight_int8 = generate_weight_perm_int8();
+        let mut inv_weight_int8 = [0i32; 1024];
+        for (i, &src) in fwd_weight_int8.iter().enumerate() {
+            inv_weight_int8[src] = i as i32;
+        }
+
         // Upload to GPU
-        let d_inv_weight = device.htod_copy(inv_weight.to_vec())
+        let d_inv_weight_int4 = device.htod_copy(inv_weight_int4.to_vec())
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                format!("Failed to upload inv_weight_perm: {:?}", e)))?;
+                format!("Failed to upload inv_weight_perm_int4: {:?}", e)))?;
         let d_inv_scale = device.htod_copy(inv_scale.to_vec())
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                 format!("Failed to upload inv_scale_perm: {:?}", e)))?;
+        let d_inv_weight_int8 = device.htod_copy(inv_weight_int8.to_vec())
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("Failed to upload inv_weight_perm_int8: {:?}", e)))?;
 
-        log::info!("GpuDecodeStore: uploaded Marlin inverse perm tables (weight=1024, scale=64)");
-        Ok((d_inv_weight, d_inv_scale))
+        log::info!("GpuDecodeStore: uploaded Marlin inverse perm tables (INT4=1024, INT8=1024, scale=64)");
+        Ok((d_inv_weight_int4, d_inv_scale, d_inv_weight_int8))
     }
 
     /// Register expert data pointers for a MoE layer.
@@ -10137,6 +10572,8 @@ impl GpuDecodeStore {
                     w2_packed_bytes: w2pb,
                     w2_scales_ptr: w2s,
                     w2_scales_bytes: w2sb,
+                    contiguous_ptr: 0,
+                    contiguous_bytes: 0,
                 }
             }
         ).collect();
@@ -10152,6 +10589,8 @@ impl GpuDecodeStore {
                     w2_packed_bytes: w2pb,
                     w2_scales_ptr: w2s,
                     w2_scales_bytes: w2sb,
+                    contiguous_ptr: 0,
+                    contiguous_bytes: 0,
                 }
             }
         );
@@ -10442,6 +10881,265 @@ impl GpuDecodeStore {
                 k_splits as i32,
             )).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                 format!("reduce_ksplits_bf16 launch: {:?}", e)))?;
+        }
+        Ok(())
+    }
+
+    /// Launch Marlin INT8 GEMV with BF16 output (for attention projections).
+    /// Uses v2 with K-splitting for small-N projections (k_proj, v_proj).
+    fn launch_marlin_gemv_int8_bf16(
+        &self, w: &GpuWeight, input_ptr: u64, output_ptr: u64,
+    ) -> Result<(), String> {
+        let n = w.rows;
+        let k = w.cols;
+        let k_splits = self.compute_k_splits(n, k);
+
+        if k_splits <= 1 {
+            // v1: sufficient SM occupancy from N tiles alone
+            let n_tiles = (n + 15) / 16;
+            let smem_bytes = (k * 2 + 1024 * 4 + 64 * 4) as u32;
+            let kernel = self.device.get_func(MODULE_NAME, "marlin_gemv_int8")
+                .ok_or("marlin_gemv_int8 kernel not found")?;
+            unsafe {
+                kernel.launch(
+                    cudarc::driver::LaunchConfig {
+                        grid_dim: (n_tiles as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: smem_bytes,
+                    },
+                    (w.ptr, w.scales_ptr, input_ptr, output_ptr,
+                     self.perm_inv_weight_int8, self.perm_inv_scale,
+                     k as i32, n as i32, w.group_size as i32),
+                ).map_err(|e| format!("marlin_gemv_int8 launch: {:?}", e))?;
+            }
+            return Ok(());
+        }
+
+        // v2 with K-splitting for small-N: better SM utilization
+        let n_tiles = (n + 15) / 16;
+        let smem_bytes = (k * 2 + 1024 * 4 + 64 * 4 + 16 * 16 * 4) as u32;
+        let partial_ptr = self.v2_partial_ptr;
+
+        let v2_kernel = self.device.get_func(MODULE_NAME, "marlin_gemv_int8_v2")
+            .ok_or("marlin_gemv_int8_v2 kernel not found")?;
+        unsafe {
+            v2_kernel.launch(
+                cudarc::driver::LaunchConfig {
+                    grid_dim: (n_tiles as u32, k_splits as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: smem_bytes,
+                },
+                (w.ptr, w.scales_ptr, input_ptr, partial_ptr,
+                 self.perm_inv_weight_int8, self.perm_inv_scale,
+                 k as i32, n as i32, w.group_size as i32, k_splits as i32),
+            ).map_err(|e| format!("marlin_gemv_int8_v2 bf16 launch: {:?}", e))?;
+        }
+
+        let reduce_kernel = self.device.get_func(MODULE_NAME, "reduce_ksplits_bf16")
+            .ok_or("reduce_ksplits_bf16 kernel not found")?;
+        unsafe {
+            reduce_kernel.launch(
+                cudarc::driver::LaunchConfig {
+                    grid_dim: (((n + 255) / 256) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                (output_ptr, partial_ptr, n as i32, k_splits as i32),
+            ).map_err(|e| format!("reduce_ksplits_bf16 int8 launch: {:?}", e))?;
+        }
+        Ok(())
+    }
+
+    /// Launch Marlin INT8 GEMV with FP32 output (for attention score paths).
+    /// Uses fused v2 with inline atomic reduction for small-N projections.
+    fn launch_marlin_gemv_int8_f32(
+        &self, w: &GpuWeight, input_ptr: u64, output_ptr: u64,
+    ) -> Result<(), String> {
+        let n = w.rows;
+        let k = w.cols;
+        let k_splits = self.compute_k_splits(n, k);
+
+        if k_splits <= 1 {
+            let n_tiles = (n + 15) / 16;
+            let smem_bytes = (k * 2 + 1024 * 4 + 64 * 4) as u32;
+            let kernel = self.device.get_func(MODULE_NAME, "marlin_gemv_int8_f32")
+                .ok_or("marlin_gemv_int8_f32 kernel not found")?;
+            unsafe {
+                kernel.launch(
+                    cudarc::driver::LaunchConfig {
+                        grid_dim: (n_tiles as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: smem_bytes,
+                    },
+                    (w.ptr, w.scales_ptr, input_ptr, output_ptr,
+                     self.perm_inv_weight_int8, self.perm_inv_scale,
+                     k as i32, n as i32, w.group_size as i32),
+                ).map_err(|e| format!("marlin_gemv_int8_f32 launch: {:?}", e))?;
+            }
+            return Ok(());
+        }
+
+        // Fused v2: zero output then atomicAdd directly
+        let n_tiles = (n + 15) / 16;
+        let smem_bytes = (k * 2 + 1024 * 4 + 64 * 4 + 16 * 16 * 4) as u32;
+
+        unsafe {
+            let err = cuda_sys::lib().cuMemsetD32_v2(output_ptr, 0, n);
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("cuMemsetD32 for int8 fused v2: {:?}", err));
+            }
+        }
+
+        let fused_kernel = self.device.get_func(MODULE_NAME, "marlin_gemv_int8_v2_fused_f32")
+            .ok_or("marlin_gemv_int8_v2_fused_f32 kernel not found")?;
+        unsafe {
+            fused_kernel.launch(
+                cudarc::driver::LaunchConfig {
+                    grid_dim: (n_tiles as u32, k_splits as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: smem_bytes,
+                },
+                (w.ptr, w.scales_ptr, input_ptr, output_ptr,
+                 self.perm_inv_weight_int8, self.perm_inv_scale,
+                 k as i32, n as i32, w.group_size as i32, k_splits as i32),
+            ).map_err(|e| format!("marlin_gemv_int8_v2_fused_f32 launch: {:?}", e))?;
+        }
+        Ok(())
+    }
+
+    /// Compute k_splits for Marlin GEMV v2 given N and K dimensions.
+    fn compute_k_splits(&self, n: usize, k: usize) -> usize {
+        let k_tiles = k / 16;
+        let max_ksplits = k_tiles / 16;
+        if max_ksplits <= 1 { return 1; }
+        let n_tiles = (n + 15) / 16;
+        let target = self.v2_num_sms * 4;
+        let desired = (target + n_tiles - 1) / n_tiles;
+        desired.clamp(1, max_ksplits.min(8))
+    }
+
+    /// Launch Marlin INT4 GEMV v2 with BF16 output (for attention projections).
+    /// Uses K-splitting for better SM utilization, writes partials to v2_partial_ptr,
+    /// then reduces to BF16 output.
+    fn launch_marlin_gemv_int4_bf16(
+        &self, w: &GpuWeight, input_ptr: u64, output_ptr: u64,
+    ) -> Result<(), String> {
+        let n = w.rows;
+        let k = w.cols;
+        let k_splits = self.compute_k_splits(n, k);
+
+        if k_splits <= 1 {
+            // Fall back to v1 for tiny matrices where splitting doesn't help
+            let n_tiles = (n + 15) / 16;
+            let smem_bytes = (k * 2 + 1024 * 4 + 64 * 4) as u32;
+            let kernel = self.device.get_func(MODULE_NAME, "marlin_gemv_int4")
+                .ok_or("marlin_gemv_int4 kernel not found")?;
+            unsafe {
+                kernel.launch(
+                    cudarc::driver::LaunchConfig {
+                        grid_dim: (n_tiles as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: smem_bytes,
+                    },
+                    (w.ptr, w.scales_ptr, input_ptr, output_ptr,
+                     self.perm_inv_weight_int4, self.perm_inv_scale,
+                     k as i32, n as i32, w.group_size as i32),
+                ).map_err(|e| format!("marlin_gemv_int4 launch: {:?}", e))?;
+            }
+            return Ok(());
+        }
+
+        let n_tiles = (n + 15) / 16;
+        // v2 shared mem: input BF16 [K*2] + inv_wperm [1024*4] + inv_sperm [64*4] + reduce [16*16*4]
+        let smem_bytes = (k * 2 + 1024 * 4 + 64 * 4 + 16 * 16 * 4) as u32;
+        let partial_ptr = self.v2_partial_ptr;
+
+        // v2 GEMV: writes FP32 partials [k_splits, N]
+        let v2_kernel = self.device.get_func(MODULE_NAME, "marlin_gemv_int4_v2")
+            .ok_or("marlin_gemv_int4_v2 kernel not found")?;
+        unsafe {
+            v2_kernel.launch(
+                cudarc::driver::LaunchConfig {
+                    grid_dim: (n_tiles as u32, k_splits as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: smem_bytes,
+                },
+                (w.ptr, w.scales_ptr, input_ptr, partial_ptr,
+                 self.perm_inv_weight_int4, self.perm_inv_scale,
+                 k as i32, n as i32, w.group_size as i32, k_splits as i32),
+            ).map_err(|e| format!("marlin_gemv_int4_v2 attn launch: {:?}", e))?;
+        }
+
+        // Reduce partials to BF16 output
+        let reduce_kernel = self.device.get_func(MODULE_NAME, "reduce_ksplits_bf16")
+            .ok_or("reduce_ksplits_bf16 kernel not found")?;
+        unsafe {
+            reduce_kernel.launch(
+                cudarc::driver::LaunchConfig {
+                    grid_dim: (((n + 255) / 256) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                (output_ptr, partial_ptr, n as i32, k_splits as i32),
+            ).map_err(|e| format!("reduce_ksplits_bf16 attn launch: {:?}", e))?;
+        }
+        Ok(())
+    }
+
+    /// Launch Marlin INT4 GEMV with FP32 output (for attention score paths).
+    /// Uses fused v2 kernel with inline atomic reduction (no separate reduce kernel).
+    fn launch_marlin_gemv_int4_f32(
+        &self, w: &GpuWeight, input_ptr: u64, output_ptr: u64,
+    ) -> Result<(), String> {
+        let n = w.rows;
+        let k = w.cols;
+        let k_splits = self.compute_k_splits(n, k);
+
+        if k_splits <= 1 {
+            let n_tiles = (n + 15) / 16;
+            let smem_bytes = (k * 2 + 1024 * 4 + 64 * 4) as u32;
+            let kernel = self.device.get_func(MODULE_NAME, "marlin_gemv_int4_f32")
+                .ok_or("marlin_gemv_int4_f32 kernel not found")?;
+            unsafe {
+                kernel.launch(
+                    cudarc::driver::LaunchConfig {
+                        grid_dim: (n_tiles as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: smem_bytes,
+                    },
+                    (w.ptr, w.scales_ptr, input_ptr, output_ptr,
+                     self.perm_inv_weight_int4, self.perm_inv_scale,
+                     k as i32, n as i32, w.group_size as i32),
+                ).map_err(|e| format!("marlin_gemv_int4_f32 launch: {:?}", e))?;
+            }
+            return Ok(());
+        }
+
+        // Fused v2: zero output then atomicAdd directly (no separate reduce kernel)
+        let n_tiles = (n + 15) / 16;
+        let smem_bytes = (k * 2 + 1024 * 4 + 64 * 4 + 16 * 16 * 4) as u32;
+
+        // Zero output buffer (cudaMemsetAsync, async on default stream)
+        unsafe {
+            let err = cuda_sys::lib().cuMemsetD32_v2(output_ptr, 0, n);
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(format!("cuMemsetD32 for fused v2: {:?}", err));
+            }
+        }
+
+        let fused_kernel = self.device.get_func(MODULE_NAME, "marlin_gemv_int4_v2_fused_f32")
+            .ok_or("marlin_gemv_int4_v2_fused_f32 kernel not found")?;
+        unsafe {
+            fused_kernel.launch(
+                cudarc::driver::LaunchConfig {
+                    grid_dim: (n_tiles as u32, k_splits as u32, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: smem_bytes,
+                },
+                (w.ptr, w.scales_ptr, input_ptr, output_ptr,
+                 self.perm_inv_weight_int4, self.perm_inv_scale,
+                 k as i32, n as i32, w.group_size as i32, k_splits as i32),
+            ).map_err(|e| format!("marlin_gemv_int4_v2_fused_f32 launch: {:?}", e))?;
         }
         Ok(())
     }
@@ -11487,11 +12185,18 @@ impl GpuDecodeStore {
                 // Wait for THIS expert's DMA to complete before computing
                 // GPU-side only: default_stream waits for copy_stream's DMA event.
                 // No host sync here -- that would serialize DMA and compute, destroying overlap.
+                let t_dma_wait = Instant::now();
                 unsafe {
                     cuda_sys::lib().cuStreamWaitEvent(default_stream, ev_dma[slot], 0);
                 }
+                if timing {
+                    // Sync to measure actual DMA wait (serializes for measurement only)
+                    unsafe { cuda_sys::lib().cuStreamSynchronize(default_stream); }
+                    graph.t_dma_expert_wait += (Instant::now() - t_dma_wait).as_secs_f64();
+                }
 
                 // Compute from buf[slot]
+                let t_dma_compute = Instant::now();
                 let base = buf_base[slot];
                 // w13 GEMV: hidden -> gate_up (v2 K-split if beneficial)
                 if use_v2_w13 {
@@ -11540,6 +12245,10 @@ impl GpuDecodeStore {
                     weight, 0u64,
                     k,
                 )?;
+                if timing {
+                    unsafe { cuda_sys::lib().cuStreamSynchronize(default_stream); }
+                    graph.t_dma_expert_compute += (Instant::now() - t_dma_compute).as_secs_f64();
+                }
 
                 #[cfg(feature = "gpu-debug")]
                 if layer_idx == 0 && i == 0 {
@@ -12016,12 +12725,9 @@ impl GpuDecodeStore {
             let gate_wid = {
                 let graph = self.graph.as_mut().unwrap();
                 let wid = graph.weights.len();
-                graph.weights.push(GpuWeight {
-                    ptr: *d_gate.device_ptr(),
-                    rows: n_experts,
-                    cols: hidden_size,
-                    dtype: 0, // BF16
-                });
+                graph.weights.push(GpuWeight::new(
+                    *d_gate.device_ptr(), n_experts, hidden_size, 0, // BF16
+                ));
                 // Keep the device allocation alive by storing it
                 // (we leak it intentionally - it lives for the lifetime of the process)
                 std::mem::forget(d_gate);
@@ -12097,12 +12803,13 @@ impl GpuDecodeStore {
                 None
             };
 
+            // e_score_corr_ptr: 0 — not stored in KrasisEngine (only used by sigmoid routing models).
+            // shared_gate_wid: None — wired by Python via set_moe_shared_gate_wid() after this call.
             self.register_moe_layer_data(
                 abs_layer_idx, expert_ptrs, shared_ptrs,
                 n_experts, topk, scoring_func, norm_topk_prob,
                 config.routed_scaling_factor, gate_wid, gate_bias_ptr as usize,
-                0, // e_score_corr_ptr - TODO
-                None, // shared_gate_wid - TODO
+                0, None,
             )?;
         }
 
@@ -12248,12 +12955,9 @@ impl GpuDecodeStore {
         let gate_wid = {
             let graph = self.graph.as_mut().unwrap();
             let wid = graph.weights.len();
-            graph.weights.push(GpuWeight {
-                ptr: *d_gate.device_ptr(),
-                rows: n_experts,
-                cols: hidden_size,
-                dtype: 1, // FP32
-            });
+            graph.weights.push(GpuWeight::new(
+                *d_gate.device_ptr(), n_experts, hidden_size, 1, // FP32
+            ));
             std::mem::forget(d_gate);
             wid
         };
@@ -12439,12 +13143,9 @@ impl GpuDecodeStore {
             let gate_wid = {
                 let graph = self.graph.as_mut().unwrap();
                 let wid = graph.weights.len();
-                graph.weights.push(GpuWeight {
-                    ptr: *d_gate.device_ptr(),
-                    rows: n_experts,
-                    cols: hidden_size,
-                    dtype: 1,
-                });
+                graph.weights.push(GpuWeight::new(
+                    *d_gate.device_ptr(), n_experts, hidden_size, 1,
+                ));
                 std::mem::forget(d_gate);
                 wid
             };
@@ -12799,20 +13500,15 @@ impl GpuDecodeStore {
                 format!("HCS pool alloc ({} MB): {:?}", pool_alloc_bytes / (1024 * 1024), e)))?;
         let pool_base = *pool_buf.device_ptr();
 
-        // Build free slot stack (all slots initially free)
-        let mut free_slots: Vec<usize> = (0..num_slots).rev().collect();
         let mut slot_to_expert: Vec<Option<(usize, usize)>> = vec![None; num_slots];
 
-        // Fill slots from ranking via H2D DMA
-        let t0 = std::time::Instant::now();
-        let mut loaded = 0usize;
-        let mut cache = std::collections::HashMap::new();
-
+        // Two-pass allocation: select experts by ranking, then sort by (layer, expert)
+        // so same-layer experts are physically contiguous in the pool for better L2 cache.
+        let mut to_load: Vec<(usize, usize)> = Vec::new();
         for &(layer_idx, expert_idx) in &ranking {
-            if free_slots.is_empty() {
+            if to_load.len() >= num_slots {
                 break;
             }
-            // Validate the (layer, expert) pair
             let moe = match graph.moe_layers.get(layer_idx).and_then(|m| m.as_ref()) {
                 Some(m) => m,
                 None => continue,
@@ -12820,8 +13516,23 @@ impl GpuDecodeStore {
             if expert_idx >= moe.experts.len() {
                 continue;
             }
+            to_load.push((layer_idx, expert_idx));
+        }
+        // Sort by layer then expert so same-layer experts get adjacent slots
+        to_load.sort_unstable();
 
-            let slot = free_slots.pop().unwrap();
+        // Remaining slots after loading become the free list
+        let mut next_slot = 0usize;
+
+        // Fill slots from sorted list via H2D DMA
+        let t0 = std::time::Instant::now();
+        let mut loaded = 0usize;
+        let mut cache = std::collections::HashMap::new();
+
+        for &(layer_idx, expert_idx) in &to_load {
+            let moe = &graph.moe_layers[layer_idx].as_ref().unwrap();
+            let slot = next_slot;
+            next_slot += 1;
             let expert = &moe.experts[expert_idx];
             let dst = pool_base + (slot as u64 * slot_size as u64);
 
@@ -12851,7 +13562,7 @@ impl GpuDecodeStore {
                     }
                 }
                 if !ok {
-                    free_slots.push(slot);
+                    slot_to_expert[slot] = None;
                     continue;
                 }
             }
@@ -12893,6 +13604,14 @@ impl GpuDecodeStore {
         hcs.pool_buf = Some(pool_buf);
         hcs.pool_slot_size = slot_size;
         hcs.pool_num_slots = num_slots;
+        // Build free slot stack from unassigned slots (above next_slot + any failed slots)
+        let mut free_slots: Vec<usize> = (next_slot..num_slots).rev().collect();
+        // Also reclaim any failed-DMA slots below next_slot
+        for s in (0..next_slot).rev() {
+            if slot_to_expert[s].is_none() {
+                free_slots.push(s);
+            }
+        }
         hcs.pool_free_slots = free_slots;
         hcs.pool_slot_to_expert = slot_to_expert;
         hcs.current_activations = vec![0u64; bitset_words];
@@ -13305,12 +14024,9 @@ impl GpuDecodeStore {
             let gate_wid = {
                 let graph = self.graph.as_mut().unwrap();
                 let wid = graph.weights.len();
-                graph.weights.push(GpuWeight {
-                    ptr: *d_gate.device_ptr(),
-                    rows: n_experts,
-                    cols: hidden_size,
-                    dtype: 1,
-                });
+                graph.weights.push(GpuWeight::new(
+                    *d_gate.device_ptr(), n_experts, hidden_size, 1,
+                ));
                 std::mem::forget(d_gate);
                 wid
             };
@@ -13527,10 +14243,9 @@ impl GpuDecodeStore {
             let gate_wid = {
                 let graph = self.graph.as_mut().unwrap();
                 let wid = graph.weights.len();
-                graph.weights.push(GpuWeight {
-                    ptr: *d_gate.device_ptr(),
-                    rows: n_experts, cols: hidden_size, dtype: 1,
-                });
+                graph.weights.push(GpuWeight::new(
+                    *d_gate.device_ptr(), n_experts, hidden_size, 1,
+                ));
                 std::mem::forget(d_gate);
                 wid
             };
@@ -13888,10 +14603,9 @@ impl GpuDecodeStore {
             let gate_wid = {
                 let graph = self.graph.as_mut().unwrap();
                 let wid = graph.weights.len();
-                graph.weights.push(GpuWeight {
-                    ptr: *d_gate.device_ptr(),
-                    rows: n_experts, cols: hidden_size, dtype: 1,
-                });
+                graph.weights.push(GpuWeight::new(
+                    *d_gate.device_ptr(), n_experts, hidden_size, 1,
+                ));
                 std::mem::forget(d_gate);
                 wid
             };

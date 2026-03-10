@@ -1,1 +1,1 @@
-Explain how public key cryptography works, including the RSA algorithm and why it is considered secure.
+Write a thorough 1000-word explanation of how distributed consensus algorithms work, covering Paxos, Raft, leader election, log replication, safety and liveness guarantees, membership changes, and how they handle network partitions and node failures.

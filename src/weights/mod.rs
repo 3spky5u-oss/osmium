@@ -169,9 +169,19 @@ impl ModelConfig {
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0) as f32;
 
-        // GPT OSS activation alpha (hardcoded in HF reference: 1.702)
-        // Not in config.json — always 1.702 when swiglu_limit > 0
-        let activation_alpha = if swiglu_limit > 0.0 { 1.702 } else { 0.0 };
+        // Activation alpha for custom SwiGLU activation (e.g. GPT OSS uses 1.702).
+        // Must be present in config.json when swiglu_limit > 0.
+        let activation_alpha = if swiglu_limit > 0.0 {
+            cfg.get("activation_alpha")
+                .or_else(|| cfg.get("silu_alpha"))
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| format!(
+                    "swiglu_limit={} requires 'activation_alpha' in config.json but it was not found",
+                    swiglu_limit
+                ))? as f32
+        } else {
+            0.0
+        };
 
         Ok(ModelConfig {
             hidden_size,

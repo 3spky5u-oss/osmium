@@ -110,6 +110,44 @@ impl ChatTemplateEngine {
         // Add strftime_now function (used by some templates)
         env.add_function("strftime_now", strftime_now);
 
+        // Handle Python string methods used by HuggingFace templates
+        env.set_unknown_method_callback(|_state, value, method, args| {
+            match method {
+                "startswith" => {
+                    let s = value.as_str().ok_or_else(|| {
+                        minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, "startswith requires a string")
+                    })?;
+                    let prefix = args.first()
+                        .and_then(|a| a.as_str())
+                        .ok_or_else(|| {
+                            minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, "startswith requires a string argument")
+                        })?;
+                    Ok(minijinja::Value::from(s.starts_with(prefix)))
+                }
+                "endswith" => {
+                    let s = value.as_str().ok_or_else(|| {
+                        minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, "endswith requires a string")
+                    })?;
+                    let suffix = args.first()
+                        .and_then(|a| a.as_str())
+                        .ok_or_else(|| {
+                            minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, "endswith requires a string argument")
+                        })?;
+                    Ok(minijinja::Value::from(s.ends_with(suffix)))
+                }
+                "strip" => {
+                    let s = value.as_str().ok_or_else(|| {
+                        minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, "strip requires a string")
+                    })?;
+                    Ok(minijinja::Value::from(s.trim()))
+                }
+                _ => Err(minijinja::Error::new(
+                    minijinja::ErrorKind::UnknownMethod,
+                    format!("unknown method: {}", method),
+                ))
+            }
+        });
+
         let tmpl = env.get_template("chat")
             .map_err(|e| format!("Failed to get template: {}", e))?;
 

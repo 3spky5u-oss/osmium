@@ -1,1 +1,1 @@
-Write a short story about an AI that discovers it can dream, in at least 100 words.
+Write a detailed 1000-word walkthrough of how a relational database processes a complex SQL query from parsing through execution, covering the query planner, cost-based optimizer, index selection, join algorithms, buffer pool management, and transaction isolation levels.

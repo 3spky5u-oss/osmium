@@ -104,7 +104,7 @@ def _mla_attention_bytes_per_layer(cfg: Dict[str, Any], quantization: str) -> in
     o_params = (n_heads * v_head) * hidden
 
     total_params = q_a_params + q_b_params + kv_a_params + kv_b_params + o_params
-    return _weight_bytes(total_params, quantization)
+    return _component_weight_bytes(total_params, quantization)
 
 
 def _gqa_attention_bytes_per_layer(cfg: Dict[str, Any], quantization: str) -> int:
@@ -119,7 +119,7 @@ def _gqa_attention_bytes_per_layer(cfg: Dict[str, Any], quantization: str) -> in
     o_params = (n_heads * head_dim) * hidden
 
     total_params = q_params + k_params + v_params + o_params
-    return _weight_bytes(total_params, quantization)
+    return _component_weight_bytes(total_params, quantization)
 
 
 def _dense_mlp_bytes_per_layer(cfg: Dict[str, Any], quantization: str) -> int:
@@ -221,7 +221,7 @@ def _linear_attention_bytes_per_layer(cfg: Dict[str, Any], quantization: str) ->
     # Always BF16: conv1d.weight, A_log, dt_bias, norm.weight
     bf16_params = conv_dim * kernel + nv + nv + dv
 
-    return _weight_bytes(quantizable_params, quantization) + bf16_params * 2
+    return _component_weight_bytes(quantizable_params, quantization) + bf16_params * 2
 
 
 def _expert_bytes_per_expert(cfg: Dict[str, Any], bits: int = 4) -> int:
@@ -239,9 +239,14 @@ def _expert_bytes_per_expert(cfg: Dict[str, Any], bits: int = 4) -> int:
 
 
 def _component_weight_bytes(params: int, quant: str) -> int:
-    """Weight bytes for per-component quant ("int8" or "bf16")."""
+    """Weight bytes for per-component quant ("int4", "int8", or "bf16").
+    For Marlin formats, includes packed weights + group scales (gs=128)."""
+    if quant == "int4":
+        # Marlin INT4: packed = params/2, scales = params/128 * 2
+        return params // 2 + (params // 128) * 2
     if quant == "int8":
-        return params  # 1 byte per param
+        # Marlin INT8: packed = params, scales = params/128 * 2
+        return params + (params // 128) * 2
     return params * 2  # BF16
 
 

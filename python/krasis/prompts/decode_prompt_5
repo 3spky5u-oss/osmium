@@ -1,1 +1,1 @@
-Compare and contrast functional programming and object-oriented programming paradigms with concrete examples.
+Write a comprehensive 1000-word explanation of how a modern operating system manages memory, covering virtual address spaces, page tables, TLB, demand paging, copy-on-write, memory-mapped files, swap management, NUMA, and the OOM killer.

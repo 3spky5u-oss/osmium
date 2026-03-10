@@ -10,14 +10,32 @@
 #   ./dev test <config> --thorough  Run thorough model test (stress + benchmark + network + large)
 #   ./dev network <port>            Run network tests against a running server
 #   ./dev network <port> --large    Include large-prompt tests
+#   ./dev benchmark <config>        Run standard benchmark (prefill/decode/round trip) and exit
+#   ./dev perplexity <config>       Run perplexity eval (WikiText-2 by default) and exit
+#   ./dev kill                      Kill all krasis processes and free GPU memory
 #   ./dev shell                     Drop into a Python shell with the dev env
 #   ./dev python <args...>          Run arbitrary Python with the dev env
 #
+# Timing / profiling:
+#   Add --timing to any command to enable per-component decode timing.
+#   This inserts GPU synchronization barriers between each decode phase and
+#   prints a detailed timing breakdown at the end. Adds ~30-50% overhead so
+#   do NOT use for speed benchmarks — only for understanding where time goes.
+#
+#   Examples:
+#     ./dev benchmark qcn --timing    Profile decode components
+#     ./dev run qcn --timing          Run server with timing enabled
+#     ./dev benchmark qcn             Normal speed benchmark (no timing overhead)
+#
 # Configs are short names that map to testconfigs/*.conf:
-#   qcn         -> testconfigs/qcn-4-4.conf
-#   v2lite      -> testconfigs/v2lite-4-4.conf
-#   deepseek-vl -> testconfigs/deepseek-vl2-4-4.conf
-#   qwen35      -> testconfigs/qwen35-4-4.conf
+#   qcn         -> testconfigs/qcn-4-4-a16.conf
+#   qcn-a4      -> testconfigs/qcn-4-4-a4.conf
+#   q235        -> testconfigs/q235-4-4-a16.conf
+#   q235-a4     -> testconfigs/q235-4-4-a4.conf
+#   v2lite      -> testconfigs/v2lite-4-4-a16.conf
+#   deepseek-vl -> testconfigs/deepseek-vl2-4-4-a16.conf
+#   qwen35      -> testconfigs/qwen35-4-4-a16.conf
+#   qwen35-a4   -> testconfigs/qwen35-4-4-a4.conf
 #
 set -euo pipefail
 
@@ -52,10 +70,14 @@ err()   { echo -e "${RED}${BOLD}ERROR${NC} $*" >&2; exit 1; }
 resolve_config() {
     local name="$1"
     case "$name" in
-        qcn|QCN)            echo "$SCRIPT_DIR/testconfigs/qcn-4-4.conf" ;;
-        v2lite|V2-Lite)     echo "$SCRIPT_DIR/testconfigs/v2lite-4-4.conf" ;;
-        deepseek-vl|vl2)    echo "$SCRIPT_DIR/testconfigs/deepseek-vl2-4-4.conf" ;;
-        qwen35|Qwen3.5)     echo "$SCRIPT_DIR/testconfigs/qwen35-4-4.conf" ;;
+        qcn|QCN)            echo "$SCRIPT_DIR/testconfigs/qcn-4-4-a16.conf" ;;
+        qcn-a4)             echo "$SCRIPT_DIR/testconfigs/qcn-4-4-a4.conf" ;;
+        q235)               echo "$SCRIPT_DIR/testconfigs/q235-4-4-a16.conf" ;;
+        q235-a4)            echo "$SCRIPT_DIR/testconfigs/q235-4-4-a4.conf" ;;
+        v2lite|V2-Lite)     echo "$SCRIPT_DIR/testconfigs/v2lite-4-4-a16.conf" ;;
+        deepseek-vl|vl2)    echo "$SCRIPT_DIR/testconfigs/deepseek-vl2-4-4-a16.conf" ;;
+        qwen35|Qwen3.5)     echo "$SCRIPT_DIR/testconfigs/qwen35-4-4-a16.conf" ;;
+        qwen35-a4)          echo "$SCRIPT_DIR/testconfigs/qwen35-4-4-a4.conf" ;;
         *)
             # Try as a direct path
             if [[ -f "$name" ]]; then
@@ -64,7 +86,7 @@ resolve_config() {
                 echo "$SCRIPT_DIR/testconfigs/$name"
             else
                 err "Unknown config: $name
-  Available: qcn, v2lite, deepseek-vl, qwen35
+  Available: qcn, qcn-a4, q235, q235-a4, v2lite, deepseek-vl, qwen35, qwen35-a4
   Or pass a path to a .conf file."
             fi
             ;;
@@ -204,7 +226,7 @@ cleanup_gpu() {
 do_build() {
     info "Building Rust extension (maturin develop --release)..."
     cd "$SCRIPT_DIR"
-    VIRTUAL_ENV="$(dirname "$(dirname "$PYTHON")")" PATH="$(dirname "$PYTHON"):$PATH" \
+    VIRTUAL_ENV="$(dirname "$(dirname "$PYTHON")")" PATH="$HOME/.cargo/bin:$(dirname "$PYTHON"):$PATH" \
         "$MATURIN" develop --release 2>&1
     ok "Build complete. Extension at: $SO_FILE"
 }
@@ -297,11 +319,108 @@ do_test() {
     info "Full log: $logfile"
 }
 
+do_benchmark() {
+    [[ $# -lt 1 ]] && err "Usage: ./dev benchmark <config>"
+    local conf
+    conf=$(resolve_config "$1")
+    cleanup_gpu
+    auto_rebuild
+    local logfile
+    logfile="$SCRIPT_DIR/benchmarks/$(basename "$conf" .conf)_$(date +%Y%m%d_%H%M%S).log"
+    mkdir -p "$SCRIPT_DIR/benchmarks"
+    info "Running standard benchmark: $conf"
+    info "Log: $logfile"
+    "$PYTHON" -m krasis.server --config "$conf" --benchmark-only 2>&1 | tee "$logfile"
+    info "Benchmark log saved: $logfile"
+}
+
+do_perplexity() {
+    [[ $# -lt 1 ]] && err "Usage: ./dev perplexity <config> [--dataset wikitext-2] [--max-tokens N]"
+    local conf
+    conf=$(resolve_config "$1")
+    shift
+    cleanup_gpu
+    auto_rebuild
+    local logfile
+    logfile="$SCRIPT_DIR/perplexity/results/$(basename "$conf" .conf)_$(date +%Y%m%d_%H%M%S).log"
+    mkdir -p "$SCRIPT_DIR/perplexity/results"
+    info "Running perplexity: $conf"
+    info "Log: $logfile"
+    cd "$SCRIPT_DIR" && "$PYTHON" -m perplexity.measure_ppl --config "$conf" "$@" 2>&1 | tee "$logfile"
+    info "Perplexity log saved: $logfile"
+}
+
 do_network() {
     [[ $# -lt 1 ]] && err "Usage: ./dev network <port> [--large] [--quick]"
     local port="$1"
     shift
     exec "$PYTHON" "$SCRIPT_DIR/tests/test_network.py" --port "$port" "$@"
+}
+
+do_kill() {
+    info "Killing all krasis processes and freeing GPU memory..."
+
+    # Kill any krasis Python processes
+    local pids
+    pids=$(pgrep -f 'python.*krasis\.' 2>/dev/null || true)
+    if [[ -n "$pids" ]]; then
+        for p in $pids; do
+            local cmdline
+            cmdline=$(ps -p "$p" -o args= 2>/dev/null || echo "unknown")
+            warn "  Killing PID $p: $cmdline"
+            kill -9 "$p" 2>/dev/null || true
+        done
+        sleep 2
+    fi
+
+    # Check for zombie processes holding GPU memory
+    local zombie_pids
+    zombie_pids=$(ps -eo pid,ppid,stat,args 2>/dev/null | awk '$3 ~ /Z/ && /krasis|python/ {print $1 " " $2}' || true)
+    if [[ -n "$zombie_pids" ]]; then
+        warn "Found zombie processes — killing their parents:"
+        while read -r zpid zppid; do
+            warn "  Zombie PID $zpid, killing parent PID $zppid"
+            kill -9 "$zppid" 2>/dev/null || true
+        done <<< "$zombie_pids"
+        sleep 2
+    fi
+
+    # Kill any process using GPU memory (except desktop compositor type stuff)
+    local gpu_pids
+    gpu_pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' || true)
+    if [[ -n "$gpu_pids" ]]; then
+        for p in $gpu_pids; do
+            [[ -z "$p" ]] && continue
+            local cmdline
+            cmdline=$(ps -p "$p" -o args= 2>/dev/null || echo "unknown")
+            warn "  GPU process PID $p: $cmdline"
+            kill -9 "$p" 2>/dev/null || true
+        done
+        sleep 2
+    fi
+
+    # Wait up to 10s for GPU to clear
+    local waited=0
+    while [[ $waited -lt 10 ]]; do
+        local gpu0_used gpu1_used
+        gpu0_used=$(nvidia-smi --id=0 --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
+        gpu1_used=$(nvidia-smi --id=1 --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
+        if [[ "${gpu0_used:-9999}" -lt 500 ]] && [[ "${gpu1_used:-9999}" -lt 500 ]]; then
+            ok "All GPUs clear."
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    # Last resort: nvidia-smi GPU reset
+    warn "GPUs still not clear after 10s. Attempting nvidia-smi --gpu-reset..."
+    if sudo nvidia-smi --gpu-reset 2>&1; then
+        ok "GPU reset successful."
+    else
+        err "GPU reset failed. You may need to reboot.
+  To reboot: sudo reboot"
+    fi
 }
 
 do_shell() {
@@ -312,7 +431,25 @@ do_python() {
     exec "$PYTHON" "$@"
 }
 
-# ── Dispatch ─────────────────────────────────────────────────────────
+# ── Extract --timing flag ────────────────────────────────────────
+# Can appear anywhere in args. Removes it and sets KRASIS_DECODE_TIMING=1.
+TIMING_FLAG=false
+args=()
+for arg in "$@"; do
+    if [[ "$arg" == "--timing" ]]; then
+        TIMING_FLAG=true
+    else
+        args+=("$arg")
+    fi
+done
+set -- "${args[@]}"
+
+if $TIMING_FLAG; then
+    export KRASIS_DECODE_TIMING=1
+    info "Decode timing ENABLED (adds ~30-50% overhead — not for speed benchmarks)"
+fi
+
+#── Dispatch ─────────────────────────────────────────────────────────
 cmd="${1:-help}"
 shift || true
 
@@ -320,6 +457,8 @@ case "$cmd" in
     build)      do_build ;;
     run)        do_run "$@" ;;
     test)       do_test "$@" ;;
+    benchmark)  do_benchmark "$@" ;;
+    perplexity) do_perplexity "$@" ;;
     network)    do_network "$@" ;;
     shell)      do_shell "$@" ;;
     python)     do_python "$@" ;;
@@ -331,22 +470,35 @@ case "$cmd" in
         echo "Commands:"
         echo "  build                     Rebuild Rust extension"
         echo "  run <config> [flags]      Launch server (add --benchmark for benchmarks)"
+        echo "  benchmark <config>        Run standard benchmark and exit"
+        echo "  perplexity <config>       Run perplexity eval (WikiText-2) and exit"
         echo "  test <config>             Short model test (benchmark + network tests)"
         echo "  test <config> --thorough  Thorough test (+ stress + large prompts)"
         echo "  network <port> [flags]    Run network tests against running server"
+        echo "  kill                      Kill all krasis/GPU processes, reset if needed"
         echo "  shell                     Python shell with dev env"
         echo "  python <args>             Run Python with dev env"
         echo ""
-        echo "Configs: qcn, v2lite, deepseek-vl, qwen35 (or path to .conf file)"
+        echo "Global flags:"
+        echo "  --timing    Enable per-component decode timing (adds ~30-50% overhead)"
+        echo "              Prints detailed breakdown of where decode time is spent."
+        echo "              NOT for speed benchmarks — only for profiling."
+        echo ""
+        echo "Configs: qcn, qcn-a4, q235, q235-a4, v2lite, deepseek-vl, qwen35, qwen35-a4"
+        echo "         (or path to .conf file)"
         echo ""
         echo "Examples:"
         echo "  ./dev build"
         echo "  ./dev run qcn"
         echo "  ./dev run qcn --benchmark"
+        echo "  ./dev benchmark qcn --timing    Profile decode components"
+        echo "  ./dev benchmark qcn             Normal speed benchmark"
+        echo "  ./dev perplexity qcn"
         echo "  ./dev test qcn"
         echo "  ./dev network 8012"
         echo "  ./dev python -m krasis.launcher"
         ;;
+    kill)       do_kill ;;
     *)
         err "Unknown command: $cmd
   Run ./dev help for usage."

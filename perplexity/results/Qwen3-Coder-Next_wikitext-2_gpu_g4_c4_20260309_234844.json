@@ -1,0 +1,31 @@
+{
+  "config": {
+    "model_path": "/home/main/.krasis/models/Qwen3-Coder-Next",
+    "num_gpus": 1,
+    "cpu_only": false,
+    "gpu_expert_bits": 4,
+    "cpu_expert_bits": 4,
+    "attention_quant": "adaptive_fp8",
+    "lm_head_quant": "int8",
+    "layer_group_size": 2,
+    "krasis_threads": 16,
+    "kv_cache_mb": 1000,
+    "dataset": "wikitext-2",
+    "window_size": 2048,
+    "stride": 1024,
+    "max_tokens": null
+  },
+  "results": {
+    "perplexity": 7.232667441623744,
+    "bits_per_char": 2.8545278180033313,
+    "mean_loss": 1.978607908878942,
+    "total_nll": 591481.0910644531,
+    "num_tokens_scored": 298938,
+    "num_tokens_total": 298939,
+    "num_windows": 292,
+    "window_size": 2048,
+    "stride": 1024,
+    "elapsed_s": 823.7132042049925,
+    "dataset": "wikitext-2"
+  }
+}
