@@ -812,6 +812,60 @@ extern "C" __global__ void gated_rmsnorm_silu(
     }
 }
 
+// Same as gated_rmsnorm_silu but outputs BF16 directly (eliminates fp32_to_bf16 kernel)
+extern "C" __global__ void gated_rmsnorm_silu_bf16(
+    unsigned short* __restrict__ output,         // [nv * dv] BF16
+    const float* __restrict__ recur_out,         // [nv * dv]
+    const float* __restrict__ z,                 // [nv * dv]
+    const float* __restrict__ norm_weight,       // [dv]
+    float eps,
+    int nv, int dv
+) {
+    int head = blockIdx.x;
+    if (head >= nv) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    const float* r = recur_out + head * dv;
+    const float* gate = z + head * dv;
+    unsigned short* out = output + head * dv;
+
+    extern __shared__ float smem[];
+    float sum_sq = 0.0f;
+    for (int i = tid; i < dv; i += num_threads) {
+        float x = r[i];
+        smem[i] = x;
+        sum_sq += x * x;
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+    }
+    __shared__ float warp_sums[32];
+    int warp_id = tid / warpSize;
+    int lane_id = tid % warpSize;
+    if (lane_id == 0) warp_sums[warp_id] = sum_sq;
+    __syncthreads();
+
+    if (tid == 0) {
+        float total = 0.0f;
+        int num_warps = (num_threads + warpSize - 1) / warpSize;
+        for (int w = 0; w < num_warps; w++) total += warp_sums[w];
+        warp_sums[0] = rsqrtf(total / (float)dv + eps);
+    }
+    __syncthreads();
+    float rms_scale = warp_sums[0];
+
+    for (int i = tid; i < dv; i += num_threads) {
+        float normed = smem[i] * rms_scale * norm_weight[i];
+        float g = gate[i];
+        float silu_g = g / (1.0f + expf(-g));
+        __nv_bfloat16 result = __float2bfloat16(silu_g * normed);
+        out[i] = *reinterpret_cast<unsigned short*>(&result);
+    }
+}
+
 // ── GQA Attention Helpers ──────────────────────────────────────────────
 
 // Per-head RMSNorm for Q/K (QK norm before RoPE)
@@ -1360,6 +1414,34 @@ extern "C" __global__ void apply_gated_attn(
     }
 }
 
+// Fused gated attention + BF16 conversion (eliminates separate fp32_to_bf16 kernel)
+extern "C" __global__ void apply_gated_attn_bf16(
+    unsigned short* __restrict__ output,    // [n] BF16
+    const float* __restrict__ attn_out,     // [n] FP32
+    const float* __restrict__ gate,         // [n] FP32
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float g = 1.0f / (1.0f + expf(-gate[idx]));
+        __nv_bfloat16 result = __float2bfloat16(attn_out[idx] * g);
+        output[idx] = *reinterpret_cast<unsigned short*>(&result);
+    }
+}
+
+// FP32 to BF16 conversion
+extern "C" __global__ void fp32_to_bf16_simple(
+    unsigned short* __restrict__ output,    // [n] BF16
+    const float* __restrict__ input,        // [n] FP32
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        __nv_bfloat16 result = __float2bfloat16(input[idx]);
+        output[idx] = *reinterpret_cast<unsigned short*>(&result);
+    }
+}
+
 // ── Type Conversions ───────────────────────────────────────────────────
 
 // BF16 -> FP32
@@ -1458,18 +1540,27 @@ extern "C" __global__ void marlin_gemv_int4(
     int kt_start = k_slice * tiles_per_slice;
     int kt_end = (k_slice == 15) ? k_tiles_total : (kt_start + tiles_per_slice);
 
-    float acc = 0.0f;
+    // Pre-compute permutation indices: constant across all k_tiles
+    int tile_base = (n_tile << 8) + tn;
+    int perm_u32_col[16];
+    int perm_shift[16];
+    #pragma unroll
+    for (int tk = 0; tk < 16; tk++) {
+        int tile_pos = tile_base + (tk << 4);
+        int chunk = tile_pos >> 10;
+        int local_idx = tile_pos & 1023;
+        int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
+        perm_u32_col[tk] = perm_pos >> 3;
+        perm_shift[tk] = (perm_pos & 7) << 2;
+    }
 
-    // ── Optimized inner loop: hoisted invariants + scale group splitting ──
+    float acc = 0.0f;
     int cur_scale_group = -1;
     float cached_scale = 0.0f;
-    int tile_base = (n_tile << 8) + tn;  // constant within inner loop
 
     for (int kt = kt_start; kt < kt_end; kt++) {
         int k_base = kt << 4;
-        int row_base = kt * out_cols;  // hoisted from inner loop
-
-        // Check if entire tile is within one scale group (common case, ~87.5%)
+        int row_base = kt * out_cols;
         int sg_start = k_base / group_size;
         int sg_end = (k_base + 15) / group_size;
 
@@ -1484,23 +1575,15 @@ extern "C" __global__ void marlin_gemv_int4(
         }
 
         if (sg_start == sg_end) {
-            // Fast path: no scale change within this tile
             #pragma unroll
             for (int tk = 0; tk < 16; tk++) {
-                int tile_pos = tile_base + (tk << 4);
-                int chunk = tile_pos >> 10;
-                int local_idx = tile_pos & 1023;
-                int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
-                int u32_col = perm_pos >> 3;
-                int nibble = perm_pos & 7;
-                unsigned int word = packed[row_base + u32_col];
-                int raw = (word >> (nibble << 2)) & 0xF;
+                unsigned int word = packed[row_base + perm_u32_col[tk]];
+                int raw = (word >> perm_shift[tk]) & 0xF;
                 float w_val = (float)(raw - 8);
                 float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k_base + tk]));
                 acc += w_val * cached_scale * x;
             }
         } else {
-            // Slow path: scale group changes within this tile
             #pragma unroll
             for (int tk = 0; tk < 16; tk++) {
                 int k = k_base + tk;
@@ -1514,14 +1597,8 @@ extern "C" __global__ void marlin_gemv_int4(
                     unsigned short scale_bits = scales[sperm_pos];
                     cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
                 }
-                int tile_pos = tile_base + (tk << 4);
-                int chunk = tile_pos >> 10;
-                int local_idx = tile_pos & 1023;
-                int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
-                int u32_col = perm_pos >> 3;
-                int nibble = perm_pos & 7;
-                unsigned int word = packed[row_base + u32_col];
-                int raw = (word >> (nibble << 2)) & 0xF;
+                unsigned int word = packed[row_base + perm_u32_col[tk]];
+                int raw = (word >> perm_shift[tk]) & 0xF;
                 float w_val = (float)(raw - 8);
                 float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
                 acc += w_val * cached_scale * x;
@@ -1585,10 +1662,23 @@ extern "C" __global__ void marlin_gemv_int4_f32(
     int kt_start = k_slice * tiles_per_slice;
     int kt_end = (k_slice == 15) ? k_tiles_total : (kt_start + tiles_per_slice);
 
+    // Pre-compute permutation indices: constant across all k_tiles
+    int tile_base = (n_tile << 8) + tn;
+    int perm_u32_col[16];
+    int perm_shift[16];
+    #pragma unroll
+    for (int tk = 0; tk < 16; tk++) {
+        int tile_pos = tile_base + (tk << 4);
+        int chunk = tile_pos >> 10;
+        int local_idx = tile_pos & 1023;
+        int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
+        perm_u32_col[tk] = perm_pos >> 3;
+        perm_shift[tk] = (perm_pos & 7) << 2;
+    }
+
     float acc = 0.0f;
     int cur_scale_group = -1;
     float cached_scale = 0.0f;
-    int tile_base = (n_tile << 8) + tn;
 
     for (int kt = kt_start; kt < kt_end; kt++) {
         int k_base = kt << 4;
@@ -1609,14 +1699,8 @@ extern "C" __global__ void marlin_gemv_int4_f32(
         if (sg_start == sg_end) {
             #pragma unroll
             for (int tk = 0; tk < 16; tk++) {
-                int tile_pos = tile_base + (tk << 4);
-                int chunk = tile_pos >> 10;
-                int local_idx = tile_pos & 1023;
-                int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
-                int u32_col = perm_pos >> 3;
-                int nibble = perm_pos & 7;
-                unsigned int word = packed[row_base + u32_col];
-                int raw = (word >> (nibble << 2)) & 0xF;
+                unsigned int word = packed[row_base + perm_u32_col[tk]];
+                int raw = (word >> perm_shift[tk]) & 0xF;
                 float w_val = (float)(raw - 8);
                 float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k_base + tk]));
                 acc += w_val * cached_scale * x;
@@ -1635,14 +1719,8 @@ extern "C" __global__ void marlin_gemv_int4_f32(
                     unsigned short scale_bits = scales[sperm_pos];
                     cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
                 }
-                int tile_pos = tile_base + (tk << 4);
-                int chunk = tile_pos >> 10;
-                int local_idx = tile_pos & 1023;
-                int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
-                int u32_col = perm_pos >> 3;
-                int nibble = perm_pos & 7;
-                unsigned int word = packed[row_base + u32_col];
-                int raw = (word >> (nibble << 2)) & 0xF;
+                unsigned int word = packed[row_base + perm_u32_col[tk]];
+                int raw = (word >> perm_shift[tk]) & 0xF;
                 float w_val = (float)(raw - 8);
                 float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
                 acc += w_val * cached_scale * x;
@@ -1727,38 +1805,69 @@ extern "C" __global__ void marlin_gemv_int4_fused_silu_accum(
     int kt_start = k_slice * tiles_per_slice;
     int kt_end = (k_slice == 15) ? k_tiles_total : (kt_start + tiles_per_slice);
 
+    // Pre-compute permutation indices: constant across all k_tiles
+    int tile_base = (n_tile << 8) + tn;
+    int perm_u32_col[16];
+    int perm_shift[16];
+    #pragma unroll
+    for (int tk = 0; tk < 16; tk++) {
+        int tile_pos = tile_base + (tk << 4);
+        int chunk = tile_pos >> 10;
+        int local_idx = tile_pos & 1023;
+        int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
+        perm_u32_col[tk] = perm_pos >> 3;
+        perm_shift[tk] = (perm_pos & 7) << 2;
+    }
+
     float acc = 0.0f;
     int cur_scale_group = -1;
     float cached_scale = 0.0f;
 
     for (int kt = kt_start; kt < kt_end; kt++) {
-        for (int tk = 0; tk < 16; tk++) {
-            int k = (kt << 4) + tk;
+        int k_base = kt << 4;
+        int row_base = kt * out_cols;
+        int sg_start = k_base / group_size;
+        int sg_end = (k_base + 15) / group_size;
 
-            int sg = k / group_size;
-            if (sg != cur_scale_group) {
-                cur_scale_group = sg;
-                int scale_flat = sg * N + n;
-                int schunk = scale_flat >> 6;
-                int slocal = scale_flat & 63;
-                int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
-                unsigned short scale_bits = w2_scales[sperm_pos];
-                cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+        if (sg_start != cur_scale_group) {
+            cur_scale_group = sg_start;
+            int scale_flat = sg_start * N + n;
+            int schunk = scale_flat >> 6;
+            int slocal = scale_flat & 63;
+            int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
+            unsigned short scale_bits = w2_scales[sperm_pos];
+            cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+        }
+
+        if (sg_start == sg_end) {
+            #pragma unroll
+            for (int tk = 0; tk < 16; tk++) {
+                unsigned int word = packed[row_base + perm_u32_col[tk]];
+                int raw = (word >> perm_shift[tk]) & 0xF;
+                float w_val = (float)(raw - 8);
+                float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k_base + tk]));
+                acc += w_val * cached_scale * x;
             }
-
-            int tile_pos = (n_tile << 8) + (tk << 4) + tn;
-            int chunk = tile_pos >> 10;
-            int local_idx = tile_pos & 1023;
-            int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
-
-            int u32_col = perm_pos >> 3;
-            int nibble = perm_pos & 7;
-            unsigned int word = packed[kt * out_cols + u32_col];
-            int raw = (word >> (nibble << 2)) & 0xF;
-            float w_val = (float)(raw - 8);
-
-            float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
-            acc += w_val * cached_scale * x;
+        } else {
+            #pragma unroll
+            for (int tk = 0; tk < 16; tk++) {
+                int k = k_base + tk;
+                int sg = k / group_size;
+                if (sg != cur_scale_group) {
+                    cur_scale_group = sg;
+                    int scale_flat = sg * N + n;
+                    int schunk = scale_flat >> 6;
+                    int slocal = scale_flat & 63;
+                    int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
+                    unsigned short scale_bits = w2_scales[sperm_pos];
+                    cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+                }
+                unsigned int word = packed[row_base + perm_u32_col[tk]];
+                int raw = (word >> perm_shift[tk]) & 0xF;
+                float w_val = (float)(raw - 8);
+                float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
+                acc += w_val * cached_scale * x;
+            }
         }
     }
 
@@ -1843,38 +1952,69 @@ extern "C" __global__ void marlin_gemv_int4_v2(
     int kt_start = split_start + k_slice * tiles_per_slice;
     int kt_end = (k_slice == 15) ? split_end : kt_start + tiles_per_slice;
 
+    // Pre-compute permutation indices: constant across all k_tiles
+    int tile_base = (n_tile << 8) + tn;
+    int perm_u32_col[16];
+    int perm_shift[16];
+    #pragma unroll
+    for (int tk = 0; tk < 16; tk++) {
+        int tile_pos = tile_base + (tk << 4);
+        int chunk = tile_pos >> 10;
+        int local_idx = tile_pos & 1023;
+        int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
+        perm_u32_col[tk] = perm_pos >> 3;
+        perm_shift[tk] = (perm_pos & 7) << 2;
+    }
+
     float acc = 0.0f;
     int cur_scale_group = -1;
     float cached_scale = 0.0f;
 
     for (int kt = kt_start; kt < kt_end; kt++) {
-        for (int tk = 0; tk < 16; tk++) {
-            int k = (kt << 4) + tk;
+        int k_base = kt << 4;
+        int row_base = kt * out_cols;
+        int sg_start = k_base / group_size;
+        int sg_end = (k_base + 15) / group_size;
 
-            int sg = k / group_size;
-            if (sg != cur_scale_group) {
-                cur_scale_group = sg;
-                int scale_flat = sg * N + n;
-                int schunk = scale_flat >> 6;
-                int slocal = scale_flat & 63;
-                int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
-                unsigned short scale_bits = scales[sperm_pos];
-                cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+        if (sg_start != cur_scale_group) {
+            cur_scale_group = sg_start;
+            int scale_flat = sg_start * N + n;
+            int schunk = scale_flat >> 6;
+            int slocal = scale_flat & 63;
+            int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
+            unsigned short scale_bits = scales[sperm_pos];
+            cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+        }
+
+        if (sg_start == sg_end) {
+            #pragma unroll
+            for (int tk = 0; tk < 16; tk++) {
+                unsigned int word = packed[row_base + perm_u32_col[tk]];
+                int raw = (word >> perm_shift[tk]) & 0xF;
+                float w_val = (float)(raw - 8);
+                float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k_base + tk]));
+                acc += w_val * cached_scale * x;
             }
-
-            int tile_pos = (n_tile << 8) + (tk << 4) + tn;
-            int chunk = tile_pos >> 10;
-            int local_idx = tile_pos & 1023;
-            int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
-
-            int u32_col = perm_pos >> 3;
-            int nibble = perm_pos & 7;
-            unsigned int word = packed[kt * out_cols + u32_col];
-            int raw = (word >> (nibble << 2)) & 0xF;
-            float w_val = (float)(raw - 8);
-
-            float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
-            acc += w_val * cached_scale * x;
+        } else {
+            #pragma unroll
+            for (int tk = 0; tk < 16; tk++) {
+                int k = k_base + tk;
+                int sg = k / group_size;
+                if (sg != cur_scale_group) {
+                    cur_scale_group = sg;
+                    int scale_flat = sg * N + n;
+                    int schunk = scale_flat >> 6;
+                    int slocal = scale_flat & 63;
+                    int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
+                    unsigned short scale_bits = scales[sperm_pos];
+                    cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+                }
+                unsigned int word = packed[row_base + perm_u32_col[tk]];
+                int raw = (word >> perm_shift[tk]) & 0xF;
+                float w_val = (float)(raw - 8);
+                float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
+                acc += w_val * cached_scale * x;
+            }
         }
     }
 
@@ -1978,38 +2118,69 @@ extern "C" __global__ void marlin_gemv_int4_v2_fused_f32(
     int kt_start = split_start + k_slice * tiles_per_slice;
     int kt_end = (k_slice == 15) ? split_end : kt_start + tiles_per_slice;
 
+    // Pre-compute permutation indices: constant across all k_tiles
+    int tile_base = (n_tile << 8) + tn;
+    int perm_u32_col[16];
+    int perm_shift[16];
+    #pragma unroll
+    for (int tk = 0; tk < 16; tk++) {
+        int tile_pos = tile_base + (tk << 4);
+        int chunk = tile_pos >> 10;
+        int local_idx = tile_pos & 1023;
+        int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
+        perm_u32_col[tk] = perm_pos >> 3;
+        perm_shift[tk] = (perm_pos & 7) << 2;
+    }
+
     float acc = 0.0f;
     int cur_scale_group = -1;
     float cached_scale = 0.0f;
 
     for (int kt = kt_start; kt < kt_end; kt++) {
-        for (int tk = 0; tk < 16; tk++) {
-            int k = (kt << 4) + tk;
+        int k_base = kt << 4;
+        int row_base = kt * out_cols;
+        int sg_start = k_base / group_size;
+        int sg_end = (k_base + 15) / group_size;
 
-            int sg = k / group_size;
-            if (sg != cur_scale_group) {
-                cur_scale_group = sg;
-                int scale_flat = sg * N + n;
-                int schunk = scale_flat >> 6;
-                int slocal = scale_flat & 63;
-                int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
-                unsigned short scale_bits = scales[sperm_pos];
-                cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+        if (sg_start != cur_scale_group) {
+            cur_scale_group = sg_start;
+            int scale_flat = sg_start * N + n;
+            int schunk = scale_flat >> 6;
+            int slocal = scale_flat & 63;
+            int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
+            unsigned short scale_bits = scales[sperm_pos];
+            cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+        }
+
+        if (sg_start == sg_end) {
+            #pragma unroll
+            for (int tk = 0; tk < 16; tk++) {
+                unsigned int word = packed[row_base + perm_u32_col[tk]];
+                int raw = (word >> perm_shift[tk]) & 0xF;
+                float w_val = (float)(raw - 8);
+                float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k_base + tk]));
+                acc += w_val * cached_scale * x;
             }
-
-            int tile_pos = (n_tile << 8) + (tk << 4) + tn;
-            int chunk = tile_pos >> 10;
-            int local_idx = tile_pos & 1023;
-            int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
-
-            int u32_col = perm_pos >> 3;
-            int nibble = perm_pos & 7;
-            unsigned int word = packed[kt * out_cols + u32_col];
-            int raw = (word >> (nibble << 2)) & 0xF;
-            float w_val = (float)(raw - 8);
-
-            float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
-            acc += w_val * cached_scale * x;
+        } else {
+            #pragma unroll
+            for (int tk = 0; tk < 16; tk++) {
+                int k = k_base + tk;
+                int sg = k / group_size;
+                if (sg != cur_scale_group) {
+                    cur_scale_group = sg;
+                    int scale_flat = sg * N + n;
+                    int schunk = scale_flat >> 6;
+                    int slocal = scale_flat & 63;
+                    int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
+                    unsigned short scale_bits = scales[sperm_pos];
+                    cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+                }
+                unsigned int word = packed[row_base + perm_u32_col[tk]];
+                int raw = (word >> perm_shift[tk]) & 0xF;
+                float w_val = (float)(raw - 8);
+                float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
+                acc += w_val * cached_scale * x;
+            }
         }
     }
 
@@ -2084,38 +2255,69 @@ extern "C" __global__ void marlin_gemv_int8_v2(
     int kt_start = split_start + k_slice * tiles_per_slice;
     int kt_end = (k_slice == 15) ? split_end : kt_start + tiles_per_slice;
 
+    // Pre-compute permutation indices: constant across all k_tiles
+    int tile_base = (n_tile << 8) + tn;
+    int perm_u32_col[16];
+    int perm_shift[16];
+    #pragma unroll
+    for (int tk = 0; tk < 16; tk++) {
+        int tile_pos = tile_base + (tk << 4);
+        int chunk = tile_pos >> 10;
+        int local_idx = tile_pos & 1023;
+        int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
+        perm_u32_col[tk] = perm_pos >> 2;
+        perm_shift[tk] = (perm_pos & 3) << 3;
+    }
+
     float acc = 0.0f;
     int cur_scale_group = -1;
     float cached_scale = 0.0f;
 
     for (int kt = kt_start; kt < kt_end; kt++) {
-        for (int tk = 0; tk < 16; tk++) {
-            int k = (kt << 4) + tk;
+        int k_base = kt << 4;
+        int row_base = kt * out_cols;
+        int sg_start = k_base / group_size;
+        int sg_end = (k_base + 15) / group_size;
 
-            int sg = k / group_size;
-            if (sg != cur_scale_group) {
-                cur_scale_group = sg;
-                int scale_flat = sg * N + n;
-                int schunk = scale_flat >> 6;
-                int slocal = scale_flat & 63;
-                int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
-                unsigned short scale_bits = scales[sperm_pos];
-                cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+        if (sg_start != cur_scale_group) {
+            cur_scale_group = sg_start;
+            int scale_flat = sg_start * N + n;
+            int schunk = scale_flat >> 6;
+            int slocal = scale_flat & 63;
+            int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
+            unsigned short scale_bits = scales[sperm_pos];
+            cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+        }
+
+        if (sg_start == sg_end) {
+            #pragma unroll
+            for (int tk = 0; tk < 16; tk++) {
+                unsigned int word = packed[row_base + perm_u32_col[tk]];
+                int raw = (word >> perm_shift[tk]) & 0xFF;
+                float w_val = (float)(raw - 128);
+                float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k_base + tk]));
+                acc += w_val * cached_scale * x;
             }
-
-            int tile_pos = (n_tile << 8) + (tk << 4) + tn;
-            int chunk = tile_pos >> 10;
-            int local_idx = tile_pos & 1023;
-            int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
-
-            int u32_col = perm_pos >> 2;
-            int byte_idx = perm_pos & 3;
-            unsigned int word = packed[kt * out_cols + u32_col];
-            int raw = (word >> (byte_idx << 3)) & 0xFF;
-            float w_val = (float)(raw - 128);
-
-            float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
-            acc += w_val * cached_scale * x;
+        } else {
+            #pragma unroll
+            for (int tk = 0; tk < 16; tk++) {
+                int k = k_base + tk;
+                int sg = k / group_size;
+                if (sg != cur_scale_group) {
+                    cur_scale_group = sg;
+                    int scale_flat = sg * N + n;
+                    int schunk = scale_flat >> 6;
+                    int slocal = scale_flat & 63;
+                    int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
+                    unsigned short scale_bits = scales[sperm_pos];
+                    cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+                }
+                unsigned int word = packed[row_base + perm_u32_col[tk]];
+                int raw = (word >> perm_shift[tk]) & 0xFF;
+                float w_val = (float)(raw - 128);
+                float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
+                acc += w_val * cached_scale * x;
+            }
         }
     }
 
@@ -2185,38 +2387,69 @@ extern "C" __global__ void marlin_gemv_int8_v2_fused_f32(
     int kt_start = split_start + k_slice * tiles_per_slice;
     int kt_end = (k_slice == 15) ? split_end : kt_start + tiles_per_slice;
 
+    // Pre-compute permutation indices: constant across all k_tiles
+    int tile_base = (n_tile << 8) + tn;
+    int perm_u32_col[16];
+    int perm_shift[16];
+    #pragma unroll
+    for (int tk = 0; tk < 16; tk++) {
+        int tile_pos = tile_base + (tk << 4);
+        int chunk = tile_pos >> 10;
+        int local_idx = tile_pos & 1023;
+        int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
+        perm_u32_col[tk] = perm_pos >> 2;
+        perm_shift[tk] = (perm_pos & 3) << 3;
+    }
+
     float acc = 0.0f;
     int cur_scale_group = -1;
     float cached_scale = 0.0f;
 
     for (int kt = kt_start; kt < kt_end; kt++) {
-        for (int tk = 0; tk < 16; tk++) {
-            int k = (kt << 4) + tk;
+        int k_base = kt << 4;
+        int row_base = kt * out_cols;
+        int sg_start = k_base / group_size;
+        int sg_end = (k_base + 15) / group_size;
 
-            int sg = k / group_size;
-            if (sg != cur_scale_group) {
-                cur_scale_group = sg;
-                int scale_flat = sg * N + n;
-                int schunk = scale_flat >> 6;
-                int slocal = scale_flat & 63;
-                int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
-                unsigned short scale_bits = scales[sperm_pos];
-                cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+        if (sg_start != cur_scale_group) {
+            cur_scale_group = sg_start;
+            int scale_flat = sg_start * N + n;
+            int schunk = scale_flat >> 6;
+            int slocal = scale_flat & 63;
+            int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
+            unsigned short scale_bits = scales[sperm_pos];
+            cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+        }
+
+        if (sg_start == sg_end) {
+            #pragma unroll
+            for (int tk = 0; tk < 16; tk++) {
+                unsigned int word = packed[row_base + perm_u32_col[tk]];
+                int raw = (word >> perm_shift[tk]) & 0xFF;
+                float w_val = (float)(raw - 128);
+                float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k_base + tk]));
+                acc += w_val * cached_scale * x;
             }
-
-            int tile_pos = (n_tile << 8) + (tk << 4) + tn;
-            int chunk = tile_pos >> 10;
-            int local_idx = tile_pos & 1023;
-            int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
-
-            int u32_col = perm_pos >> 2;
-            int byte_idx = perm_pos & 3;
-            unsigned int word = packed[kt * out_cols + u32_col];
-            int raw = (word >> (byte_idx << 3)) & 0xFF;
-            float w_val = (float)(raw - 128);
-
-            float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
-            acc += w_val * cached_scale * x;
+        } else {
+            #pragma unroll
+            for (int tk = 0; tk < 16; tk++) {
+                int k = k_base + tk;
+                int sg = k / group_size;
+                if (sg != cur_scale_group) {
+                    cur_scale_group = sg;
+                    int scale_flat = sg * N + n;
+                    int schunk = scale_flat >> 6;
+                    int slocal = scale_flat & 63;
+                    int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
+                    unsigned short scale_bits = scales[sperm_pos];
+                    cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+                }
+                unsigned int word = packed[row_base + perm_u32_col[tk]];
+                int raw = (word >> perm_shift[tk]) & 0xFF;
+                float w_val = (float)(raw - 128);
+                float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
+                acc += w_val * cached_scale * x;
+            }
         }
     }
 
@@ -2292,38 +2525,69 @@ extern "C" __global__ void marlin_gemv_int4_fused_silu_accum_v2(
     int kt_start = split_start + k_slice * tiles_per_slice;
     int kt_end = (k_slice == 15) ? split_end : kt_start + tiles_per_slice;
 
+    // Pre-compute permutation indices: constant across all k_tiles
+    int tile_base = (n_tile << 8) + tn;
+    int perm_u32_col[16];
+    int perm_shift[16];
+    #pragma unroll
+    for (int tk = 0; tk < 16; tk++) {
+        int tile_pos = tile_base + (tk << 4);
+        int chunk = tile_pos >> 10;
+        int local_idx = tile_pos & 1023;
+        int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
+        perm_u32_col[tk] = perm_pos >> 3;
+        perm_shift[tk] = (perm_pos & 7) << 2;
+    }
+
     float acc = 0.0f;
     int cur_scale_group = -1;
     float cached_scale = 0.0f;
 
     for (int kt = kt_start; kt < kt_end; kt++) {
-        for (int tk = 0; tk < 16; tk++) {
-            int k = (kt << 4) + tk;
+        int k_base = kt << 4;
+        int row_base = kt * out_cols;
+        int sg_start = k_base / group_size;
+        int sg_end = (k_base + 15) / group_size;
 
-            int sg = k / group_size;
-            if (sg != cur_scale_group) {
-                cur_scale_group = sg;
-                int scale_flat = sg * N + n;
-                int schunk = scale_flat >> 6;
-                int slocal = scale_flat & 63;
-                int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
-                unsigned short scale_bits = w2_scales[sperm_pos];
-                cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+        if (sg_start != cur_scale_group) {
+            cur_scale_group = sg_start;
+            int scale_flat = sg_start * N + n;
+            int schunk = scale_flat >> 6;
+            int slocal = scale_flat & 63;
+            int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
+            unsigned short scale_bits = w2_scales[sperm_pos];
+            cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+        }
+
+        if (sg_start == sg_end) {
+            #pragma unroll
+            for (int tk = 0; tk < 16; tk++) {
+                unsigned int word = packed[row_base + perm_u32_col[tk]];
+                int raw = (word >> perm_shift[tk]) & 0xF;
+                float w_val = (float)(raw - 8);
+                float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k_base + tk]));
+                acc += w_val * cached_scale * x;
             }
-
-            int tile_pos = (n_tile << 8) + (tk << 4) + tn;
-            int chunk = tile_pos >> 10;
-            int local_idx = tile_pos & 1023;
-            int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
-
-            int u32_col = perm_pos >> 3;
-            int nibble = perm_pos & 7;
-            unsigned int word = packed[kt * out_cols + u32_col];
-            int raw = (word >> (nibble << 2)) & 0xF;
-            float w_val = (float)(raw - 8);
-
-            float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
-            acc += w_val * cached_scale * x;
+        } else {
+            #pragma unroll
+            for (int tk = 0; tk < 16; tk++) {
+                int k = k_base + tk;
+                int sg = k / group_size;
+                if (sg != cur_scale_group) {
+                    cur_scale_group = sg;
+                    int scale_flat = sg * N + n;
+                    int schunk = scale_flat >> 6;
+                    int slocal = scale_flat & 63;
+                    int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
+                    unsigned short scale_bits = w2_scales[sperm_pos];
+                    cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+                }
+                unsigned int word = packed[row_base + perm_u32_col[tk]];
+                int raw = (word >> perm_shift[tk]) & 0xF;
+                float w_val = (float)(raw - 8);
+                float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
+                acc += w_val * cached_scale * x;
+            }
         }
     }
 
@@ -2418,34 +2682,69 @@ extern "C" __global__ void marlin_gemv_int4_v2_batched(
     int kt_start = split_start + k_slice * tiles_per_slice;
     int kt_end = (k_slice == 15) ? split_end : kt_start + tiles_per_slice;
 
+    // Pre-compute permutation indices: constant across all k_tiles
+    int tile_base = (n_tile << 8) + tn;
+    int perm_u32_col[16];
+    int perm_shift[16];
+    #pragma unroll
+    for (int tk = 0; tk < 16; tk++) {
+        int tile_pos = tile_base + (tk << 4);
+        int chunk = tile_pos >> 10;
+        int local_idx = tile_pos & 1023;
+        int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
+        perm_u32_col[tk] = perm_pos >> 3;
+        perm_shift[tk] = (perm_pos & 7) << 2;
+    }
+
     float acc = 0.0f;
     int cur_scale_group = -1;
     float cached_scale = 0.0f;
 
     for (int kt = kt_start; kt < kt_end; kt++) {
-        for (int tk = 0; tk < 16; tk++) {
-            int k = (kt << 4) + tk;
-            int sg = k / group_size;
-            if (sg != cur_scale_group) {
-                cur_scale_group = sg;
-                int scale_flat = sg * N + n;
-                int schunk = scale_flat >> 6;
-                int slocal = scale_flat & 63;
-                int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
-                unsigned short scale_bits = scales[sperm_pos];
-                cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+        int k_base = kt << 4;
+        int row_base = kt * out_cols;
+        int sg_start = k_base / group_size;
+        int sg_end = (k_base + 15) / group_size;
+
+        if (sg_start != cur_scale_group) {
+            cur_scale_group = sg_start;
+            int scale_flat = sg_start * N + n;
+            int schunk = scale_flat >> 6;
+            int slocal = scale_flat & 63;
+            int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
+            unsigned short scale_bits = scales[sperm_pos];
+            cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+        }
+
+        if (sg_start == sg_end) {
+            #pragma unroll
+            for (int tk = 0; tk < 16; tk++) {
+                unsigned int word = packed[row_base + perm_u32_col[tk]];
+                int raw = (word >> perm_shift[tk]) & 0xF;
+                float w_val = (float)(raw - 8);
+                float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k_base + tk]));
+                acc += w_val * cached_scale * x;
             }
-            int tile_pos = (n_tile << 8) + (tk << 4) + tn;
-            int chunk = tile_pos >> 10;
-            int local_idx = tile_pos & 1023;
-            int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
-            int u32_col = perm_pos >> 3;
-            int nibble = perm_pos & 7;
-            unsigned int word = packed[kt * out_cols + u32_col];
-            int raw = (word >> (nibble << 2)) & 0xF;
-            float w_val = (float)(raw - 8);
-            float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
-            acc += w_val * cached_scale * x;
+        } else {
+            #pragma unroll
+            for (int tk = 0; tk < 16; tk++) {
+                int k = k_base + tk;
+                int sg = k / group_size;
+                if (sg != cur_scale_group) {
+                    cur_scale_group = sg;
+                    int scale_flat = sg * N + n;
+                    int schunk = scale_flat >> 6;
+                    int slocal = scale_flat & 63;
+                    int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
+                    unsigned short scale_bits = scales[sperm_pos];
+                    cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+                }
+                unsigned int word = packed[row_base + perm_u32_col[tk]];
+                int raw = (word >> perm_shift[tk]) & 0xF;
+                float w_val = (float)(raw - 8);
+                float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
+                acc += w_val * cached_scale * x;
+            }
         }
     }
 
@@ -2530,34 +2829,69 @@ extern "C" __global__ void fused_silu_w2_batched(
     int kt_start = k_slice * tiles_per_slice;
     int kt_end = (k_slice == 15) ? k_tiles_total : (kt_start + tiles_per_slice);
 
+    // Pre-compute permutation indices: constant across all k_tiles
+    int tile_base = (n_tile << 8) + tn;
+    int perm_u32_col[16];
+    int perm_shift[16];
+    #pragma unroll
+    for (int tk = 0; tk < 16; tk++) {
+        int tile_pos = tile_base + (tk << 4);
+        int chunk = tile_pos >> 10;
+        int local_idx = tile_pos & 1023;
+        int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
+        perm_u32_col[tk] = perm_pos >> 3;
+        perm_shift[tk] = (perm_pos & 7) << 2;
+    }
+
     float acc = 0.0f;
     int cur_scale_group = -1;
     float cached_scale = 0.0f;
 
     for (int kt = kt_start; kt < kt_end; kt++) {
-        for (int tk = 0; tk < 16; tk++) {
-            int k = (kt << 4) + tk;
-            int sg = k / group_size;
-            if (sg != cur_scale_group) {
-                cur_scale_group = sg;
-                int scale_flat = sg * N + n;
-                int schunk = scale_flat >> 6;
-                int slocal = scale_flat & 63;
-                int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
-                unsigned short scale_bits = w2_scales[sperm_pos];
-                cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+        int k_base = kt << 4;
+        int row_base = kt * out_cols;
+        int sg_start = k_base / group_size;
+        int sg_end = (k_base + 15) / group_size;
+
+        if (sg_start != cur_scale_group) {
+            cur_scale_group = sg_start;
+            int scale_flat = sg_start * N + n;
+            int schunk = scale_flat >> 6;
+            int slocal = scale_flat & 63;
+            int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
+            unsigned short scale_bits = w2_scales[sperm_pos];
+            cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+        }
+
+        if (sg_start == sg_end) {
+            #pragma unroll
+            for (int tk = 0; tk < 16; tk++) {
+                unsigned int word = packed[row_base + perm_u32_col[tk]];
+                int raw = (word >> perm_shift[tk]) & 0xF;
+                float w_val = (float)(raw - 8);
+                float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k_base + tk]));
+                acc += w_val * cached_scale * x;
             }
-            int tile_pos = (n_tile << 8) + (tk << 4) + tn;
-            int chunk = tile_pos >> 10;
-            int local_idx = tile_pos & 1023;
-            int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
-            int u32_col = perm_pos >> 3;
-            int nibble = perm_pos & 7;
-            unsigned int word = packed[kt * out_cols + u32_col];
-            int raw = (word >> (nibble << 2)) & 0xF;
-            float w_val = (float)(raw - 8);
-            float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
-            acc += w_val * cached_scale * x;
+        } else {
+            #pragma unroll
+            for (int tk = 0; tk < 16; tk++) {
+                int k = k_base + tk;
+                int sg = k / group_size;
+                if (sg != cur_scale_group) {
+                    cur_scale_group = sg;
+                    int scale_flat = sg * N + n;
+                    int schunk = scale_flat >> 6;
+                    int slocal = scale_flat & 63;
+                    int sperm_pos = (schunk << 6) + s_inv_sperm[slocal];
+                    unsigned short scale_bits = w2_scales[sperm_pos];
+                    cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
+                }
+                unsigned int word = packed[row_base + perm_u32_col[tk]];
+                int raw = (word >> perm_shift[tk]) & 0xF;
+                float w_val = (float)(raw - 8);
+                float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
+                acc += w_val * cached_scale * x;
+            }
         }
     }
 
@@ -2792,6 +3126,126 @@ extern "C" __global__ void gqa_attention_g(
     }
 }
 
+// Same as gqa_attention_g but outputs BF16 directly (eliminates fp32_to_bf16 kernel)
+extern "C" __global__ void gqa_attention_g_bf16(
+    unsigned short* __restrict__ output,   // [num_q_heads * head_dim] BF16
+    const float* __restrict__ q,
+    const __nv_fp8_e4m3* __restrict__ k_cache,
+    const __nv_fp8_e4m3* __restrict__ v_cache,
+    float sm_scale,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    const int* __restrict__ d_seq_len,
+    int max_seq
+) {
+    int seq_len = *d_seq_len;
+    int qh = blockIdx.x;
+    if (qh >= num_q_heads) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    int heads_per_kv = num_q_heads / num_kv_heads;
+    int kv_head = qh / heads_per_kv;
+    int kv_stride = num_kv_heads * head_dim;
+
+    const float* q_head = q + qh * head_dim;
+
+    extern __shared__ float smem[];
+    float* s_q = smem;
+
+    int warp_id = tid / warpSize;
+    int lane_id = tid % warpSize;
+    int num_warps = (num_threads + warpSize - 1) / warpSize;
+
+    for (int i = tid; i < head_dim; i += num_threads) {
+        s_q[i] = q_head[i];
+    }
+    __syncthreads();
+
+    float local_max = -1e30f;
+    for (int pos = tid; pos < seq_len; pos += num_threads) {
+        float score = 0.0f;
+        const __nv_fp8_e4m3* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
+        for (int d = 0; d < head_dim; d += 16) {
+            uint4 k_packed = *reinterpret_cast<const uint4*>(k_vec + d);
+            const unsigned char* kb = reinterpret_cast<const unsigned char*>(&k_packed);
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                score += s_q[d + j] * fp8e4m3_to_f32(
+                    *reinterpret_cast<const __nv_fp8_e4m3*>(&kb[j]));
+            }
+        }
+        score *= sm_scale;
+        local_max = fmaxf(local_max, score);
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    }
+    float* smem_reduce = smem + head_dim;
+    if (lane_id == 0) smem_reduce[warp_id] = local_max;
+    __syncthreads();
+    if (tid == 0) {
+        float m = smem_reduce[0];
+        for (int w = 1; w < num_warps; w++) m = fmaxf(m, smem_reduce[w]);
+        smem_reduce[0] = m;
+    }
+    __syncthreads();
+    float global_max = smem_reduce[0];
+
+    float local_sum = 0.0f;
+    float local_out[256];
+    int my_count = 0;
+    for (int d = tid; d < head_dim; d += num_threads) {
+        local_out[my_count++] = 0.0f;
+    }
+
+    for (int pos = tid; pos < seq_len; pos += num_threads) {
+        float score = 0.0f;
+        const __nv_fp8_e4m3* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
+        for (int d = 0; d < head_dim; d += 16) {
+            uint4 k_packed = *reinterpret_cast<const uint4*>(k_vec + d);
+            const unsigned char* kb = reinterpret_cast<const unsigned char*>(&k_packed);
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                score += s_q[d + j] * fp8e4m3_to_f32(
+                    *reinterpret_cast<const __nv_fp8_e4m3*>(&kb[j]));
+            }
+        }
+        float w = expf(score * sm_scale - global_max);
+        local_sum += w;
+
+        const __nv_fp8_e4m3* v_vec = v_cache + pos * kv_stride + kv_head * head_dim;
+        int vi = 0;
+        for (int d = tid; d < head_dim; d += num_threads) {
+            local_out[vi++] += w * fp8e4m3_to_f32(v_vec[d]);
+        }
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_sum;
+    __syncthreads();
+    if (tid == 0) {
+        float s = 0.0f;
+        for (int w = 0; w < num_warps; w++) s += smem_reduce[w];
+        smem_reduce[0] = s;
+    }
+    __syncthreads();
+    float total_sum = smem_reduce[0];
+    float inv_sum = (total_sum > 0.0f) ? 1.0f / total_sum : 0.0f;
+
+    // Write normalised output as BF16 directly
+    unsigned short* out = output + qh * head_dim;
+    int vi = 0;
+    for (int d = tid; d < head_dim; d += num_threads) {
+        __nv_bfloat16 result = __float2bfloat16(local_out[vi++] * inv_sum);
+        out[d] = *reinterpret_cast<unsigned short*>(&result);
+    }
+}
+
 // ── Simple INT4 GEMV (for draft model) ───────────────────────────────
 //
 // Row-major packed INT4 weights: each byte holds 2 values (low nibble = even col, high nibble = odd col).
@@ -2960,10 +3414,23 @@ extern "C" __global__ void marlin_gemv_int8(
     int kt_start = k_slice * tiles_per_slice;
     int kt_end = (k_slice == 15) ? k_tiles_total : (kt_start + tiles_per_slice);
 
+    // Pre-compute permutation indices: constant across all k_tiles
+    int tile_base = (n_tile << 8) + tn;
+    int perm_u32_col[16];
+    int perm_shift[16];
+    #pragma unroll
+    for (int tk = 0; tk < 16; tk++) {
+        int tile_pos = tile_base + (tk << 4);
+        int chunk = tile_pos >> 10;
+        int local_idx = tile_pos & 1023;
+        int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
+        perm_u32_col[tk] = perm_pos >> 2;
+        perm_shift[tk] = (perm_pos & 3) << 3;
+    }
+
     float acc = 0.0f;
     int cur_scale_group = -1;
     float cached_scale = 0.0f;
-    int tile_base = (n_tile << 8) + tn;
 
     for (int kt = kt_start; kt < kt_end; kt++) {
         int k_base = kt << 4;
@@ -2984,14 +3451,8 @@ extern "C" __global__ void marlin_gemv_int8(
         if (sg_start == sg_end) {
             #pragma unroll
             for (int tk = 0; tk < 16; tk++) {
-                int tile_pos = tile_base + (tk << 4);
-                int chunk = tile_pos >> 10;
-                int local_idx = tile_pos & 1023;
-                int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
-                int u32_col = perm_pos >> 2;
-                int byte_idx = perm_pos & 3;
-                unsigned int word = packed[row_base + u32_col];
-                int raw = (word >> (byte_idx << 3)) & 0xFF;
+                unsigned int word = packed[row_base + perm_u32_col[tk]];
+                int raw = (word >> perm_shift[tk]) & 0xFF;
                 float w_val = (float)(raw - 128);
                 float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k_base + tk]));
                 acc += w_val * cached_scale * x;
@@ -3010,14 +3471,8 @@ extern "C" __global__ void marlin_gemv_int8(
                     unsigned short scale_bits = scales[sperm_pos];
                     cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
                 }
-                int tile_pos = tile_base + (tk << 4);
-                int chunk = tile_pos >> 10;
-                int local_idx = tile_pos & 1023;
-                int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
-                int u32_col = perm_pos >> 2;
-                int byte_idx = perm_pos & 3;
-                unsigned int word = packed[row_base + u32_col];
-                int raw = (word >> (byte_idx << 3)) & 0xFF;
+                unsigned int word = packed[row_base + perm_u32_col[tk]];
+                int raw = (word >> perm_shift[tk]) & 0xFF;
                 float w_val = (float)(raw - 128);
                 float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
                 acc += w_val * cached_scale * x;
@@ -3080,10 +3535,23 @@ extern "C" __global__ void marlin_gemv_int8_f32(
     int kt_start = k_slice * tiles_per_slice;
     int kt_end = (k_slice == 15) ? k_tiles_total : (kt_start + tiles_per_slice);
 
+    // Pre-compute permutation indices: constant across all k_tiles
+    int tile_base = (n_tile << 8) + tn;
+    int perm_u32_col[16];
+    int perm_shift[16];
+    #pragma unroll
+    for (int tk = 0; tk < 16; tk++) {
+        int tile_pos = tile_base + (tk << 4);
+        int chunk = tile_pos >> 10;
+        int local_idx = tile_pos & 1023;
+        int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
+        perm_u32_col[tk] = perm_pos >> 2;
+        perm_shift[tk] = (perm_pos & 3) << 3;
+    }
+
     float acc = 0.0f;
     int cur_scale_group = -1;
     float cached_scale = 0.0f;
-    int tile_base = (n_tile << 8) + tn;
 
     for (int kt = kt_start; kt < kt_end; kt++) {
         int k_base = kt << 4;
@@ -3104,14 +3572,8 @@ extern "C" __global__ void marlin_gemv_int8_f32(
         if (sg_start == sg_end) {
             #pragma unroll
             for (int tk = 0; tk < 16; tk++) {
-                int tile_pos = tile_base + (tk << 4);
-                int chunk = tile_pos >> 10;
-                int local_idx = tile_pos & 1023;
-                int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
-                int u32_col = perm_pos >> 2;
-                int byte_idx = perm_pos & 3;
-                unsigned int word = packed[row_base + u32_col];
-                int raw = (word >> (byte_idx << 3)) & 0xFF;
+                unsigned int word = packed[row_base + perm_u32_col[tk]];
+                int raw = (word >> perm_shift[tk]) & 0xFF;
                 float w_val = (float)(raw - 128);
                 float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k_base + tk]));
                 acc += w_val * cached_scale * x;
@@ -3130,14 +3592,8 @@ extern "C" __global__ void marlin_gemv_int8_f32(
                     unsigned short scale_bits = scales[sperm_pos];
                     cached_scale = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&scale_bits));
                 }
-                int tile_pos = tile_base + (tk << 4);
-                int chunk = tile_pos >> 10;
-                int local_idx = tile_pos & 1023;
-                int perm_pos = (chunk << 10) + s_inv_wperm[local_idx];
-                int u32_col = perm_pos >> 2;
-                int byte_idx = perm_pos & 3;
-                unsigned int word = packed[row_base + u32_col];
-                int raw = (word >> (byte_idx << 3)) & 0xFF;
+                unsigned int word = packed[row_base + perm_u32_col[tk]];
+                int raw = (word >> perm_shift[tk]) & 0xFF;
                 float w_val = (float)(raw - 128);
                 float x = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
                 acc += w_val * cached_scale * x;

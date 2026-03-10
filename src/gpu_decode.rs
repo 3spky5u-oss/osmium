@@ -84,6 +84,9 @@ const KERNEL_NAMES: &[&str] = &[
     "apply_rope_g",
     "kv_cache_write_g",
     "gqa_attention_g",
+    "gated_rmsnorm_silu_bf16",
+    "gqa_attention_g_bf16",
+    "apply_gated_attn_bf16",
 ];
 
 const MODULE_NAME: &str = "decode_kernels";
@@ -928,6 +931,10 @@ struct CachedKernels {
     apply_rope_g: cudarc::driver::CudaFunction,
     kv_cache_write_g: cudarc::driver::CudaFunction,
     gqa_attention_g: cudarc::driver::CudaFunction,
+    // BF16-output variants (eliminate fp32_to_bf16 conversion kernel)
+    gated_rmsnorm_silu_bf16: cudarc::driver::CudaFunction,
+    gqa_attention_g_bf16: cudarc::driver::CudaFunction,
+    apply_gated_attn_bf16: cudarc::driver::CudaFunction,
 }
 
 // ── Main GPU decode graph ──────────────────────────────────────────────
@@ -1876,6 +1883,10 @@ impl GpuDecodeStore {
                 apply_rope_g: get("apply_rope_g")?,
                 kv_cache_write_g: get("kv_cache_write_g")?,
                 gqa_attention_g: get("gqa_attention_g")?,
+                // BF16-output variants
+                gated_rmsnorm_silu_bf16: get("gated_rmsnorm_silu_bf16")?,
+                gqa_attention_g_bf16: get("gqa_attention_g_bf16")?,
+                apply_gated_attn_bf16: get("apply_gated_attn_bf16")?,
             };
             self.graph.as_mut().unwrap().kernels = Some(kernels);
             log::info!("GpuDecodeStore: cached 40 kernel function handles");
@@ -5574,40 +5585,25 @@ impl GpuDecodeStore {
                             ).map_err(|e| format!("delta_net_step[{}]: {:?}", layer_idx, e))?;
                         }
 
-                        // Gated RMSNorm + SiLU
+                        // Gated RMSNorm + SiLU → BF16 directly
                         {
                             let threads = 256u32;
                             let smem = (dv_ as u32 + 32) * 4;
                             unsafe {
-                                k.gated_rmsnorm_silu.clone().launch(
+                                k.gated_rmsnorm_silu_bf16.clone().launch(
                                     LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: smem },
                                     (
-                                        *graph.d_la_conv_out.device_ptr(),
+                                        *graph.d_scratch.device_ptr(),
                                         *graph.d_la_ba.device_ptr(),
                                         *graph.d_la_gated_out.device_ptr(),
                                         *norm_weight_ptr, eps,
                                         nv_ as i32, dv_ as i32,
                                     ),
-                                ).map_err(|e| format!("gated_rmsnorm_silu[{}]: {:?}", layer_idx, e))?;
+                                ).map_err(|e| format!("gated_rmsnorm_silu_bf16[{}]: {:?}", layer_idx, e))?;
                             }
                         }
 
                         // Output projection
-                        let gated_size = nv_ * dv_;
-                        {
-                            let threads = 256u32;
-                            let blocks = ((gated_size as u32) + threads - 1) / threads;
-                            unsafe {
-                                k.fp32_to_bf16.clone().launch(
-                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
-                                    (
-                                        *graph.d_scratch.device_ptr(),
-                                        *graph.d_la_conv_out.device_ptr(),
-                                        gated_size as i32,
-                                    ),
-                                ).map_err(|e| format!("fp32_to_bf16[{}]: {:?}", layer_idx, e))?;
-                            }
-                        }
                         let o_w = &graph.weights[*out_proj];
                         self.gemv_bf16_internal(o_w, *graph.d_scratch.device_ptr(),
                             *graph.d_hidden.device_ptr())?;
@@ -5757,31 +5753,27 @@ impl GpuDecodeStore {
                             }
                         }
 
-                        // Gated attention
+                        // Gated attention + BF16 conversion (or just BF16 conversion if non-gated)
+                        let attn_out_dim = nh * hd;
                         if *gated {
-                            let total = (nh * hd) as u32;
+                            let total = attn_out_dim as u32;
                             let threads = 256u32;
                             let blocks = (total + threads - 1) / threads;
                             unsafe {
-                                k.apply_gated_attn.clone().launch(
+                                k.apply_gated_attn_bf16.clone().launch(
                                     LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
                                     (
+                                        *graph.d_scratch.device_ptr(),
                                         *graph.d_gqa_out.device_ptr(),
                                         *graph.d_la_qkvz.device_ptr(),
-                                        (nh * hd) as i32,
+                                        attn_out_dim as i32,
                                     ),
-                                ).map_err(|e| format!("apply_gated_attn[{}]: {:?}", layer_idx, e))?;
+                                ).map_err(|e| format!("apply_gated_attn_bf16[{}]: {:?}", layer_idx, e))?;
                             }
-                        }
-
-                        // O projection
-                        let attn_out_dim = nh * hd;
-                        {
-                            let threads = 256u32;
-                            let blocks = ((attn_out_dim as u32) + threads - 1) / threads;
+                        } else {
                             unsafe {
                                 k.fp32_to_bf16.clone().launch(
-                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    LaunchConfig::for_num_elems(attn_out_dim as u32),
                                     (
                                         *graph.d_scratch.device_ptr(),
                                         *graph.d_gqa_out.device_ptr(),
@@ -5790,6 +5782,8 @@ impl GpuDecodeStore {
                                 ).map_err(|e| format!("fp32_to_bf16[{}]: {:?}", layer_idx, e))?;
                             }
                         }
+
+                        // O projection
                         let o_w = &graph.weights[*o_proj];
                         self.gemv_bf16_internal(o_w, *graph.d_scratch.device_ptr(),
                             *graph.d_hidden.device_ptr())?;
@@ -6620,43 +6614,30 @@ impl GpuDecodeStore {
                     }
                     let t_la_s8 = Instant::now();
 
-                    // ── LA Step 8: Gated RMSNorm + SiLU ──
+                    // ── LA Step 8: Gated RMSNorm + SiLU → BF16 directly ──
                     // z was saved in d_la_gated_out earlier
                     // recurrence output is in d_la_ba
+                    // Outputs BF16 directly to d_scratch (eliminates separate fp32_to_bf16 kernel)
                     {
                         let threads = 256u32;
                         let smem = (dv_ as u32 + 32) * 4;
                         unsafe {
-                            k.gated_rmsnorm_silu.clone().launch(
+                            k.gated_rmsnorm_silu_bf16.clone().launch(
                                 LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: smem },
                                 (
-                                    *graph.d_la_conv_out.device_ptr(),  // output (reuse buffer)
+                                    *graph.d_scratch.device_ptr(),      // output BF16 (direct to GEMV input)
                                     *graph.d_la_ba.device_ptr(),        // recurrence output (from step 7)
                                     *graph.d_la_gated_out.device_ptr(), // z (saved earlier)
                                     *norm_weight_ptr,
                                     eps,
                                     nv_ as i32, dv_ as i32,
                                 ),
-                            ).map_err(|e| format!("gated_rmsnorm_silu[{}]: {:?}", layer_idx, e))?;
+                            ).map_err(|e| format!("gated_rmsnorm_silu_bf16[{}]: {:?}", layer_idx, e))?;
                         }
                     }
 
                     // ── LA Step 9: Output projection ──
                     let out_w = &graph.weights[*out_proj];
-                    // d_la_conv_out (FP32 nv*dv, gated rmsnorm output) → BF16 → GEMV → d_hidden
-                    let gated_size = nv_ * dv_;
-                    {
-                        unsafe {
-                            k.fp32_to_bf16.clone().launch(
-                                LaunchConfig::for_num_elems(gated_size as u32),
-                                (
-                                    *graph.d_scratch.device_ptr(),
-                                    *graph.d_la_conv_out.device_ptr(),
-                                    gated_size as i32,
-                                ),
-                            ).map_err(|e| format!("fp32_to_bf16 la out[{}]: {:?}", layer_idx, e))?;
-                        }
-                    }
                     self.gemv_bf16_internal(
                         out_w,
                         *graph.d_scratch.device_ptr(),
@@ -6942,32 +6923,30 @@ impl GpuDecodeStore {
                     }
                     let t_gqa_out_start = Instant::now();
 
-                    // ── GQA: Apply gated attention ──
-                    // d_gqa_out *= sigmoid(gate) where gate is in d_la_qkvz
+                    // ── GQA: Apply gated attention + convert to BF16 for O projection ──
+                    let o_size = nh * hd;
                     if *gated {
-                        let total = (nh * hd) as u32;
+                        // Fused: sigmoid(gate) * attn_out → BF16 (eliminates separate fp32_to_bf16)
+                        let total = o_size as u32;
                         let threads = 256u32;
                         let blocks = (total + threads - 1) / threads;
                         unsafe {
-                            k.apply_gated_attn.clone().launch(
+                            k.apply_gated_attn_bf16.clone().launch(
                                 LaunchConfig {
                                     grid_dim: (blocks, 1, 1),
                                     block_dim: (threads, 1, 1),
                                     shared_mem_bytes: 0,
                                 },
                                 (
-                                    *graph.d_gqa_out.device_ptr(),
-                                    *graph.d_la_qkvz.device_ptr(),
-                                    (nh * hd) as i32,
+                                    *graph.d_scratch.device_ptr(),      // BF16 output
+                                    *graph.d_gqa_out.device_ptr(),      // FP32 attention output
+                                    *graph.d_la_qkvz.device_ptr(),      // FP32 gate values
+                                    o_size as i32,
                                 ),
-                            ).map_err(|e| format!("apply_gated_attn[{}]: {:?}", layer_idx, e))?;
+                            ).map_err(|e| format!("apply_gated_attn_bf16[{}]: {:?}", layer_idx, e))?;
                         }
-                    }
-
-                    // ── GQA: O projection ──
-                    // d_gqa_out is FP32 [nh * hd]. Convert to BF16, then GEMV.
-                    let o_size = nh * hd;
-                    {
+                    } else {
+                        // Non-gated: just convert FP32 → BF16
                         unsafe {
                             k.fp32_to_bf16.clone().launch(
                                 LaunchConfig::for_num_elems(o_size as u32),
@@ -6979,6 +6958,8 @@ impl GpuDecodeStore {
                             ).map_err(|e| format!("fp32_to_bf16 gqa out[{}]: {:?}", layer_idx, e))?;
                         }
                     }
+
+                    // ── GQA: O projection ──
                     let ow = &graph.weights[*o_proj];
                     self.gemv_bf16_internal(
                         ow,
@@ -8244,30 +8225,20 @@ impl GpuDecodeStore {
                             }
                         }
 
-                        // Gated RMSNorm + SiLU
+                        // Gated RMSNorm + SiLU → BF16 directly → batch_attn_out[t]
                         {
                             let threads = 256u32;
                             let smem = (dv_ as u32 + 32) * 4;
-                            let f = self.device.get_func(MODULE_NAME, "gated_rmsnorm_silu")
-                                .ok_or_else(|| "gated_rmsnorm_silu not found".to_string())?;
+                            let out_ptr = d_bao_ptr + (t * gated_size * 2) as u64;
+                            let f = self.device.get_func(MODULE_NAME, "gated_rmsnorm_silu_bf16")
+                                .ok_or_else(|| "gated_rmsnorm_silu_bf16 not found".to_string())?;
                             unsafe {
                                 f.launch(
                                     LaunchConfig { grid_dim: (nv_ as u32, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: smem },
-                                    (*graph.d_la_conv_out.device_ptr(), *graph.d_la_ba.device_ptr(),
+                                    (out_ptr, *graph.d_la_ba.device_ptr(),
                                      *graph.d_la_gated_out.device_ptr(), *norm_weight_ptr, eps,
                                      nv_ as i32, dv_ as i32),
-                                ).map_err(|e| format!("batch gated_norm[{}][{}]: {:?}", layer_idx, t, e))?;
-                            }
-                        }
-
-                        // Convert attention output to BF16 → batch_attn_out[t]
-                        {
-                            let out_ptr = d_bao_ptr + (t * gated_size * 2) as u64;
-                            unsafe {
-                                k.fp32_to_bf16.clone().launch(
-                                    LaunchConfig::for_num_elems(gated_size as u32),
-                                    (out_ptr, *graph.d_la_conv_out.device_ptr(), gated_size as i32),
-                                ).map_err(|e| format!("batch fp32_to_bf16[{}][{}]: {:?}", layer_idx, t, e))?;
+                                ).map_err(|e| format!("batch gated_norm_bf16[{}][{}]: {:?}", layer_idx, t, e))?;
                             }
                         }
                     } // end per-token LA loop
@@ -8456,24 +8427,19 @@ impl GpuDecodeStore {
                                 }
                             }
 
-                            // Gated attention
+                            // Gated attention + BF16 conversion (or just BF16 conversion)
+                            let out_ptr = d_bao_ptr + (t * o_size * 2) as u64;
                             if is_gated {
-                                let total = (nh * hd) as u32;
+                                let total = o_size as u32;
                                 let threads = 256u32;
                                 let blocks = (total + threads - 1) / threads;
-                                let gate_fn = self.device.get_func(MODULE_NAME, "apply_gated_attn")
-                                    .ok_or_else(|| "apply_gated_attn not found".to_string())?;
                                 unsafe {
-                                    gate_fn.launch(
+                                    k.apply_gated_attn_bf16.clone().launch(
                                         LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
-                                        (*graph.d_gqa_out.device_ptr(), *graph.d_la_qkvz.device_ptr(), (nh * hd) as i32),
-                                    ).map_err(|e| format!("batch gated_attn[{}][{}]: {:?}", layer_idx, t, e))?;
+                                        (out_ptr, *graph.d_gqa_out.device_ptr(), *graph.d_la_qkvz.device_ptr(), o_size as i32),
+                                    ).map_err(|e| format!("batch gated_attn_bf16[{}][{}]: {:?}", layer_idx, t, e))?;
                                 }
-                            }
-
-                            // Convert attention output to BF16 → batch_attn_out[t]
-                            {
-                                let out_ptr = d_bao_ptr + (t * o_size * 2) as u64;
+                            } else {
                                 unsafe {
                                     k.fp32_to_bf16.clone().launch(
                                         LaunchConfig::for_num_elems(o_size as u32),
@@ -8632,29 +8598,29 @@ impl GpuDecodeStore {
                                 }
                             }
 
-                            // Gated attention (same as fused path)
+                            // Gated attention + BF16 conversion (or just BF16 conversion)
                             if is_gated {
-                                let total = (nh * hd) as u32;
+                                let total = o_size as u32;
                                 let threads = 256u32;
                                 let blocks = (total + threads - 1) / threads;
-                                let gate_fn = self.device.get_func(MODULE_NAME, "apply_gated_attn")
-                                    .ok_or_else(|| "apply_gated_attn not found".to_string())?;
                                 unsafe {
-                                    gate_fn.launch(
+                                    k.apply_gated_attn_bf16.clone().launch(
                                         LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
-                                        (*graph.d_gqa_out.device_ptr(), *graph.d_la_qkvz.device_ptr(), (nh * hd) as i32),
-                                    ).map_err(|e| format!("batch gated_attn[{}][{}]: {:?}", layer_idx, t, e))?;
+                                        (*graph.d_scratch.device_ptr(), *graph.d_gqa_out.device_ptr(),
+                                         *graph.d_la_qkvz.device_ptr(), o_size as i32),
+                                    ).map_err(|e| format!("batch gated_attn_bf16[{}][{}]: {:?}", layer_idx, t, e))?;
                                 }
-                            }
-
-                            // O projection (per-token GEMV for non-fused path)
-                            {
+                            } else {
                                 unsafe {
                                     k.fp32_to_bf16.clone().launch(
                                         LaunchConfig::for_num_elems(o_size as u32),
                                         (*graph.d_scratch.device_ptr(), *graph.d_gqa_out.device_ptr(), o_size as i32),
                                     ).map_err(|e| format!("batch fp32_to_bf16_o[{}][{}]: {:?}", layer_idx, t, e))?;
                                 }
+                            }
+
+                            // O projection (per-token GEMV for non-fused path)
+                            {
                                 let ow = &graph.weights[*o_proj];
                                 self.gemv_bf16_internal(ow, *graph.d_scratch.device_ptr(), hidden_ptr)?;
                             }
