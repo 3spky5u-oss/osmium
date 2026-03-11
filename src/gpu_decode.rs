@@ -5888,6 +5888,15 @@ impl GpuDecodeStore {
                                 let dummy_base = graph.d_dummy_expert.as_ref()
                                     .map(|b| *b.device_ptr()).unwrap_or(0);
 
+                                // Validate: layer_idx must be within d_expert_ptrs bounds
+                                let table_entries = hcs.d_expert_ptrs_nl * hcs.d_expert_ptrs_ne * 4;
+                                let max_access = (layer_idx * ne + (ne - 1)) * 4 + 3;
+                                if max_access >= table_entries {
+                                    return Err(format!(
+                                        "expert_classify[{}]: OOB layer_idx={} ne={} max_access={} table={}",
+                                        layer_idx, layer_idx, ne, max_access, table_entries));
+                                }
+
                                 unsafe {
                                     k.expert_classify_prepare.clone().launch(
                                         LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 },
@@ -5901,9 +5910,10 @@ impl GpuDecodeStore {
                                             ne as i32,
                                             topk as i32,
                                             max_ept as i32,
-                                            dummy_base,      // dummy_ptr (same for all 4 arrays)
+                                            dummy_base,
                                         ),
-                                    ).map_err(|e| format!("expert_classify[{}]: {:?}", layer_idx, e))?;
+                                    ).map_err(|e| format!("expert_classify[{}]: ptrs=[ids={:#x} wts={:#x} eptrs={:#x} upload={:#x} cold={:#x} dummy={:#x}] err={:?}",
+                                        layer_idx, topk_ids_dptr, topk_wts_dptr, d_eptrs_ptr, d_upload_ptr, cold_buf_dptr, dummy_base, e))?;
                                 }
                             }
                         }
@@ -13623,8 +13633,12 @@ impl GpuDecodeStore {
         hcs.replacement_pct = replacement_pct as f32 / 100.0;
         hcs.rebalance_enabled = true;
 
-        // Enable GPU-side route sync if we have both d_expert_ptrs and mapped_cold_buf
         let gpu_rs = hcs.d_expert_ptrs.is_some() && graph.mapped_cold_buf.is_some();
+        if gpu_rs {
+            log::info!("GPU-side route sync ENABLED: d_expert_ptrs={} entries, mapped_cold_buf={} bytes",
+                hcs.d_expert_ptrs_nl * hcs.d_expert_ptrs_ne * 4,
+                graph.mapped_cold_buf.as_ref().map(|m| m.size).unwrap_or(0));
+        }
         graph.hcs = Some(hcs);
         graph.gpu_route_sync = gpu_rs;
 

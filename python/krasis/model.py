@@ -3849,7 +3849,6 @@ class KrasisModel:
         _awq_template = None
         if attn_quant == "awq":
             from krasis.awq_calibrate import load_template
-            import os
             template_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
                 os.path.abspath(__file__)))), "templates", "attention")
             _awq_template = load_template(template_dir, self.cfg.model_path)
@@ -3924,13 +3923,17 @@ class KrasisModel:
                     del w_cpu
 
                     # Step 3: Create GPU tensors from Rust-repacked data
+                    # CRITICAL: scales are raw BF16 bits stored as u16 — must use
+                    # .view(torch.bfloat16) to reinterpret bits, NOT .to(torch.bfloat16)
+                    # which would numerically convert (e.g. 15890 -> BF16(15872.0) instead
+                    # of BF16(0.1429)).
                     import numpy as np
                     packed_np = np.frombuffer(packed_bytes, dtype=np.uint32)
                     scales_np = np.frombuffer(scales_bytes, dtype=np.uint16)
                     repacked = torch.from_numpy(packed_np.copy()).to(
                         dtype=torch.int32, device=device)
-                    scale_perm = torch.from_numpy(scales_np.copy()).to(
-                        dtype=torch.bfloat16, device=device)
+                    scale_raw = torch.from_numpy(scales_np.copy()).to(torch.int16)
+                    scale_perm = scale_raw.view(torch.bfloat16).to(device)
                     # Reshape for gptq_marlin_gemm: packed [K/16, pack_factor*N], scales [K/gs, N]
                     if use_int4:
                         repacked = repacked.reshape(k // 16, 2 * n)
