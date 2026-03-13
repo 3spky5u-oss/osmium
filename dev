@@ -337,9 +337,10 @@ do_release_test() {
 }
 
 do_benchmark() {
-    [[ $# -lt 1 ]] && err "Usage: ./dev benchmark <config>"
+    [[ $# -lt 1 ]] && err "Usage: ./dev benchmark <config> [extra server args...]"
     local conf
     conf=$(resolve_config "$1")
+    shift
     cleanup_gpu
     auto_rebuild
     local logfile
@@ -347,7 +348,7 @@ do_benchmark() {
     mkdir -p "$SCRIPT_DIR/logs/benchmarks"
     info "Running standard benchmark: $conf"
     info "Log: $logfile"
-    "$PYTHON" -m krasis.server --config "$conf" --benchmark-only 2>&1 | tee "$logfile"
+    "$PYTHON" -m krasis.server --config "$conf" --benchmark-only "$@" 2>&1 | tee "$logfile"
     info "Benchmark log saved: $logfile"
 }
 

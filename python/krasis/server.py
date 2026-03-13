@@ -1252,8 +1252,6 @@ def main():
                 gpu0_ranking,
                 hard_budget_mb=gpu0_hard,
                 soft_budget_mb=gpu0_soft,
-                window_size=10,
-                replacement_pct=25,
                 safety_margin_mb=SAFETY_MARGIN_MB,
             )
             hcs_elapsed = time.time() - t_hcs
@@ -1448,8 +1446,6 @@ def main():
                         aux_ranking,
                         hard_budget_mb=aux_hard,
                         soft_budget_mb=aux_soft,
-                        window_size=10,
-                        replacement_pct=25,
                         safety_margin_mb=SAFETY_MARGIN_MB,
                     )
                     _detail(f"Aux HCS: {result}")

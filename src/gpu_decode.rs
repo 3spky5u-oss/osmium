@@ -420,23 +420,8 @@ struct HcsState {
     /// Safety margin in MB — minimum free VRAM to maintain.
     safety_margin_mb: usize,
 
-    // ── Dynamic eviction: sliding window activation tracking ──
-    /// Bitset for current prompt: 1 bit per (layer_idx * num_experts + expert_idx).
-    current_activations: Vec<u64>,
-    /// Max experts per layer (stride for bit indexing).
+    /// Max experts per layer (stride for flat indexing in cache_fast, heatmap, etc.).
     num_experts_per_layer: usize,
-    /// Sliding window of recent prompt activation bitsets.
-    prompt_history: std::collections::VecDeque<Vec<u64>>,
-    /// Window size (number of prompts to keep).
-    window_size: usize,
-    /// Fraction of pool experts to consider replacing per rebalance (0.0-1.0).
-    replacement_pct: f32,
-    /// Whether dynamic rebalancing is enabled.
-    rebalance_enabled: bool,
-    /// Cumulative stats.
-    total_evictions: u64,
-    total_promotions: u64,
-    total_rebalances: u64,
 
     // ── GPU-side expert pointer table (for CUDA graph capture) ──
     /// Flat GPU buffer: [num_layers * num_experts * 4] u64 pointers.
@@ -489,15 +474,7 @@ impl HcsState {
             soft_reload_stream: None, // CudaStream
             soft_reload_entries: Vec::new(),
             safety_margin_mb: 1000,
-            current_activations: Vec::new(),
             num_experts_per_layer: 0,
-            prompt_history: std::collections::VecDeque::new(),
-            window_size: 10,
-            replacement_pct: 0.25,
-            rebalance_enabled: false,
-            total_evictions: 0,
-            total_promotions: 0,
-            total_rebalances: 0,
             d_expert_ptrs: None,
             d_expert_ptrs_ne: 0,
             d_expert_ptrs_nl: 0,
@@ -641,36 +618,6 @@ impl HcsState {
             if idx < self.heatmap_flat.len() {
                 self.heatmap_flat[idx] += 1;
             }
-        }
-        // Set bit in current prompt activation bitset
-        if self.rebalance_enabled && self.num_experts_per_layer > 0 {
-            let bit_idx = layer * self.num_experts_per_layer + expert;
-            let word = bit_idx / 64;
-            let bit = bit_idx % 64;
-            if word < self.current_activations.len() {
-                self.current_activations[word] |= 1u64 << bit;
-            }
-        }
-    }
-
-    /// Clear current prompt activation bitset (call at start of each prompt).
-    fn begin_prompt(&mut self) {
-        if self.rebalance_enabled {
-            for w in self.current_activations.iter_mut() {
-                *w = 0;
-            }
-        }
-    }
-
-    /// Push current prompt's activations into the sliding window.
-    fn finish_prompt(&mut self) {
-        if !self.rebalance_enabled || self.current_activations.is_empty() {
-            return;
-        }
-        let snapshot = self.current_activations.clone();
-        self.prompt_history.push_back(snapshot);
-        while self.prompt_history.len() > self.window_size {
-            self.prompt_history.pop_front();
         }
     }
 
@@ -3258,25 +3205,20 @@ impl GpuDecodeStore {
     ///
     /// Allocates a contiguous VRAM pool and fills it with the hottest experts
     /// from the provided ranking (list of (layer_idx, expert_idx) pairs, sorted
-    /// hottest-first). Enables sliding-window activation tracking for between-prompt
-    /// rebalancing.
+    /// hottest-first).
     ///
     /// Args:
     ///   ranking: list of (layer_idx, expert_idx) tuples, hottest first
     ///   budget_mb: VRAM budget for pool (0 = auto from free VRAM)
     ///   headroom_mb: VRAM to keep free (only used when budget_mb=0)
-    ///   window_size: number of recent prompts to track (default 10)
-    ///   replacement_pct: fraction of pool to consider replacing per rebalance (default 25)
-    #[pyo3(signature = (ranking, budget_mb=0, headroom_mb=500, window_size=10, replacement_pct=25))]
+    #[pyo3(signature = (ranking, budget_mb=0, headroom_mb=500))]
     fn hcs_pool_init(
         &mut self,
         ranking: Vec<(usize, usize)>,
         budget_mb: usize,
         headroom_mb: usize,
-        window_size: usize,
-        replacement_pct: usize,
     ) -> PyResult<String> {
-        self.hcs_pool_init_internal(ranking, budget_mb, headroom_mb, window_size, replacement_pct)
+        self.hcs_pool_init_internal(ranking, budget_mb, headroom_mb)
     }
 
     /// Store four-point VRAM calibration data from startup measurement.
@@ -3337,20 +3279,17 @@ impl GpuDecodeStore {
     /// hard_budget_mb: experts that survive worst-case prefill
     /// soft_budget_mb: additional experts loaded during decode, evicted for prefill.
     /// safety_margin_mb: minimum free VRAM to maintain (default 1000).
-    #[pyo3(signature = (ranking, hard_budget_mb, soft_budget_mb,
-                        window_size=10, replacement_pct=25, safety_margin_mb=1000))]
+    #[pyo3(signature = (ranking, hard_budget_mb, soft_budget_mb, safety_margin_mb=1000))]
     fn hcs_pool_init_tiered(
         &mut self,
         ranking: Vec<(usize, usize)>,
         hard_budget_mb: usize,
         soft_budget_mb: usize,
-        window_size: usize,
-        replacement_pct: usize,
         safety_margin_mb: usize,
     ) -> PyResult<String> {
         // First, init the hard pool using existing logic
         let result = self.hcs_pool_init_internal(
-            ranking.clone(), hard_budget_mb, 0, window_size, replacement_pct,
+            ranking.clone(), hard_budget_mb, 0,
         )?;
 
         {
@@ -3494,17 +3433,15 @@ impl GpuDecodeStore {
         Ok(msg)
     }
 
-    /// Get dynamic HCS eviction statistics.
+    /// Get HCS pool statistics.
     fn hcs_dynamic_stats(&self) -> PyResult<String> {
         let graph = self.graph.as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
         let hcs = graph.hcs.as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call init_hcs first"))?;
         Ok(format!(
-            "HCS dynamic: pool={}/{} slots, window={}/{} prompts, rebalances={}, evictions={}, promotions={}, hit_rate={:.1}%",
+            "HCS: pool={}/{} slots, hit_rate={:.1}%",
             hcs.pool_num_slots - hcs.pool_free_slots.len(), hcs.pool_num_slots,
-            hcs.prompt_history.len(), hcs.window_size,
-            hcs.total_rebalances, hcs.total_evictions, hcs.total_promotions,
             hcs.hit_rate() * 100.0,
         ))
     }
@@ -4023,14 +3960,6 @@ impl GpuDecodeStore {
             rng_state
         };
 
-        // Begin activation tracking on both stores
-        if let Some(ref mut hcs) = self.graph.as_mut().unwrap().hcs {
-            hcs.begin_prompt();
-        }
-        if let Some(ref mut hcs) = aux_store.graph.as_mut().unwrap().hcs {
-            hcs.begin_prompt();
-        }
-
         let mut next_token = first_token;
         let mut tokens = Vec::with_capacity(max_tokens);
         let mut seen_tokens: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -4095,14 +4024,6 @@ impl GpuDecodeStore {
                 tokens.len(), elapsed, tps);
         }
         self.last_decode_elapsed = elapsed;
-
-        // End activation tracking
-        if let Some(ref mut hcs) = self.graph.as_mut().unwrap().hcs {
-            hcs.finish_prompt();
-        }
-        if let Some(ref mut hcs) = aux_store.graph.as_mut().unwrap().hcs {
-            hcs.finish_prompt();
-        }
 
         Ok(tokens)
     }
@@ -6118,24 +6039,6 @@ impl GpuDecodeStore {
                 }
             }
 
-            // Record activations from mapped activation buffer (post-sync)
-            if let Some(ref act_buf) = graph.mapped_activations {
-                let act_ptr = act_buf.host_ptr as *const i32;
-                let mut moe_seq = 0usize;
-                for &moe_layer_idx in &moe_indices {
-                    let topk = graph.moe_layers[moe_layer_idx].as_ref()
-                        .map(|m| m.topk).unwrap_or(10);
-                    for i in 0..topk {
-                        let eid = unsafe { *act_ptr.add(moe_seq * topk + i) };
-                        if eid >= 0 {
-                            if let Some(ref mut hcs) = graph.hcs {
-                                hcs.record_activation(moe_layer_idx, eid as usize);
-                            }
-                        }
-                    }
-                    moe_seq += 1;
-                }
-            }
 
             // D2H logits
             if do_final {
@@ -6187,21 +6090,12 @@ impl GpuDecodeStore {
 
                     let cold_count = unsafe { std::ptr::read_volatile(cold_ptr) } as usize;
 
-                    // Record activations for HCS heatmap (read topk IDs from pinned memory)
-                    if let Some(ref pm) = graph.pinned_topk_ids {
-                        let ids = pm.host_ptr as *const i32;
-                        for i in 0..topk {
-                            let eid = unsafe { *ids.add(i) };
-                            if eid >= 0 {
-                                if let Some(ref mut hcs) = graph.hcs {
-                                    hcs.record_activation(moe_layer_idx, eid as usize);
-                                }
-                            }
-                        }
-                    }
+                    // Count hot experts (topk - cold)
+                    graph.dma_hcs_experts += (topk - cold_count) as u64;
 
                     // DMA cold experts into VRAM buffers and update their d_batch_upload slots
                     if cold_count > 0 {
+                        graph.dma_cold_experts += cold_count as u64;
                         let moe_data = graph.moe_layers[moe_layer_idx].as_ref().unwrap();
 
                         for ci in 0..cold_count {
@@ -6305,10 +6199,6 @@ impl GpuDecodeStore {
                         let eid = eid as usize;
                         let weight = graph.h_topk_weights[i];
 
-                        if let Some(ref mut hcs) = graph.hcs {
-                            hcs.record_activation(moe_layer_idx, eid);
-                        }
-
                         let hcs_ptrs = if let Some(ref hcs) = graph.hcs {
                             hcs.get_fast(moe_layer_idx, eid)
                         } else { None };
@@ -6321,12 +6211,14 @@ impl GpuDecodeStore {
                                 graph.h_batch_w2_scales_ptrs[batch_count] = w2s;
                                 graph.h_batch_weights[batch_count] = weight;
                                 batch_count += 1;
+                                graph.dma_hcs_experts += 1;
                             }
                         } else {
                             cold_experts.push((i, eid, weight));
                         }
                     }
 
+                    graph.dma_cold_experts += cold_experts.len() as u64;
                     for (ci, &(_topk_pos, eid, weight)) in cold_experts.iter().enumerate() {
                         let expert = &moe_data.experts[eid];
 
@@ -7689,14 +7581,6 @@ impl GpuDecodeStore {
             rng_state
         };
 
-        // Begin activation tracking on both stores
-        if let Some(ref mut hcs) = self.graph.as_mut().unwrap().hcs {
-            hcs.begin_prompt();
-        }
-        if let Some(ref mut hcs) = aux_store.graph.as_mut().unwrap().hcs {
-            hcs.begin_prompt();
-        }
-
         let mut detok = crate::server::StreamDetokenizer::new(tokenizer);
         let mut seen_tokens: std::collections::HashSet<usize> = std::collections::HashSet::new();
         seen_tokens.insert(first_token);
@@ -8071,14 +7955,6 @@ impl GpuDecodeStore {
                 split_layer, num_layers - 1, avg_gpu1, avg_gpu1 / avg_total * 100.0,
                 avg_sample, avg_sample / avg_total * 100.0
             );
-        }
-
-        // End activation tracking
-        if let Some(ref mut hcs) = self.graph.as_mut().unwrap().hcs {
-            hcs.finish_prompt();
-        }
-        if let Some(ref mut hcs) = aux_store.graph.as_mut().unwrap().hcs {
-            hcs.finish_prompt();
         }
 
         generated
@@ -9124,14 +9000,6 @@ impl GpuDecodeStore {
                 expert_tokens.entry(eid as usize).or_default().push((t, weight));
             }
 
-            // Record HCS activation for each token's experts
-            for j in 0..topk {
-                let eid = graph.h_batch_topk_ids[t * topk + j];
-                if eid < 0 { continue; }
-                if let Some(ref mut hcs) = graph.hcs {
-                    hcs.record_activation(layer_idx, eid as usize);
-                }
-            }
         }
 
         // ── Step 3: Zero batch moe_out accumulators ──
@@ -9948,11 +9816,6 @@ impl GpuDecodeStore {
             rng_state
         };
 
-        // Begin activation tracking for this prompt's decode
-        if let Some(ref mut hcs) = self.graph.as_mut().unwrap().hcs {
-            hcs.begin_prompt();
-        }
-
         // Reset per-prompt timing accumulators
         {
             let g = self.graph.as_mut().unwrap();
@@ -10014,6 +9877,15 @@ impl GpuDecodeStore {
 
         // Track min VRAM free during decode
         let mut min_vram_free_bytes: usize = usize::MAX;
+
+        // Lightweight decode profiling (KRASIS_DECODE_PROFILE=1)
+        // Zero overhead when disabled — just a bool check per token.
+        let profile_enabled = std::env::var("KRASIS_DECODE_PROFILE").map(|v| v == "1").unwrap_or(false);
+        let profile_interval = 25usize;
+        let mut profile_last_step = 0usize;
+        let mut profile_last_time = Instant::now();
+        let mut profile_cold_total = 0u64;
+        let mut profile_hcs_total = 0u64;
 
         // Initialize CUDA graph infrastructure (GPU-side scalar buffers + dummy expert)
         {
@@ -10401,6 +10273,26 @@ impl GpuDecodeStore {
                 step += 1;
                 next_token = target_pred;
 
+                // Lightweight profiling checkpoint
+                if profile_enabled && step > 0 && step % profile_interval == 0 {
+                    let now = Instant::now();
+                    let window_secs = (now - profile_last_time).as_secs_f64();
+                    let window_tokens = (step - profile_last_step) as f64;
+                    let window_tps = window_tokens / window_secs;
+                    let window_ms = window_secs * 1000.0 / window_tokens;
+                    let g = self.graph.as_ref().unwrap();
+                    let cold = g.dma_cold_experts - profile_cold_total;
+                    let hcs = g.dma_hcs_experts - profile_hcs_total;
+                    let cold_per_tok = cold as f64 / window_tokens;
+                    let hcs_per_tok = hcs as f64 / window_tokens;
+                    eprintln!("  [profile] tok {}-{}: {:.1} tok/s ({:.1}ms/tok)  cold={:.0}/tok hcs={:.0}/tok",
+                        profile_last_step + 1, step, window_tps, window_ms, cold_per_tok, hcs_per_tok);
+                    profile_last_step = step;
+                    profile_last_time = now;
+                    profile_cold_total = g.dma_cold_experts;
+                    profile_hcs_total = g.dma_hcs_experts;
+                }
+
                 let mut text = detok.add(target_pred as u32);
                 let finish_reason = if stop_set.contains(&target_pred) {
                     Some("stop")
@@ -10605,17 +10497,6 @@ impl GpuDecodeStore {
                     avg_norm, avg_dense, avg_lm,
                     avg_cold, dma_mb, est_pcie_bw
                 );
-            }
-        }
-
-        // Finish activation tracking and run dynamic rebalance
-        if let Some(ref mut hcs) = self.graph.as_mut().unwrap().hcs {
-            hcs.finish_prompt();
-        }
-        if generated > 0 {
-            let (swapped, rebalance_ms) = self.hcs_rebalance_internal();
-            if swapped > 0 {
-                log::info!("HCS rebalance after decode: {} experts swapped in {:.1}ms", swapped, rebalance_ms);
             }
         }
 
@@ -12065,11 +11946,6 @@ impl GpuDecodeStore {
             let eid = eid as usize;
             let weight = graph.h_topk_weights[i];
 
-            // Record activation for HCS heatmap
-            if let Some(ref mut hcs) = graph.hcs {
-                hcs.record_activation(layer_idx, eid);
-            }
-
             // Check HCS cache (fast flat array lookup)
             let hcs_ptrs = if let Some(ref hcs) = graph.hcs {
                 hcs.get_fast(layer_idx, eid)
@@ -12087,7 +11963,7 @@ impl GpuDecodeStore {
                     graph.h_batch_weights[hcs_batch_count] = weight;
                     hcs_batch_count += 1;
                     hcs_hits += 1;
-                    if timing { graph.dma_hcs_experts += 1; }
+                    graph.dma_hcs_experts += 1;
                 }
             } else {
                 if dma_count < 10 {
@@ -12277,12 +12153,12 @@ impl GpuDecodeStore {
                 // Expert N DMAs to buf[slot], expert N-1 computes from buf[prev_slot].
                 // The copy engine and compute SMs run concurrently on different buffers.
                 apfl_misses += 1;
+                graph.dma_cold_experts += 1;
                 if timing {
                     let dma_bytes = expert.w13_packed_bytes + expert.w13_scales_bytes
                                   + expert.w2_packed_bytes + expert.w2_scales_bytes;
                     graph.dma_bytes_total += dma_bytes as u64;
                     graph.dma_call_count += 4;
-                    graph.dma_cold_experts += 1;
                 }
 
                 let slot = (dma_expert_count % 2) as usize;
@@ -12419,12 +12295,12 @@ impl GpuDecodeStore {
             } else {
                 // ── Fallback: legacy single-buffer DMA (no ping-pong) ──
                 apfl_misses += 1;
+                graph.dma_cold_experts += 1;
                 if timing {
                     let dma_bytes = expert.w13_packed_bytes + expert.w13_scales_bytes
                                   + expert.w2_packed_bytes + expert.w2_scales_bytes;
                     graph.dma_bytes_total += dma_bytes as u64;
                     graph.dma_call_count += 4;
-                    graph.dma_cold_experts += 1;
                 }
 
                 unsafe {
@@ -13569,14 +13445,12 @@ impl GpuDecodeStore {
         Ok(msg)
     }
 
-    /// Initialize pool-based HCS with dynamic eviction support.
+    /// Initialize pool-based HCS.
     fn hcs_pool_init_internal(
         &mut self,
         ranking: Vec<(usize, usize)>,
         budget_mb: usize,
         headroom_mb: usize,
-        window_size: usize,
-        replacement_pct: usize,
     ) -> PyResult<String> {
         let graph = self.graph.as_mut()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
@@ -13629,9 +13503,6 @@ impl GpuDecodeStore {
             .max()
             .unwrap_or(0);
         let num_layers = graph.moe_layers.len();
-        let total_bits = num_layers * num_experts_per_layer;
-        let bitset_words = (total_bits + 63) / 64;
-
         // Total unique experts
         let total_experts: usize = graph.moe_layers.iter()
             .filter_map(|m| m.as_ref())
@@ -13762,10 +13633,6 @@ impl GpuDecodeStore {
         }
         hcs.pool_free_slots = free_slots;
         hcs.pool_slot_to_expert = slot_to_expert;
-        hcs.current_activations = vec![0u64; bitset_words];
-        hcs.window_size = window_size;
-        hcs.replacement_pct = replacement_pct as f32 / 100.0;
-        hcs.rebalance_enabled = true;
 
         // GPU-side route sync: disabled. Benchmarking showed zero speed gain (+0.4%,
         // within noise) because the classify kernel runs at end of graph segment — by the
@@ -13880,174 +13747,13 @@ impl GpuDecodeStore {
         let mapped_reads = graph.mapped_reads_active;
         let msg = format!(
             "HCS pool: {}/{} experts loaded in {:.2}s ({:.1}% coverage), {:.1} MB VRAM, \
-             {} free slots, window={}, replace={:.0}%, gpu_route_sync={}, mapped_reads={}",
+             {} free slots, gpu_route_sync={}, mapped_reads={}",
             loaded, total_experts, load_elapsed, pct,
             pool_alloc_bytes as f64 / (1024.0 * 1024.0),
-            num_slots - loaded, window_size, replacement_pct, gpu_rs, mapped_reads,
+            num_slots - loaded, gpu_rs, mapped_reads,
         );
         log::info!("{}", msg);
         Ok(msg)
-    }
-
-    /// Rebalance HCS pool based on sliding window activation scores.
-    /// Evicts low-scoring pool entries and promotes high-scoring cold experts.
-    /// Called automatically after each prompt's decode completes.
-    fn hcs_rebalance_internal(&mut self) -> (usize, f64) {
-        // Take HCS out of graph to avoid borrow conflicts with moe_layers
-        let graph = match self.graph.as_mut() {
-            Some(g) => g,
-            None => return (0, 0.0),
-        };
-        let mut hcs = match graph.hcs.take() {
-            Some(h) => h,
-            None => return (0, 0.0),
-        };
-
-        if !hcs.rebalance_enabled || hcs.prompt_history.len() < 2 || hcs.pool_buf.is_none() {
-            graph.hcs = Some(hcs);
-            return (0, 0.0);
-        }
-
-        let t0 = std::time::Instant::now();
-        let num_experts = hcs.num_experts_per_layer;
-        let window = &hcs.prompt_history;
-
-        // Score all experts: count prompts in window where expert was active
-        let mut scored_cached: Vec<(usize, usize, u32)> = Vec::new();
-        let mut scored_cold: Vec<(usize, usize, u32)> = Vec::new();
-
-        for (layer_idx, moe_opt) in graph.moe_layers.iter().enumerate() {
-            if let Some(moe) = moe_opt {
-                for eid in 0..moe.num_experts {
-                    let bit_idx = layer_idx * num_experts + eid;
-                    let word = bit_idx / 64;
-                    let bit = bit_idx % 64;
-
-                    let score: u32 = window.iter()
-                        .map(|bits| {
-                            if word < bits.len() { ((bits[word] >> bit) & 1) as u32 } else { 0 }
-                        })
-                        .sum();
-
-                    if let Some(entry) = hcs.cache.get(&(layer_idx, eid)) {
-                        if entry.pool_slot.is_some() {
-                            scored_cached.push((layer_idx, eid, score));
-                        }
-                        // External entries are never evicted
-                    } else {
-                        scored_cold.push((layer_idx, eid, score));
-                    }
-                }
-            }
-        }
-
-        // Sort: cached worst-first, cold best-first
-        scored_cached.sort_by_key(|x| x.2);
-        scored_cold.sort_by(|a, b| b.2.cmp(&a.2));
-
-        let max_replace = ((hcs.pool_num_slots as f32 * hcs.replacement_pct) as usize)
-            .min(scored_cached.len())
-            .min(scored_cold.len());
-
-        // Only replace where cold expert has strictly higher score
-        let mut actual = 0usize;
-        for i in 0..max_replace {
-            if scored_cold[i].2 > scored_cached[i].2 {
-                actual += 1;
-            } else {
-                break;
-            }
-        }
-
-        if actual == 0 {
-            hcs.total_rebalances += 1;
-            graph.hcs = Some(hcs);
-            let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
-            return (0, elapsed);
-        }
-
-        // Perform swaps
-        let pool_base = *hcs.pool_buf.as_ref().unwrap().device_ptr();
-        let slot_size = hcs.pool_slot_size;
-
-        for i in 0..actual {
-            let (ev_layer, ev_eid, _ev_score) = scored_cached[i];
-            let (pr_layer, pr_eid, _pr_score) = scored_cold[i];
-
-            // Evict: remove from cache, reclaim slot
-            hcs.cache_fast_clear(ev_layer, ev_eid);
-            let evicted = hcs.cache.remove(&(ev_layer, ev_eid)).unwrap();
-            let slot = evicted.pool_slot.unwrap();
-            hcs.pool_slot_to_expert[slot] = None;
-            hcs.num_cached -= 1;
-
-            // Promote: DMA new expert into the freed slot
-            let moe = graph.moe_layers[pr_layer].as_ref().unwrap();
-            let expert = &moe.experts[pr_eid];
-            let dst = pool_base + (slot as u64 * slot_size as u64);
-
-            let w13p_off = 0u64;
-            let w13s_off = expert.w13_packed_bytes as u64;
-            let w2p_off = w13s_off + expert.w13_scales_bytes as u64;
-            let w2s_off = w2p_off + expert.w2_packed_bytes as u64;
-
-            let mut dma_ok = true;
-            unsafe {
-                for &(off, src_ptr, bytes) in &[
-                    (w13p_off, expert.w13_packed_ptr, expert.w13_packed_bytes),
-                    (w13s_off, expert.w13_scales_ptr, expert.w13_scales_bytes),
-                    (w2p_off, expert.w2_packed_ptr, expert.w2_packed_bytes),
-                    (w2s_off, expert.w2_scales_ptr, expert.w2_scales_bytes),
-                ] {
-                    let err = cuda_sys::lib().cuMemcpyHtoD_v2(
-                        dst + off,
-                        src_ptr as *const std::ffi::c_void,
-                        bytes,
-                    );
-                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                        log::warn!("HCS rebalance H2D failed for L{}E{}: {:?}", pr_layer, pr_eid, err);
-                        dma_ok = false;
-                        break;
-                    }
-                }
-            }
-
-            if dma_ok {
-                let entry = HcsCacheEntry {
-                    d_buf: None,
-                    w13_packed_offset: 0, w13_packed_size: 0,
-                    w13_scales_offset: 0, w13_scales_size: 0,
-                    w2_packed_offset: 0, w2_packed_size: 0,
-                    w2_scales_offset: 0, w2_scales_size: 0,
-                    ext_w13_packed: dst + w13p_off,
-                    ext_w13_scales: dst + w13s_off,
-                    ext_w2_packed: dst + w2p_off,
-                    ext_w2_scales: dst + w2s_off,
-                    pool_slot: Some(slot),
-                };
-                hcs.cache_fast_set(pr_layer, pr_eid, &entry);
-                hcs.cache.insert((pr_layer, pr_eid), entry);
-                hcs.pool_slot_to_expert[slot] = Some((pr_layer, pr_eid));
-                hcs.num_cached += 1;
-            } else {
-                // DMA failed: return slot to free list
-                hcs.pool_free_slots.push(slot);
-            }
-        }
-
-        hcs.total_evictions += actual as u64;
-        hcs.total_promotions += actual as u64;
-        hcs.total_rebalances += 1;
-
-        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        log::info!(
-            "HCS rebalance #{}: swapped {}/{} experts in {:.1}ms (window={} prompts, {} cached)",
-            hcs.total_rebalances, actual, max_replace, elapsed_ms,
-            hcs.prompt_history.len(), hcs.num_cached,
-        );
-
-        graph.hcs = Some(hcs);
-        (actual, elapsed_ms)
     }
 
     fn hcs_pin_expert_internal(&mut self, layer_idx: usize, expert_idx: usize) -> PyResult<bool> {
