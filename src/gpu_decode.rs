@@ -5734,8 +5734,10 @@ impl GpuDecodeStore {
                         // GQA attention
                         {
                             let threads = 256u32;
-                            let q_smem = (hd as u32) * 4;
-                            let shared_mem_bytes = q_smem + 128;
+                            let q_smem = (hd as u32) * 4;       // s_q[head_dim]
+                            let reduce_smem = 32 * 4;            // smem_reduce[num_warps] (256/32=8, pad to 32)
+                            let tile_smem = 4096 * 4;            // smem_weights[GQA_TILE_SIZE]
+                            let shared_mem_bytes = q_smem + reduce_smem + tile_smem;
                             unsafe {
                                 k.gqa_attention_g.clone().launch(
                                     LaunchConfig {

@@ -14,7 +14,18 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_DIR="$SCRIPT_DIR/.venv"
+
+# Prefer conda env if available (dev machines). The conda env has the
+# correct .so built by ./dev build. Using a separate .venv with a
+# different Python version loads a stale/wrong .so.
+CONDA_ENV="$HOME/miniconda3/envs/ktransformers"
+USE_CONDA=false
+if [[ -x "$CONDA_ENV/bin/python" ]]; then
+    USE_CONDA=true
+    VENV_DIR="$CONDA_ENV"
+else
+    VENV_DIR="$SCRIPT_DIR/.venv"
+fi
 
 # Detect platform: Windows (Git Bash/MSYS/Cygwin) uses Scripts/, Unix uses bin/
 if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* || "$(uname -s)" == CYGWIN* ]]; then
@@ -51,7 +62,7 @@ PASSTHROUGH_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip-setup) SKIP_SETUP=true; PASSTHROUGH_ARGS+=("$1"); shift ;;
-        --venv)       VENV_DIR="$2"; PASSTHROUGH_ARGS+=("$1" "$2"); shift 2 ;;
+        --venv)       VENV_DIR="$2"; USE_CONDA=false; PASSTHROUGH_ARGS+=("$1" "$2"); shift 2 ;;
         *)            PASSTHROUGH_ARGS+=("$1"); shift ;;
     esac
 done
@@ -73,44 +84,54 @@ phase_setup() {
 
     header "Phase 1: Setup"
 
-    # Python 3.10+
-    local py_version
-    if ! command -v python3 &>/dev/null; then
-        err "python3 not found. Install Python 3.10+."
-        exit 1
-    fi
-    py_version=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-    local py_major py_minor
-    py_major=$(echo "$py_version" | cut -d. -f1)
-    py_minor=$(echo "$py_version" | cut -d. -f2)
-    if (( py_major < 3 || (py_major == 3 && py_minor < 10) )); then
-        err "Python $py_version found, but 3.10+ is required."
-        exit 1
-    fi
-    info "Python $py_version"
+    if $USE_CONDA; then
+        # Dev machine: use conda env directly, skip venv creation
+        local py_version
+        py_version=$("$VENV_DIR/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+        info "Using conda env: $VENV_DIR (Python $py_version)"
+        export PATH="$VENV_DIR/bin:$PATH"
+    else
+        # End-user: create/activate .venv as usual
 
-    # Venv
-    if [[ ! -d "$VENV_DIR" ]] || [[ ! -f "$VENV_DIR/$VENV_BIN/activate" ]]; then
-        # Clean up partial venv if activate is missing
-        if [[ -d "$VENV_DIR" ]] && [[ ! -f "$VENV_DIR/$VENV_BIN/activate" ]]; then
-            warn "Incomplete venv detected, recreating..."
-            rm -rf "$VENV_DIR"
-        fi
-        info "Creating virtual environment at $VENV_DIR ..."
-        if ! python3 -m venv "$VENV_DIR" 2>&1; then
-            err "Failed to create virtual environment."
-            err "On Ubuntu/Debian, install: sudo apt install python${py_version}-venv"
+        # Python 3.10+
+        local py_version
+        if ! command -v python3 &>/dev/null; then
+            err "python3 not found. Install Python 3.10+."
             exit 1
         fi
-        if [[ ! -f "$VENV_DIR/$VENV_BIN/activate" ]]; then
-            err "Virtual environment created but activate script is missing."
-            err "On Ubuntu/Debian, install: sudo apt install python${py_version}-venv"
-            rm -rf "$VENV_DIR"
+        py_version=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+        local py_major py_minor
+        py_major=$(echo "$py_version" | cut -d. -f1)
+        py_minor=$(echo "$py_version" | cut -d. -f2)
+        if (( py_major < 3 || (py_major == 3 && py_minor < 10) )); then
+            err "Python $py_version found, but 3.10+ is required."
             exit 1
         fi
+        info "Python $py_version"
+
+        # Venv
+        if [[ ! -d "$VENV_DIR" ]] || [[ ! -f "$VENV_DIR/$VENV_BIN/activate" ]]; then
+            # Clean up partial venv if activate is missing
+            if [[ -d "$VENV_DIR" ]] && [[ ! -f "$VENV_DIR/$VENV_BIN/activate" ]]; then
+                warn "Incomplete venv detected, recreating..."
+                rm -rf "$VENV_DIR"
+            fi
+            info "Creating virtual environment at $VENV_DIR ..."
+            if ! python3 -m venv "$VENV_DIR" 2>&1; then
+                err "Failed to create virtual environment."
+                err "On Ubuntu/Debian, install: sudo apt install python${py_version}-venv"
+                exit 1
+            fi
+            if [[ ! -f "$VENV_DIR/$VENV_BIN/activate" ]]; then
+                err "Virtual environment created but activate script is missing."
+                err "On Ubuntu/Debian, install: sudo apt install python${py_version}-venv"
+                rm -rf "$VENV_DIR"
+                exit 1
+            fi
+        fi
+        source "$VENV_DIR/$VENV_BIN/activate"
+        info "Venv active: $(which python3)"
     fi
-    source "$VENV_DIR/$VENV_BIN/activate"
-    info "Venv active: $(which python3)"
 
     # Check krasis is importable
     if ! python3 -c "from krasis.krasis import RustServer" 2>/dev/null; then
@@ -178,9 +199,12 @@ phase_setup() {
 phase_setup
 
 # Determine python binary
-PYTHON_BIN="python3"
-if [[ -f "$VENV_DIR/$VENV_BIN/python" ]]; then
+if [[ -x "$VENV_DIR/bin/python" ]]; then
+    PYTHON_BIN="$VENV_DIR/bin/python"
+elif [[ -x "$VENV_DIR/$VENV_BIN/python" ]]; then
     PYTHON_BIN="$VENV_DIR/$VENV_BIN/python"
+else
+    PYTHON_BIN="python3"
 fi
 
 # Hand off to Python launcher for everything else
