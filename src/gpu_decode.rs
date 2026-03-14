@@ -6190,17 +6190,22 @@ impl GpuDecodeStore {
                     // Count hot experts (topk - cold)
                     graph.dma_hcs_experts += (topk - cold_count) as u64;
 
-                    // DMA cold experts into VRAM buffers and update their d_batch_upload slots
+                    // DMA cold experts into VRAM buffers and update their d_batch_upload slots.
+                    // All DMAs are queued on copy_stream without per-expert sync, then a single
+                    // event wait ensures all transfers complete before batch pointer updates.
                     if cold_count > 0 {
                         graph.dma_cold_experts += cold_count as u64;
                         let moe_data = graph.moe_layers[moe_layer_idx].as_ref().unwrap();
+
+                        // Collect VRAM buffer destinations for each cold expert
+                        let mut cold_bufs: [(u64, u64, u64, u64, usize); 10] = [(0,0,0,0,0); 10];
+                        let mut actual_cold = 0usize;
 
                         for ci in 0..cold_count {
                             let eid = unsafe { std::ptr::read_volatile(cold_ptr.add(2 + ci)) } as usize;
                             let batch_slot = unsafe { std::ptr::read_volatile(cold_ptr.add(2 + topk + ci)) } as usize;
                             let expert = &moe_data.experts[eid];
 
-                            // Choose a VRAM buffer: first 2 use double-buffer, rest use APFL slots
                             let (w13p, w13s, w2p, w2s) = if ci < 2 {
                                 let base = buf_base[ci];
                                 (base + w13p_off as u64, base + w13s_off as u64,
@@ -6218,30 +6223,45 @@ impl GpuDecodeStore {
                                 continue;
                             };
 
-                            // DMA expert weights from system RAM to VRAM
+                            // Queue DMA (contiguous or 4-call, NO per-expert sync)
                             unsafe {
-                                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                    w13p, expert.w13_packed_ptr as *const std::ffi::c_void,
-                                    expert.w13_packed_bytes, copy_stream);
-                                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                    w13s, expert.w13_scales_ptr as *const std::ffi::c_void,
-                                    expert.w13_scales_bytes, copy_stream);
-                                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                    w2p, expert.w2_packed_ptr as *const std::ffi::c_void,
-                                    expert.w2_packed_bytes, copy_stream);
-                                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                    w2s, expert.w2_scales_ptr as *const std::ffi::c_void,
-                                    expert.w2_scales_bytes, copy_stream);
-                                cuda_sys::lib().cuStreamSynchronize(copy_stream);
+                                if expert.contiguous_ptr != 0 && ci < 2 {
+                                    // Contiguous DMA: single call for entire expert
+                                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                        buf_base[ci], expert.contiguous_ptr as *const std::ffi::c_void,
+                                        expert.contiguous_bytes, copy_stream);
+                                } else {
+                                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                        w13p, expert.w13_packed_ptr as *const std::ffi::c_void,
+                                        expert.w13_packed_bytes, copy_stream);
+                                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                        w13s, expert.w13_scales_ptr as *const std::ffi::c_void,
+                                        expert.w13_scales_bytes, copy_stream);
+                                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                        w2p, expert.w2_packed_ptr as *const std::ffi::c_void,
+                                        expert.w2_packed_bytes, copy_stream);
+                                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                        w2s, expert.w2_scales_ptr as *const std::ffi::c_void,
+                                        expert.w2_scales_bytes, copy_stream);
+                                }
                             }
 
-                            // Update the batch_upload slot for this cold expert
-                            // Write the 4 VRAM pointers to the correct slot in d_batch_upload
+                            cold_bufs[actual_cold] = (w13p, w13s, w2p, w2s, batch_slot);
+                            actual_cold += 1;
+                        }
+
+                        // Single sync after all DMAs complete (replaces N per-expert syncs)
+                        unsafe {
+                            cuda_sys::lib().cuStreamSynchronize(copy_stream);
+                        }
+
+                        // Update batch_upload slots for all cold experts
+                        let d_upload_base = *graph.d_batch_upload.device_ptr();
+                        for ci in 0..actual_cold {
+                            let (w13p, w13s, w2p, w2s, batch_slot) = cold_bufs[ci];
                             if batch_slot < max_ept {
-                                let d_upload_base = *graph.d_batch_upload.device_ptr();
                                 let ptrs: [u64; 4] = [w13p, w13s, w2p, w2s];
                                 unsafe {
-                                    // Each pointer array is max_ept u64s apart
                                     for (arr_idx, &ptr_val) in ptrs.iter().enumerate() {
                                         let dst = d_upload_base + ((arr_idx * max_ept + batch_slot) * 8) as u64;
                                         cuda_sys::lib().cuMemcpyHtoDAsync_v2(
@@ -6316,10 +6336,13 @@ impl GpuDecodeStore {
                     }
 
                     graph.dma_cold_experts += cold_experts.len() as u64;
-                    for (ci, &(_topk_pos, eid, weight)) in cold_experts.iter().enumerate() {
+
+                    // Queue ALL cold expert DMAs on copy_stream (no per-expert sync)
+                    let mut cold_ptrs_list: Vec<(u64, u64, u64, u64)> = Vec::with_capacity(cold_experts.len());
+                    for (ci, &(_topk_pos, eid, _weight)) in cold_experts.iter().enumerate() {
                         let expert = &moe_data.experts[eid];
 
-                        let (base, w13p, w13s, w2p, w2s) = if ci < 2 {
+                        let (_base, w13p, w13s, w2p, w2s) = if ci < 2 {
                             let base = buf_base[ci];
                             (base,
                              base + w13p_off as u64, base + w13s_off as u64,
@@ -6333,28 +6356,46 @@ impl GpuDecodeStore {
                                  slot.w13_packed_ptr(), slot.w13_scales_ptr(),
                                  slot.w2_packed_ptr(), slot.w2_scales_ptr())
                             } else {
+                                cold_ptrs_list.push((0, 0, 0, 0));
                                 continue;
                             }
                         } else {
+                            cold_ptrs_list.push((0, 0, 0, 0));
                             continue;
                         };
 
                         unsafe {
-                            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                w13p, expert.w13_packed_ptr as *const std::ffi::c_void,
-                                expert.w13_packed_bytes, copy_stream);
-                            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                w13s, expert.w13_scales_ptr as *const std::ffi::c_void,
-                                expert.w13_scales_bytes, copy_stream);
-                            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                w2p, expert.w2_packed_ptr as *const std::ffi::c_void,
-                                expert.w2_packed_bytes, copy_stream);
-                            cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                                w2s, expert.w2_scales_ptr as *const std::ffi::c_void,
-                                expert.w2_scales_bytes, copy_stream);
-                            cuda_sys::lib().cuStreamSynchronize(copy_stream);
+                            if expert.contiguous_ptr != 0 && ci < 2 {
+                                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                    buf_base[ci], expert.contiguous_ptr as *const std::ffi::c_void,
+                                    expert.contiguous_bytes, copy_stream);
+                            } else {
+                                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                    w13p, expert.w13_packed_ptr as *const std::ffi::c_void,
+                                    expert.w13_packed_bytes, copy_stream);
+                                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                    w13s, expert.w13_scales_ptr as *const std::ffi::c_void,
+                                    expert.w13_scales_bytes, copy_stream);
+                                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                    w2p, expert.w2_packed_ptr as *const std::ffi::c_void,
+                                    expert.w2_packed_bytes, copy_stream);
+                                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                    w2s, expert.w2_scales_ptr as *const std::ffi::c_void,
+                                    expert.w2_scales_bytes, copy_stream);
+                            }
                         }
+                        cold_ptrs_list.push((w13p, w13s, w2p, w2s));
+                    }
 
+                    // Single sync after all DMAs (replaces N per-expert syncs)
+                    if !cold_experts.is_empty() {
+                        unsafe { cuda_sys::lib().cuStreamSynchronize(copy_stream); }
+                    }
+
+                    // Add cold experts to batch with their VRAM pointers
+                    for (ci, &(_topk_pos, _eid, weight)) in cold_experts.iter().enumerate() {
+                        let (w13p, w13s, w2p, w2s) = cold_ptrs_list[ci];
+                        if w13p == 0 { continue; } // skipped expert
                         if batch_count < max_ept {
                             graph.h_batch_w13_packed_ptrs[batch_count] = w13p;
                             graph.h_batch_w13_scales_ptrs[batch_count] = w13s;
@@ -10299,7 +10340,11 @@ impl GpuDecodeStore {
             } else {
                 // ── Normal (non-speculative) decode path ──
                 // Use per-layer CUDA graph replay when available, fall back to ungraphed.
-                let use_per_layer = self.graph.as_ref()
+                // When timing is enabled, skip graph replay to get per-component timing
+                // (replay_per_layer_graphs has no timing instrumentation).
+                let timing_enabled = self.graph.as_ref()
+                    .map(|g| g.timing_enabled).unwrap_or(false);
+                let use_per_layer = !timing_enabled && self.graph.as_ref()
                     .map(|g| g.per_layer_graphs_valid).unwrap_or(false);
 
                 if use_per_layer {
@@ -12157,7 +12202,42 @@ impl GpuDecodeStore {
             }
         }
 
+        // ── Pre-queue first 2 cold expert DMAs for DMA/compute overlap ──
+        // Start DMA on copy_stream before Phase 2 so the PCIe copy engine works
+        // while GPU SMs run HCS batch compute.  This hides up to 2 cold expert
+        // transfers (~134 us) behind the HCS+shared compute window (~96 us).
+        let pre_dma_count = if use_double_buf && dma_count > 0 { dma_count.min(2) } else { 0 };
+        for di in 0..pre_dma_count {
+            let (i, _weight) = dma_experts[di];
+            let eid = graph.h_topk_ids[i] as usize;
+            let expert = &moe.experts[eid];
+            let slot = di;
+            let base = buf_base[slot];
+            unsafe {
+                if expert.contiguous_ptr != 0 {
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        base, expert.contiguous_ptr as *const std::ffi::c_void,
+                        expert.contiguous_bytes, copy_stream);
+                } else {
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        base + w13p_off as u64, expert.w13_packed_ptr as *const std::ffi::c_void,
+                        expert.w13_packed_bytes, copy_stream);
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        base + w13s_off as u64, expert.w13_scales_ptr as *const std::ffi::c_void,
+                        expert.w13_scales_bytes, copy_stream);
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        base + w2p_off as u64, expert.w2_packed_ptr as *const std::ffi::c_void,
+                        expert.w2_packed_bytes, copy_stream);
+                    cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                        base + w2s_off as u64, expert.w2_scales_ptr as *const std::ffi::c_void,
+                        expert.w2_scales_bytes, copy_stream);
+                }
+                cuda_sys::lib().cuEventRecord(ev_dma[slot], copy_stream);
+            }
+        }
+
         // ── Phase 2: Batched HCS expert compute (4 launches instead of 3*N) ──
+        // Runs on default_stream while pre-queued cold DMAs proceed on copy_stream.
         if hcs_batch_count > 0 && use_v2_w13 && hcs_batch_count >= 2 {
             let t_w13 = Instant::now();
 
@@ -12324,7 +12404,9 @@ impl GpuDecodeStore {
             }
         }
 
-        // ── Phase 3: DMA experts (double-buffered pipeline, unchanged) ──
+        // ── Phase 3: Cold expert compute (DMA/compute overlap for pre-queued experts) ──
+        // Experts 0..pre_dma_count already have DMAs in flight from before Phase 2.
+        // Their ev_dma events may already be signaled, giving near-zero wait.
         for di in 0..dma_count {
             let (i, _weight) = dma_experts[di];
             let eid = graph.h_topk_ids[i] as usize;
@@ -12332,10 +12414,6 @@ impl GpuDecodeStore {
             let expert = &moe.experts[eid];
 
             if use_double_buf {
-                // ── Priority 3: Double-buffered DMA with ping-pong overlap ──
-                //
-                // Expert N DMAs to buf[slot], expert N-1 computes from buf[prev_slot].
-                // The copy engine and compute SMs run concurrently on different buffers.
                 apfl_misses += 1;
                 graph.dma_cold_experts += 1;
                 if timing {
@@ -12347,57 +12425,58 @@ impl GpuDecodeStore {
 
                 let slot = (dma_expert_count % 2) as usize;
 
-                // Wait for this buffer's previous compute to finish (free the buffer)
-                if dma_expert_count >= 2 {
-                    unsafe {
-                        cuda_sys::lib().cuStreamWaitEvent(copy_stream, ev_compute[slot], 0);
+                if di < pre_dma_count {
+                    // DMA already queued before Phase 2 — skip DMA, just wait + compute
+                } else {
+                    // Wait for this buffer's previous compute to finish (free the buffer)
+                    if dma_expert_count >= 2 {
+                        unsafe {
+                            cuda_sys::lib().cuStreamWaitEvent(copy_stream, ev_compute[slot], 0);
+                        }
                     }
-                }
 
-                unsafe {
-                    let base = buf_base[slot];
-                    if expert.contiguous_ptr != 0 {
-                        // Single-call DMA: host contiguous buffer → GPU contiguous buffer
-                        // Both use identical layout (256-byte aligned components).
-                        let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                            base, expert.contiguous_ptr as *const std::ffi::c_void,
-                            expert.contiguous_bytes, copy_stream);
-                        if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                                format!("DMA contiguous[{}]: {:?}", eid, err)));
+                    unsafe {
+                        let base = buf_base[slot];
+                        if expert.contiguous_ptr != 0 {
+                            let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                base, expert.contiguous_ptr as *const std::ffi::c_void,
+                                expert.contiguous_bytes, copy_stream);
+                            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                                    format!("DMA contiguous[{}]: {:?}", eid, err)));
+                            }
+                        } else {
+                            let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                base + w13p_off as u64, expert.w13_packed_ptr as *const std::ffi::c_void,
+                                expert.w13_packed_bytes, copy_stream);
+                            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                                    format!("DMA w13p[{}]: {:?}", eid, err)));
+                            }
+                            let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                base + w13s_off as u64, expert.w13_scales_ptr as *const std::ffi::c_void,
+                                expert.w13_scales_bytes, copy_stream);
+                            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                                    format!("DMA w13s[{}]: {:?}", eid, err)));
+                            }
+                            let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                base + w2p_off as u64, expert.w2_packed_ptr as *const std::ffi::c_void,
+                                expert.w2_packed_bytes, copy_stream);
+                            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                                    format!("DMA w2p[{}]: {:?}", eid, err)));
+                            }
+                            let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                base + w2s_off as u64, expert.w2_scales_ptr as *const std::ffi::c_void,
+                                expert.w2_scales_bytes, copy_stream);
+                            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                                    format!("DMA w2s[{}]: {:?}", eid, err)));
+                            }
                         }
-                    } else {
-                        // Fallback: 4 separate DMA calls
-                        let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                            base + w13p_off as u64, expert.w13_packed_ptr as *const std::ffi::c_void,
-                            expert.w13_packed_bytes, copy_stream);
-                        if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                                format!("DMA w13p[{}]: {:?}", eid, err)));
-                        }
-                        let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                            base + w13s_off as u64, expert.w13_scales_ptr as *const std::ffi::c_void,
-                            expert.w13_scales_bytes, copy_stream);
-                        if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                                format!("DMA w13s[{}]: {:?}", eid, err)));
-                        }
-                        let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                            base + w2p_off as u64, expert.w2_packed_ptr as *const std::ffi::c_void,
-                            expert.w2_packed_bytes, copy_stream);
-                        if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                                format!("DMA w2p[{}]: {:?}", eid, err)));
-                        }
-                        let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                            base + w2s_off as u64, expert.w2_scales_ptr as *const std::ffi::c_void,
-                            expert.w2_scales_bytes, copy_stream);
-                        if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                                format!("DMA w2s[{}]: {:?}", eid, err)));
-                        }
+                        cuda_sys::lib().cuEventRecord(ev_dma[slot], copy_stream);
                     }
-                    cuda_sys::lib().cuEventRecord(ev_dma[slot], copy_stream);
                 }
 
                 // Wait for THIS expert's DMA to complete before computing
