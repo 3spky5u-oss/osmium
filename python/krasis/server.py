@@ -475,12 +475,9 @@ def main():
     import os # Ensure os is in local scope
     os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True" # Mitigate fragmentation
 
-    # WSL2: add CUDA driver library path so Rust cudarc can find libcuda.so
-    _wsl_cuda = "/usr/lib/wsl/lib"
-    if os.path.isdir(_wsl_cuda):
-        ld_path = os.environ.get("LD_LIBRARY_PATH", "")
-        if _wsl_cuda not in ld_path:
-            os.environ["LD_LIBRARY_PATH"] = f"{_wsl_cuda}:{ld_path}" if ld_path else _wsl_cuda
+    # Note: WSL2 LD_LIBRARY_PATH fix for /usr/lib/wsl/lib is in launcher.py's
+    # launch_server() — must be set BEFORE execvp because glibc caches
+    # LD_LIBRARY_PATH at process startup (too late to set here for dlopen).
 
     # Register cleanup early to prevent CUDA zombie processes
     atexit.register(_cleanup_cuda)
@@ -625,8 +622,8 @@ def main():
     parser.add_argument("--multi-gpu-hcs", action="store_true", default=False,
                         help="Pin HCS experts across ALL GPUs (more capacity, but cross-device transfer)")
     # NOTE: --hcs-headroom-mb removed — HCS budget is computed from 4-point VRAM calibration, not a fixed headroom
-    parser.add_argument("--vram-safety-margin", type=int, default=1000,
-                        help="VRAM safety margin in MB — reserved free VRAM below which warnings fire (default: 1000)")
+    parser.add_argument("--vram-safety-margin", type=int, default=600,
+                        help="VRAM safety margin in MB — reserved free VRAM below which warnings fire (default: 600)")
     parser.add_argument("--stream-attention", action="store_true",
                         help="Stream attention weights from CPU instead of keeping resident on GPU. "
                              "Use when attention weights don't fit in VRAM (e.g. very large models).")

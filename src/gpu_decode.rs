@@ -465,7 +465,7 @@ impl HcsState {
             soft_reload_event: None,  // CudaEvent
             soft_reload_stream: None, // CudaStream
             soft_reload_entries: Vec::new(),
-            safety_margin_mb: 1000,
+            safety_margin_mb: 600,
             num_experts_per_layer: 0,
             d_expert_ptrs: None,
             d_expert_ptrs_ne: 0,
@@ -3344,8 +3344,8 @@ impl GpuDecodeStore {
     /// Initialize HCS with hard + soft tiers based on VRAM calibration.
     /// hard_budget_mb: experts that survive worst-case prefill
     /// soft_budget_mb: additional experts loaded during decode, evicted for prefill.
-    /// safety_margin_mb: minimum free VRAM to maintain (default 1000).
-    #[pyo3(signature = (ranking, hard_budget_mb, soft_budget_mb, safety_margin_mb=1000))]
+    /// safety_margin_mb: minimum free VRAM to maintain (default 600).
+    #[pyo3(signature = (ranking, hard_budget_mb, soft_budget_mb, safety_margin_mb=600))]
     fn hcs_pool_init_tiered(
         &mut self,
         ranking: Vec<(usize, usize)>,

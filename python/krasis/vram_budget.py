@@ -439,11 +439,11 @@ def compute_launcher_budget(
         dn = max(0, min(rank_end, first_k_dense) - rank_start)
         mn = n_layers - dn
 
-        # With layer streaming (layer_group_size >= 1), ALL per-layer weights
-        # (attention, shared experts, expert buffers) are streamed through GPU
-        # in groups of layer_group_size. Only group_size layers are resident
-        # at any time (double-buffered DMA for attention).
-        # With persistent mode (layer_group_size == 0), all layers are on GPU.
+        # layer_group_size controls expert DMA pipelining (HCS), NOT attention/shared
+        # expert streaming. Attention and shared experts are permanently on GPU for
+        # ALL layers (offloaded only for very large models, decided at runtime).
+        # The budget shows the peak (non-streaming) footprint so the user sees the
+        # real VRAM impact of their quant choices.
         if layer_group_size >= 1:
             group_size = min(layer_group_size, max(mn, 1))
             streaming = True
@@ -451,26 +451,16 @@ def compute_launcher_budget(
             group_size = 0  # not used
             streaming = False
 
-        # Attention weights: capped by group_size when streaming
-        if streaming:
-            attn_layers = min(group_size, rank_full_attn)
-            linear_layers = min(group_size, rank_linear_attn)
-        else:
-            attn_layers = rank_full_attn
-            linear_layers = rank_linear_attn
-        rank_attn_bytes = _component_weight_bytes(attn_params_per_layer, attention_quant) * attn_layers
-        rank_attn_bytes += linear_attn_bpl * linear_layers
+        # Attention weights: ALL layers permanently on GPU (not capped by group_size)
+        rank_attn_bytes = _component_weight_bytes(attn_params_per_layer, attention_quant) * rank_full_attn
+        rank_attn_bytes += linear_attn_bpl * rank_linear_attn
 
         # Norms and gates are PERMANENT on GPU for ALL layers (not streamed)
         rank_norm_bytes = norm_bytes_all_layers
         gate_bytes = gate_bytes_all_layers + gate_f32_bytes_all_layers
 
-        # Shared experts: capped by group_size when streaming
-        if streaming:
-            shared_layers = min(group_size, mn)
-        else:
-            shared_layers = mn
-        shared_bytes = _component_weight_bytes(shared_params_per_moe, shared_expert_quant) * shared_layers if shared_params_per_moe else 0
+        # Shared experts: ALL layers permanently on GPU (not capped by group_size)
+        shared_bytes = _component_weight_bytes(shared_params_per_moe, shared_expert_quant) * mn if shared_params_per_moe else 0
         dense_mlp_bytes = _component_weight_bytes(dense_mlp_params_per_layer, dense_mlp_quant) * dn
 
         # Expert buffers (GPU side)
@@ -659,20 +649,9 @@ def compute_vram_budget(
         dense_layers_in_rank = max(0, min(rank_end, first_k_dense) - rank_start)
         moe_layers_in_rank = num_layers - dense_layers_in_rank
 
-        # With layer streaming (layer_group_size >= 1), attention and shared experts
-        # are streamed through GPU in groups. Norms and gates are PERMANENT (all layers).
-        streaming = layer_group_size >= 1
-        if streaming:
-            gs = min(layer_group_size, max(moe_layers_in_rank, 1))
-            attn_layers = min(gs, rank_full_attn)
-            linear_layers = min(gs, rank_linear_attn)
-            shared_layers = min(gs, moe_layers_in_rank)
-        else:
-            attn_layers = rank_full_attn
-            linear_layers = rank_linear_attn
-            shared_layers = moe_layers_in_rank
-
-        rank_attn_total = attn_per_layer * attn_layers + linear_attn_bpl * linear_layers
+        # Attention and shared experts are permanently on GPU for ALL layers.
+        # layer_group_size only controls expert DMA pipelining (HCS).
+        rank_attn_total = attn_per_layer * rank_full_attn + linear_attn_bpl * rank_linear_attn
         # Norms and gates are permanent for ALL layers (not streamed)
         rank_norm_total = norm_bytes_per_layer * num_layers
         hidden = cfg["hidden_size"]
@@ -682,7 +661,7 @@ def compute_vram_budget(
         gate_f32_total = hidden * n_experts_cli * 4 * moe_layers_in_rank
 
         dense_mlp_total = _dense_mlp_bytes_per_layer(cfg, quantization) * dense_layers_in_rank
-        shared_expert_total = _shared_expert_bytes_per_moe_layer(cfg, quantization) * shared_layers
+        shared_expert_total = _shared_expert_bytes_per_moe_layer(cfg, quantization) * moe_layers_in_rank
         pinned_expert_total = expert_bytes * num_gpu_experts if num_gpu_experts > 0 else 0
 
         weight_total = (

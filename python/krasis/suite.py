@@ -230,6 +230,12 @@ class SuiteRunner:
         env["CUDA_VISIBLE_DEVICES"] = gpu_indices
         # Ensure instrumentation is off
         env.pop("KRASIS_DECODE_TIMING", None)
+        # WSL2: ensure CUDA driver path is in LD_LIBRARY_PATH for Rust cudarc
+        _wsl_cuda = "/usr/lib/wsl/lib"
+        if os.path.isdir(_wsl_cuda):
+            ld = env.get("LD_LIBRARY_PATH", "")
+            if _wsl_cuda not in ld:
+                env["LD_LIBRARY_PATH"] = f"{_wsl_cuda}:{ld}" if ld else _wsl_cuda
         return env
 
     @staticmethod

@@ -45,6 +45,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="/home/main/miniconda3/envs/ktransformers/bin/python"
 export PYTHONUNBUFFERED=1
+# WSL2: add CUDA driver path so Rust cudarc can find libcuda.so
+[[ -d /usr/lib/wsl/lib ]] && export LD_LIBRARY_PATH="/usr/lib/wsl/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 PIP="/home/main/miniconda3/envs/ktransformers/bin/pip"
 MATURIN="/home/main/.local/bin/maturin"
 SO_FILE="$SCRIPT_DIR/python/krasis/krasis.cpython-311-x86_64-linux-gnu.so"

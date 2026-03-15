@@ -25,7 +25,18 @@ jobs:
           args: --release --out dist -i python3.10 python3.11 python3.12 python3.13
           manylinux: auto
           before-script-linux: |
+            # numactl for libnuma
             yum install -y numactl-devel 2>/dev/null || dnf install -y numactl-devel 2>/dev/null || apt-get install -y libnuma-dev 2>/dev/null || true
+            # CUDA toolkit for nvcc (decode kernels compiled to PTX at build time)
+            # build.rs checks /usr/local/cuda-12.6/bin/nvcc directly
+            if [ ! -f /usr/local/cuda-12.6/bin/nvcc ]; then
+              yum install -y yum-utils 2>/dev/null || true
+              yum-config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo 2>/dev/null || \
+                dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo 2>/dev/null || true
+              yum install -y --nogpgcheck cuda-nvcc-12-6 cuda-cudart-devel-12-6 2>/dev/null || \
+                dnf install -y --nogpgcheck cuda-nvcc-12-6 cuda-cudart-devel-12-6 2>/dev/null || true
+              ls -la /usr/local/cuda-12.6/bin/nvcc 2>/dev/null && echo "nvcc installed OK" || echo "WARNING: nvcc install failed"
+            fi
 
       - name: Build sdist
         uses: PyO3/maturin-action@v1

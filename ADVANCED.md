@@ -81,7 +81,7 @@ Legacy `int4`/`int8` values for `--attention-quant` are auto-migrated to `awq`.
 | `--kv-cache-mb N` | 1000 | KV cache size in MB |
 | `--hcs` / `--no-hcs` | on | Hot Cache Strategy for expert pinning |
 | `--multi-gpu-hcs` | off | Pin HCS experts across all GPUs |
-| `--vram-safety-margin N` | 1000 | Reserved VRAM in MB below which warnings fire |
+| `--vram-safety-margin N` | 600 | Reserved VRAM in MB below which warnings fire |
 | `--stream-attention` | off | Stream attention weights from CPU (for very large models) |
 | `--force-load` | — | Override RAM safety checks and load anyway |
 | `--force-rebuild-cache` | — | Delete existing expert caches and rebuild from safetensors |

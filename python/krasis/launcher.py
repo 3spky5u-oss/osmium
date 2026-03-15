@@ -393,7 +393,7 @@ class LauncherConfig:
         self.port: int = 8012
         self.gpu_prefill_threshold: int = 300
         self.gguf_path: str = ""
-        self.vram_safety_margin: int = 1000
+        self.vram_safety_margin: int = 600
         self.force_load: bool = False
         self.force_rebuild_cache: bool = False
         self.build_cache: bool = False
@@ -572,10 +572,8 @@ OPTIONS = [
                  choices=["int8", "bf16"], affects_budget=True),
     ConfigOption("LM head quant", "lm_head_quant",
                  choices=["int8", "bf16"], affects_budget=True),
-    ConfigOption("VRAM safety margin (MB)", "vram_safety_margin",
+    ConfigOption("VRAM safety margin", "vram_safety_margin",
                  opt_type="number", min_val=500, max_val=8000, step=100),
-    ConfigOption("CPU threads", "krasis_threads",
-                 opt_type="number", min_val=1, max_val=256),
     ConfigOption("Host/Port", "host", opt_type="text"),
     ConfigOption("Enable thinking", "enable_thinking",
                  choices=[True, False]),
@@ -596,7 +594,7 @@ def _format_value(opt: ConfigOption, val: Any) -> str:
     if opt.key == "attention_quant":
         labels = {
             "bf16": "BF16",
-            "awq": "AWQ (calibrated per-tensor)",
+            "awq": "AWQ",
         }
         return labels.get(str(val), str(val))
     return str(val)
@@ -963,9 +961,9 @@ class Launcher:
         lines = []
 
         # Header
-        lines.append(f"{BOLD}\u2554{'═' * 39}\u2557{NC}")
-        lines.append(f"{BOLD}\u2551         {CYAN}Krasis{NC}{BOLD} MoE Server             \u2551{NC}")
-        lines.append(f"{BOLD}\u255a{'═' * 39}\u255d{NC}")
+        lines.append(f"{BOLD}\u2554{'═' * 71}\u2557{NC}")
+        lines.append(f"{BOLD}\u2551{'':>27}{CYAN}Krasis{NC}{BOLD} MoE Server{'':>27}\u2551{NC}")
+        lines.append(f"{BOLD}\u255a{'═' * 71}\u255d{NC}")
         lines.append("")
 
         # Model info
@@ -999,13 +997,7 @@ class Launcher:
         native_dtype = (self.model_info or {}).get("native_dtype", "bfloat16")
         visible_options = [opt for opt in OPTIONS if _is_option_visible(opt, self.model_info, self.cfg)]
 
-        # Column positions for two-column size estimates (VRAM + RAM)
-        VRAM_COL = 58
-        COL_WIDTH = 10  # e.g. "XX,XXX MB" right-justified
-
-        sep_left = f"  {DIM}\u2500\u2500\u2500 Configuration \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{NC}"
-        hpad = max(1, VRAM_COL - _visible_len(sep_left))
-        lines.append(f"{sep_left}{' ' * hpad}{CYAN}{'VRAM':^{COL_WIDTH}}{NC}  {GREEN}{'RAM':^{COL_WIDTH}}{NC}")
+        lines.append(f"  {DIM}\u2500\u2500\u2500 Configuration \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{NC}")
 
         for i, opt in enumerate(visible_options):
             val = getattr(self.cfg, opt.key)
@@ -1036,55 +1028,10 @@ class Launcher:
                     alloc_tokens = (self.cfg.kv_cache_mb * 1024 * 1024) // kv_bytes_per_token if kv_bytes_per_token > 0 else 0
                     suffix = f"  {DIM}(~{_format_tokens(alloc_tokens)} tokens, model max {_format_tokens(max_ctx)}){NC}"
 
-            # Compute VRAM and RAM estimates from budget
-            vram_mb = 0
-            ram_mb = 0
-            if self.budget:
-                rank = self.budget["ranks"][self.budget["worst_rank"]]
-                b = self.budget
-                _vram_map = {
-                    "gpu_expert_bits": "expert_buffer_mb",
-                    "attention_quant": "attention_mb",
-                    "shared_expert_quant": "shared_expert_mb",
-                    "dense_mlp_quant": "dense_mlp_mb",
-                    "lm_head_quant": "lm_head_mb",
-                }
-                _ram_map = {
-                    "gpu_expert_bits": "ram_gpu_experts_mb",
-                }
-                vkey = _vram_map.get(opt.key)
-                if vkey:
-                    vram_mb = rank.get(vkey, 0)
-                elif opt.key == "kv_cache_mb":
-                    # Show capped KV allocation (min of config and available VRAM)
-                    free = rank.get("free_mb", 0)
-                    vram_mb = min(self.cfg.kv_cache_mb, max(0, free))
-                rkey = _ram_map.get(opt.key)
-                if rkey:
-                    ram_mb = b.get(rkey, 0)
-
             # Build left part (prefix + label + value + annotation)
             label_part = f"{label_style}{opt.label:<20s}{NC}"
             left = f"{prefix}{label_part}{display}{suffix}"
-
-            # Build right columns: VRAM (cyan) + RAM (green)
-            has_estimates = vram_mb > 0 or ram_mb > 0
-            if has_estimates:
-                vis_len = _visible_len(left)
-                pad1 = max(1, VRAM_COL - vis_len)
-                if vram_mb >= 1:
-                    vram_str = f"{CYAN}{int(vram_mb):>{COL_WIDTH - 3},} MB{NC}"
-                elif vram_mb > 0:
-                    vram_str = f"{CYAN}{'<1 MB':>{COL_WIDTH}}{NC}"
-                else:
-                    vram_str = " " * COL_WIDTH
-                if ram_mb >= 1:
-                    ram_str = f"  {GREEN}{int(ram_mb):>{COL_WIDTH - 3},} MB{NC}"
-                else:
-                    ram_str = ""
-                lines.append(f"{left}{' ' * pad1}{vram_str}{ram_str}")
-            else:
-                lines.append(left)
+            lines.append(left)
 
         lines.append("")
 
@@ -1095,16 +1042,39 @@ class Launcher:
             rank = b["ranks"][wr]
             gpu_vram = b["gpu_vram_mb"]
 
-            embed_mb = int(rank.get("embedding_mb", 0))
-            norms_gates_mb = int(rank.get("norms_gates_mb", 0))
-            cuda_mb = int(rank.get("cuda_overhead_mb", 0))
-            flashinfer_mb = int(rank.get("flashinfer_mb", 0))
-            prefill_ws_mb = int(rank.get("prefill_workspace_mb", 0))
-            total_with_kv = int(rank.get("total_with_kv_mb", rank["total_mb"]))
-            free_after_kv = int(rank.get("free_after_kv_mb", rank["free_mb"]))
-            kv_alloc_tokens = rank.get("kv_alloc_tokens", rank["kv_tokens"])
-            kv_label = "fp8" if self.cfg.kv_dtype == "fp8_e4m3" else "bf16"
+            # Three main VRAM categories
+            experts_mb = int(rank.get("expert_buffer_mb", 0))
+            attention_mb = int(rank.get("attention_mb", 0))
+            overhead_mb = int(
+                rank.get("embedding_mb", 0) +
+                rank.get("norms_gates_mb", 0) +
+                rank.get("shared_expert_mb", 0) +
+                rank.get("dense_mlp_mb", 0) +
+                rank.get("lm_head_mb", 0) +
+                rank.get("flashinfer_mb", 0) +
+                rank.get("prefill_workspace_mb", 0) +
+                rank.get("cuda_overhead_mb", 0)
+            )
 
+            # KV allocation (capped to available VRAM)
+            free_before_kv = rank.get("free_mb", 0)
+            kv_alloc = int(min(self.cfg.kv_cache_mb, max(0, free_before_kv)))
+            kv_label = "fp8" if self.cfg.kv_dtype == "fp8_e4m3" else "bf16"
+            kv_alloc_tokens = rank.get("kv_alloc_tokens", rank["kv_tokens"])
+
+            total_used = experts_mb + attention_mb + overhead_mb + kv_alloc
+
+            # HCS coverage: VRAM available for expert caching vs total expert cache
+            permanent_mb = attention_mb + overhead_mb + kv_alloc
+            free_for_hcs = max(0, int(gpu_vram - permanent_mb))
+            total_expert_cache = b.get("ram_gpu_experts_mb", 0)
+            hcs_pct = (free_for_hcs / total_expert_cache * 100) if total_expert_cache > 0 else 0
+
+            # Labels
+            expert_label = f"INT{self.cfg.gpu_expert_bits}"
+            attn_label = "AWQ" if self.cfg.attention_quant == "awq" else "BF16"
+
+            # RAM
             ram_experts_gb = b.get('ram_gpu_experts_mb', 0) / 1024
             ram_tot_gb = b.get('ram_total_mb', 0) / 1024
             sys_ram_gb = b['total_ram_gb']
@@ -1115,36 +1085,37 @@ class Launcher:
                 vl = _visible_len(text)
                 return text + " " * max(0, width - vl)
 
-            # Left column (VRAM) — 5 data rows + sep + total
+            # Left column (VRAM) — 3 categories + KV + total + HCS
             left = [
-                f"{DIM}\u2500\u2500 VRAM (fixed costs) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{NC}",
-                f"  Embedding:       {CYAN}{embed_mb:>8,} MB{NC}",
-                f"  Norms + gates:   {CYAN}{norms_gates_mb:>8,} MB{NC}",
-                f"  FlashInfer:      {CYAN}{flashinfer_mb:>8,} MB{NC}",
-                f"  Prefill w/s:     {CYAN}{prefill_ws_mb:>8,} MB{NC}",
-                f"  CUDA overhead:   {CYAN}{cuda_mb:>8,} MB{NC}",
+                f"{DIM}\u2500\u2500 VRAM Budget \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{NC}",
+                f"  Experts:     {CYAN}{experts_mb:>8,} MB{NC}  {DIM}({expert_label}){NC}",
+                f"  Attention:   {CYAN}{attention_mb:>8,} MB{NC}  {DIM}({attn_label}){NC}",
+                f"  Overhead:    {CYAN}{overhead_mb:>8,} MB{NC}",
+                f"  KV cache:    {CYAN}{kv_alloc:>8,} MB{NC}  {DIM}({kv_label}){NC}",
                 f"  {DIM}\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{NC}",
-                f"  Total: {CYAN}{total_with_kv:>8,}{NC} / {int(gpu_vram):,} MB",
+                f"  Total: {CYAN}{total_used:>8,}{NC} / {int(gpu_vram):,} MB",
+                f"  HCS:   {CYAN}{free_for_hcs:>8,} MB{NC} {DIM}(~{hcs_pct:.0f}% coverage){NC}",
             ]
-            # Right column (RAM) — expert cache is the only significant RAM consumer
+            # Right column (RAM) — expert cache
             right = [
                 f"{DIM}\u2500\u2500 System RAM \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{NC}",
-                "",
-                "",
                 f"  Expert cache:    {GREEN}{ram_experts_gb:>7.1f} GB{NC}",
+                "",
                 "",
                 "",
                 f"  {DIM}\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500{NC}",
                 f"  Total:   {GREEN}{ram_tot_gb:>7.1f}{NC} / {sys_ram_gb:.0f} GB",
+                "",
             ]
             for l_line, r_line in zip(left, right):
                 lines.append(f"  {_pad_col(l_line)}  {r_line}")
 
             # Token estimate + over-budget warning below tables
             lines.append(f"    {DIM}~{_format_tokens(kv_alloc_tokens)} tokens {kv_label} KV{NC}")
+            free_after_kv = rank.get("free_after_kv_mb", rank["free_mb"])
             if free_after_kv < 0:
-                over = -free_after_kv
-                lines.append(f"    {RED}\u26a0 OVER BUDGET by {int(over):,} MB!{NC}")
+                over = int(-free_after_kv)
+                lines.append(f"    {RED}\u26a0 OVER BUDGET by {over:,} MB!{NC}")
         else:
             lines.append(f"  {DIM}(budget unavailable){NC}")
 
@@ -1453,7 +1424,6 @@ class Launcher:
             print(f"  Dense MLP quant: {self.cfg.dense_mlp_quant}")
         print(f"  LM head quant:   {self.cfg.lm_head_quant}")
         print(f"  VRAM safety:     {self.cfg.vram_safety_margin:,} MB")
-        print(f"  CPU threads:     {self.cfg.krasis_threads}")
         print(f"  Server:          {self.cfg.host}:{self.cfg.port}")
         if self.selected_gpus:
             idx_str = ",".join(str(g["index"]) for g in self.selected_gpus)
@@ -1466,9 +1436,26 @@ class Launcher:
             wr = budget["worst_rank"]
             rank = budget["ranks"][wr]
             gpu_vram = budget["gpu_vram_mb"]
-            print(f"\n  VRAM: {rank['total_mb']:,.0f} MB / {gpu_vram:,} MB (rank {wr})")
+            experts_mb = int(rank.get("expert_buffer_mb", 0))
+            attention_mb = int(rank.get("attention_mb", 0))
+            overhead_mb = int(
+                rank.get("embedding_mb", 0) + rank.get("norms_gates_mb", 0) +
+                rank.get("shared_expert_mb", 0) + rank.get("dense_mlp_mb", 0) +
+                rank.get("lm_head_mb", 0) + rank.get("flashinfer_mb", 0) +
+                rank.get("prefill_workspace_mb", 0) + rank.get("cuda_overhead_mb", 0)
+            )
+            kv_label = "fp8" if self.cfg.kv_dtype == "fp8_e4m3" else "bf16"
+            print(f"\n  Experts:     {experts_mb:>8,} MB  (INT{self.cfg.gpu_expert_bits})")
+            attn_label = "AWQ" if self.cfg.attention_quant == "awq" else "BF16"
+            print(f"  Attention:   {attention_mb:>8,} MB  ({attn_label})")
+            print(f"  Overhead:    {overhead_mb:>8,} MB")
+            print(f"  Total: {rank['total_mb']:>8,.0f} / {gpu_vram:,} MB (rank {wr})")
+            permanent_mb = attention_mb + overhead_mb + min(self.cfg.kv_cache_mb, max(0, rank["free_mb"]))
+            free_for_hcs = max(0, int(gpu_vram - permanent_mb))
+            total_expert_cache = budget.get("ram_gpu_experts_mb", 0)
+            hcs_pct = (free_for_hcs / total_expert_cache * 100) if total_expert_cache > 0 else 0
+            print(f"  HCS:   {free_for_hcs:>8,} MB  (~{hcs_pct:.0f}% coverage)")
             if rank["free_mb"] > 0:
-                kv_label = "fp8" if self.cfg.kv_dtype == "fp8_e4m3" else "bf16"
                 print(f"  KV capacity: ~{_format_tokens(rank['kv_tokens'])} tokens ({kv_label})")
             else:
                 print(f"  {RED}WARNING: OVER BUDGET by {-rank['free_mb']:,.0f} MB{NC}")
@@ -1513,6 +1500,15 @@ class Launcher:
             os.environ["CUDA_VISIBLE_DEVICES"] = cvd
             print(f"  CUDA_VISIBLE_DEVICES={cvd}")
 
+        # WSL2: LD_LIBRARY_PATH must be set BEFORE execvp so the new process
+        # starts with it — glibc caches the library search path at startup,
+        # so setting it inside the server's main() is too late for dlopen.
+        _wsl_cuda = "/usr/lib/wsl/lib"
+        if os.path.isdir(_wsl_cuda):
+            ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+            if _wsl_cuda not in ld_path:
+                os.environ["LD_LIBRARY_PATH"] = f"{_wsl_cuda}:{ld_path}" if ld_path else _wsl_cuda
+
         print(f"\n{GREEN}Starting Krasis server...{NC}\n")
         print(f"  Config: {config_path}")
         print(f"{DIM}$ {' '.join(cmd_args)}{NC}\n")
@@ -1548,7 +1544,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kv-cache-mb", type=int, default=None,
                         help="KV cache size in MB (default: 1000)")
     parser.add_argument("--vram-safety-margin", type=int, default=None,
-                        help="VRAM safety margin in MB (default: 1000)")
+                        help="VRAM safety margin in MB (default: 600)")
     parser.add_argument("--kv-dtype", default=None,
                         help="KV cache dtype: fp8_e4m3 or bf16")
     parser.add_argument("--gpu-expert-bits", type=int, default=None,
