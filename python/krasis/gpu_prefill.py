@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 from krasis.timing import TIMING
 
 
+
 def _gpu_to_device(tensor: torch.Tensor, target) -> torch.Tensor:
     """Transfer tensor between GPUs using CPU bounce (P2P is broken on this system)."""
     target = torch.device(target)
@@ -108,9 +109,15 @@ def _fused_marlin_moe_gpt_oss(
     K_out = w2.shape[2] // nb2  # may be > K if padded (e.g., 2944 vs 2880)
     w2_padded = K_out != K
 
-    # Block size selection (same as original)
-    for block_size_m in [8, 16, 32, 48, 64]:
-        if M * topk / E / block_size_m < 0.9:
+    # Block size selection (same as original, but cap at 48 for INT8 to work around
+    # sgl_kernel moe_wna16_marlin_gemm crash with block_size_m=64 on Blackwell)
+    max_bsm = 48 if num_bits == 8 else 64
+    block_size_m = 8
+    for bsm in [8, 16, 32, 48, 64]:
+        if bsm > max_bsm:
+            break
+        block_size_m = bsm
+        if M * topk / E / bsm < 0.9:
             break
 
     if global_num_experts == -1:
@@ -237,6 +244,164 @@ def _fused_marlin_moe_gpt_oss(
 
     moe_sum_reduce(intermediate_cache3, output, routed_scaling_factor)
     return output
+
+
+def _fused_marlin_moe_standard(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    global_num_experts: int = -1,
+    expert_map: Optional[torch.Tensor] = None,
+    g_idx1: Optional[torch.Tensor] = None,
+    g_idx2: Optional[torch.Tensor] = None,
+    sort_indices1: Optional[torch.Tensor] = None,
+    sort_indices2: Optional[torch.Tensor] = None,
+    w1_zeros: Optional[torch.Tensor] = None,
+    w2_zeros: Optional[torch.Tensor] = None,
+    workspace: Optional[torch.Tensor] = None,
+    num_bits: int = 4,
+    is_k_full: bool = True,
+    inplace: bool = False,
+    routed_scaling_factor: Optional[float] = None,
+) -> torch.Tensor:
+    """Standard fused_marlin_moe with block_size_m cap for INT8 on Blackwell.
+
+    Mirrors sglang's fused_marlin_moe exactly, except caps block_size_m at 48
+    for INT8 to work around sgl_kernel moe_wna16_marlin_gemm crash with
+    block_size_m=64 on sm_120 (Blackwell).
+    """
+    from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+    from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import get_scalar_type
+    from sgl_kernel import moe_sum_reduce, silu_and_mul
+
+    assert hidden_states.is_contiguous()
+
+    M, K = hidden_states.shape
+    E = w1.shape[0]
+    N = w2.shape[1] * 16
+    topk = topk_ids.shape[1]
+
+    # Cap block_size_m at 48 for INT8 (sgl_kernel bug with bsm=64 on Blackwell)
+    max_bsm = 48 if num_bits == 8 else 64
+    block_size_m = 8
+    for bsm in [8, 16, 32, 48, 64]:
+        if bsm > max_bsm:
+            break
+        block_size_m = bsm
+        if M * topk / E / bsm < 0.9:
+            break
+
+    if global_num_experts == -1:
+        global_num_experts = E
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        topk_ids, block_size_m, global_num_experts
+    )
+
+    if workspace is None:
+        max_workspace_size = (max(2 * N, K) // 64) * (
+            sorted_token_ids.size(0) // block_size_m
+        )
+        device = hidden_states.device
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        max_workspace_size = min(max_workspace_size, sms * 4)
+        workspace = torch.zeros(
+            max_workspace_size, dtype=torch.int, device=device, requires_grad=False
+        )
+
+    scalar_type1 = get_scalar_type(num_bits, w1_zeros is not None)
+    scalar_type2 = get_scalar_type(num_bits, w2_zeros is not None)
+
+    intermediate_cache2 = torch.empty(
+        (M * topk, N), device=hidden_states.device, dtype=hidden_states.dtype,
+    )
+    intermediate_cache13 = torch.empty(
+        (M * topk * max(2 * N, K),), device=hidden_states.device, dtype=hidden_states.dtype,
+    )
+    intermediate_cache1 = intermediate_cache13[: M * topk * 2 * N].view(-1, 2 * N)
+    intermediate_cache3 = intermediate_cache13[: M * topk * K].view(-1, K)
+
+    use_atomic_add = (
+        hidden_states.dtype == torch.half
+        or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
+    )
+
+    intermediate_cache1 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
+        hidden_states,
+        intermediate_cache1,
+        w1,
+        None,
+        w1_scale,
+        None,
+        w1_zeros,
+        g_idx1,
+        sort_indices1,
+        workspace,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        moe_block_size=block_size_m,
+        top_k=topk,
+        mul_topk_weights=False,
+        is_ep=expert_map is not None,
+        b_q_type_id=scalar_type1.id,
+        size_m=M,
+        size_n=2 * N,
+        size_k=K,
+        is_k_full=is_k_full,
+        use_atomic_add=use_atomic_add,
+        use_fp32_reduce=True,
+        is_zp_float=False,
+    )
+
+    silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
+
+    if expert_map is not None:
+        intermediate_cache3.zero_()
+
+    intermediate_cache3 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
+        intermediate_cache2,
+        intermediate_cache3,
+        w2,
+        None,
+        w2_scale,
+        None,
+        w2_zeros,
+        g_idx2,
+        sort_indices2,
+        workspace,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        moe_block_size=block_size_m,
+        top_k=1,
+        mul_topk_weights=True,
+        is_ep=expert_map is not None,
+        b_q_type_id=scalar_type2.id,
+        size_m=M * topk,
+        size_n=K,
+        size_k=N,
+        is_k_full=is_k_full,
+        use_atomic_add=use_atomic_add,
+        use_fp32_reduce=True,
+        is_zp_float=False,
+    ).view(-1, topk, K)
+
+    output = hidden_states if inplace else torch.empty_like(hidden_states)
+
+    if routed_scaling_factor is None:
+        routed_scaling_factor = 1.0
+
+    moe_sum_reduce(intermediate_cache3, output, routed_scaling_factor)
+    return output
+
+
 
 
 def _quantize_and_pack_gpu(w: torch.Tensor, group_size: int = GROUP_SIZE, num_bits: int = 4):
@@ -642,10 +807,7 @@ class GpuPrefillManager:
                 routed_scaling_factor=routed_scaling_factor,
             )
         else:
-            from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-                fused_marlin_moe,
-            )
-            return fused_marlin_moe(
+            return _fused_marlin_moe_standard(
                 hidden_states=hidden_states,
                 w1=w1,
                 w2=w2,
@@ -660,6 +822,8 @@ class GpuPrefillManager:
                 g_idx2=g_idx2,
                 sort_indices1=sort_indices1,
                 sort_indices2=sort_indices2,
+                w1_zeros=None,
+                w2_zeros=None,
                 workspace=workspace,
                 num_bits=num_bits,
                 is_k_full=is_k_full,
@@ -1919,9 +2083,7 @@ class GpuPrefillManager:
         The active_only buffer [E, ...] is used as the "staging" buffer
         that fused_marlin_moe reads from. We copy from LRU cache → staging.
         """
-        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-            fused_marlin_moe,
-        )
+        fused_marlin_moe = _fused_marlin_moe_standard
 
         self._allocate_ao_buffer()  # Staging buffer
         self._allocate_lru_buffer()  # LRU cache
@@ -2074,9 +2236,7 @@ class GpuPrefillManager:
         On layer change: zero the buffer and reset loaded expert tracking.
         For each call: determine active experts, DMA only missing ones, run kernel.
         """
-        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-            fused_marlin_moe,
-        )
+        fused_marlin_moe = _fused_marlin_moe_standard
 
         self._allocate_ao_buffer()
 
@@ -2330,9 +2490,7 @@ class GpuPrefillManager:
         every token. Compact buffers are per-layer, so cached experts survive
         layer cycling and only changed experts need DMA.
         """
-        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-            fused_marlin_moe,
-        )
+        fused_marlin_moe = _fused_marlin_moe_standard
 
         self._init_compact_decode()
 
@@ -3834,9 +3992,7 @@ class GpuPrefillManager:
 
             if no_graphs:
                 # Direct fused_marlin_moe call (diagnostic: bypass CUDA graphs)
-                from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-                    fused_marlin_moe,
-                )
+                fused_marlin_moe = _fused_marlin_moe_standard
                 dev = hcs_dev.device
                 n_hot = hcs_dev.num_pinned[moe_layer_idx]
                 bufs = hcs_dev.buffers[moe_layer_idx]
@@ -4167,9 +4323,7 @@ class GpuPrefillManager:
             logger.warning("Cannot init multi-GPU CUDA graphs: HCS not initialized")
             return
 
-        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-            fused_marlin_moe,
-        )
+        fused_marlin_moe = _fused_marlin_moe_standard
 
         K = self.hidden_size
         top_k = self._engine.top_k()
@@ -4531,9 +4685,7 @@ class GpuPrefillManager:
         Returns:
             [M, K] output tensor on GPU
         """
-        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-            fused_marlin_moe,
-        )
+        fused_marlin_moe = _fused_marlin_moe_standard
 
         # sgl_kernel's moe_sum_reduce launches on the current CUDA device,
         # not the tensor's device. Must set device explicitly for multi-GPU.
@@ -4718,9 +4870,7 @@ class GpuPrefillManager:
         debug_sync: bool,
     ) -> torch.Tensor:
         """Forward using engine weights. Marlin-native: DMA copy. Legacy: on-the-fly repack."""
-        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-            fused_marlin_moe,
-        )
+        fused_marlin_moe = _fused_marlin_moe_standard
         M = x.shape[0]
         output = torch.zeros(M, self.hidden_size, dtype=x.dtype, device=self.device)
         gating_output = torch.empty(M, self.chunk_size, device=self.device)
@@ -4788,9 +4938,7 @@ class GpuPrefillManager:
         debug_sync: bool,
     ) -> torch.Tensor:
         """Forward using pre-cached Marlin weights in RAM (legacy path)."""
-        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-            fused_marlin_moe,
-        )
+        fused_marlin_moe = _fused_marlin_moe_standard
         M = x.shape[0]
 
         # topk_ids use GLOBAL expert indices. This manager handles
@@ -4880,9 +5028,7 @@ class GpuPrefillManager:
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         """Compute shared expert forward on GPU using Marlin kernel."""
-        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-            fused_marlin_moe,
-        )
+        fused_marlin_moe = _fused_marlin_moe_standard
         from sglang.srt.layers.quantization.marlin_utils import (
             marlin_make_workspace,
         )
