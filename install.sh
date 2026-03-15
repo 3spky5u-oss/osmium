@@ -2,8 +2,11 @@
 # Krasis installer — downloads pre-built wheels from GitHub releases.
 # No PyPI, no pipx, no sudo. Works out of the box.
 #
-# Install / upgrade:
+# Install / upgrade (latest stable):
 #   curl -sSf https://raw.githubusercontent.com/brontoguana/krasis/main/install.sh | bash
+#
+# Install latest pre-release:
+#   curl -sSf https://raw.githubusercontent.com/brontoguana/krasis/main/install.sh | bash -s -- prerelease
 #
 # Uninstall:
 #   curl -sSf https://raw.githubusercontent.com/brontoguana/krasis/main/install.sh | bash -s -- --uninstall
@@ -33,6 +36,13 @@ info()  { echo -e "${CYAN}${BOLD}=>${NC} $1"; }
 ok()    { echo -e "${GREEN}${BOLD}OK${NC} $1"; }
 warn()  { echo -e "${YELLOW}${BOLD}!!${NC} $1"; }
 err()   { echo -e "${RED}${BOLD}ERROR${NC} $1"; exit 1; }
+
+# ── Channel (stable / prerelease) ────────────────────────────────────
+CHANNEL="stable"
+if [[ "${1:-}" == "prerelease" || "${1:-}" == "--prerelease" ]]; then
+    CHANNEL="prerelease"
+    shift
+fi
 
 # ── Uninstall ──────────────────────────────────────────────────────────
 if [[ "${1:-}" == "--uninstall" ]]; then
@@ -140,11 +150,30 @@ fi
 # Use the first Python we found for JSON parsing
 PARSE_PY="${PY_BINS[0]}"
 
-# ── Fetch latest release from GitHub ─────────────────────────────────
+# ── Fetch release from GitHub ────────────────────────────────────────
 ARCH=$(uname -m)
-info "Checking latest release..."
-RELEASE_JSON=$(curl -sSf "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null) \
-    || err "Cannot reach GitHub API. Check your internet connection."
+if [[ "$CHANNEL" == "prerelease" ]]; then
+    info "Checking latest pre-release..."
+    # /releases returns all releases sorted newest first; pick the first pre-release
+    ALL_JSON=$(curl -sSf "https://api.github.com/repos/$REPO/releases?per_page=10" 2>/dev/null) \
+        || err "Cannot reach GitHub API. Check your internet connection."
+    RELEASE_JSON=$("$PARSE_PY" -c '
+import json, sys
+releases = json.loads(sys.stdin.read())
+if isinstance(releases, dict) and "message" in releases:
+    print(json.dumps(releases))
+    sys.exit(0)
+for r in releases:
+    if r.get("prerelease", False):
+        print(json.dumps(r))
+        sys.exit(0)
+print(json.dumps({"message": "No pre-release found. Create one on GitHub first."}))
+' <<< "$ALL_JSON")
+else
+    info "Checking latest release..."
+    RELEASE_JSON=$(curl -sSf "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null) \
+        || err "Cannot reach GitHub API. Check your internet connection."
+fi
 
 # ── Match best Python + wheel from release assets ────────────────────
 # Tries each installed Python version (newest first) against the
@@ -393,6 +422,7 @@ else
     echo ""
 fi
 echo -e "${DIM}Upgrade:    curl -sSf https://raw.githubusercontent.com/brontoguana/krasis/main/install.sh | bash${NC}"
+echo -e "${DIM}Pre-release: curl -sSf https://raw.githubusercontent.com/brontoguana/krasis/main/install.sh | bash -s -- prerelease${NC}"
 echo -e "${DIM}Uninstall:  curl -sSf https://raw.githubusercontent.com/brontoguana/krasis/main/install.sh | bash -s -- --uninstall${NC}"
 
 } # end do_install
