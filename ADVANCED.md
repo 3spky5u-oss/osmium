@@ -1,5 +1,13 @@
 # Advanced Configuration
 
+## Install Pre-release
+
+```bash
+curl -sSf https://raw.githubusercontent.com/brontoguana/krasis/main/install.sh | bash -s -- prerelease
+```
+
+This installs the latest pre-release build. Normal `install.sh` (without the `prerelease` flag) always installs the latest stable release.
+
 ## Running Krasis
 
 Krasis has two entry points:
