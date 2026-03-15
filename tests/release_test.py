@@ -432,7 +432,11 @@ def send_chat_streaming(prompt: str, port: int = DEFAULT_PORT,
                         timeout: int = 120) -> Dict:
     """Send a streaming chat completion request.
 
-    Returns dict with: text, ttft_s, total_s, tokens, tok_s, error.
+    Returns dict with: text, ttft_s, total_s, tokens, decode_tok_s,
+    prefill_tok_s, prompt_tokens, overhead, finish_reason, error.
+
+    Speed numbers come from krasis_timing (internal engine metrics), not
+    from network-level measurement which suffers from TCP buffering artifacts.
     """
     payload = {
         "messages": [{"role": "user", "content": prompt}],
@@ -454,12 +458,14 @@ def send_chat_streaming(prompt: str, port: int = DEFAULT_PORT,
             error_body = resp.read().decode("utf-8", errors="replace")
             conn.close()
             return {"text": "", "ttft_s": 0, "total_s": 0, "tokens": 0,
-                    "tok_s": 0, "error": f"HTTP {resp.status}: {error_body[:200]}"}
+                    "decode_tok_s": 0, "prefill_tok_s": 0, "prompt_tokens": 0,
+                    "overhead": {}, "error": f"HTTP {resp.status}: {error_body[:200]}"}
 
         t_first = None
         token_count = 0
         text_parts = []
         finish_reason = None
+        timing_data = None
         buf = b""
 
         while True:
@@ -476,6 +482,7 @@ def send_chat_streaming(prompt: str, port: int = DEFAULT_PORT,
                     try:
                         data = json.loads(line[6:])
                         if "krasis_timing" in data:
+                            timing_data = data["krasis_timing"]
                             continue
                         choice = data.get("choices", [{}])[0]
                         fr = choice.get("finish_reason")
@@ -498,26 +505,36 @@ def send_chat_streaming(prompt: str, port: int = DEFAULT_PORT,
         ttft_s = (t_first - t_start) if t_first else total_s
         text = "".join(text_parts)
 
-        # Decode tok/s: tokens after first / time from first to last
-        if t_first and token_count > 1:
-            decode_time = t_end - t_first
-            tok_s = (token_count - 1) / decode_time
-        else:
-            tok_s = 0
+        # Use internal engine metrics from krasis_timing SSE event
+        decode_tok_s = 0.0
+        prefill_tok_s = 0.0
+        prompt_tokens = 0
+        overhead = {}
+        if timing_data:
+            decode_tok_s = timing_data.get("decode_tok_s", 0.0)
+            prompt_tokens = timing_data.get("prompt_tokens", 0)
+            overhead = timing_data.get("overhead", {})
+            prefill_ms = overhead.get("prefill_ms", 0.0)
+            if prefill_ms > 0 and prompt_tokens > 0:
+                prefill_tok_s = prompt_tokens / (prefill_ms / 1000.0)
 
         return {
             "text": text,
             "ttft_s": round(ttft_s, 2),
             "total_s": round(total_s, 2),
             "tokens": token_count,
-            "tok_s": round(tok_s, 2),
+            "decode_tok_s": round(decode_tok_s, 2),
+            "prefill_tok_s": round(prefill_tok_s, 1),
+            "prompt_tokens": prompt_tokens,
+            "overhead": overhead,
             "finish_reason": finish_reason,
             "error": None,
         }
 
     except Exception as e:
         return {"text": "", "ttft_s": 0, "total_s": 0, "tokens": 0,
-                "tok_s": 0, "error": str(e)}
+                "decode_tok_s": 0, "prefill_tok_s": 0, "prompt_tokens": 0,
+                "overhead": {}, "error": str(e)}
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -587,7 +604,8 @@ def run_sanity_prompts(port: int = DEFAULT_PORT) -> List[Dict]:
             warn(f"    Error: {r['error']}")
         else:
             preview = r["text"][:120].replace("\n", " ")
-            ok(f"    TTFT {r['ttft_s']:.1f}s | {r['tok_s']:.1f} tok/s | {r['total_s']:.1f}s — {preview}")
+            decode_str = f"decode {r['decode_tok_s']:.1f} tok/s" if r['decode_tok_s'] > 0 else "decode Not Received"
+            ok(f"    TTFT {r['ttft_s']:.1f}s | {decode_str} | {r['total_s']:.1f}s — {preview}")
 
     return results
 
@@ -639,7 +657,14 @@ def run_large_prompt_tests(port: int = DEFAULT_PORT) -> List[Dict]:
             warn(f"    Error: {r['error']}")
         else:
             preview = r["text"][:120].replace("\n", " ")
-            ok(f"    TTFT {r['ttft_s']:.1f}s | {r['tok_s']:.1f} tok/s | {r['total_s']:.1f}s — {preview}")
+            decode_str = f"decode {r['decode_tok_s']:.1f} tok/s" if r['decode_tok_s'] > 0 else "decode Not Received"
+            prefill_str = f"prefill {r['prefill_tok_s']:.0f} tok/s" if r['prefill_tok_s'] > 0 else ""
+            parts = [f"TTFT {r['ttft_s']:.1f}s"]
+            if prefill_str:
+                parts.append(prefill_str)
+            parts.append(decode_str)
+            parts.append(f"{r['total_s']:.1f}s")
+            ok(f"    {' | '.join(parts)} — {preview}")
 
     return results
 
@@ -700,10 +725,18 @@ def generate_report(model_name: str, gpu_info: Tuple[int, str, int],
                 if sr.get("error"):
                     lines.append(f"**Error:** {sr['error']}")
                 else:
+                    decode_str = f"{sr['decode_tok_s']:.1f} tok/s" if sr.get('decode_tok_s', 0) > 0 else "Not Received"
+                    prefill_str = f"{sr['prefill_tok_s']:.0f} tok/s" if sr.get('prefill_tok_s', 0) > 0 else "Not Received"
                     lines.append(f"TTFT: {sr['ttft_s']:.2f}s | "
-                                 f"Speed: {sr['tok_s']:.1f} tok/s | "
-                                 f"Total: {sr['total_s']:.2f}s | "
-                                 f"Tokens: {sr['tokens']}")
+                                 f"Prefill: {prefill_str} | "
+                                 f"Decode: {decode_str} | "
+                                 f"Tokens: {sr['tokens']} (prompt: {sr.get('prompt_tokens', '?')})")
+                    overhead = sr.get('overhead', {})
+                    if overhead:
+                        lines.append(f"Overhead: parse={overhead.get('parse_ms', 0):.1f}ms "
+                                     f"evict={overhead.get('evict_ms', 0):.1f}ms "
+                                     f"prefill={overhead.get('prefill_ms', 0):.0f}ms "
+                                     f"reload={overhead.get('reload_ms', 0):.0f}ms")
                     lines.append("")
                     lines.append(f"> {sr['text']}")
                 lines.append("")
@@ -720,10 +753,18 @@ def generate_report(model_name: str, gpu_info: Tuple[int, str, int],
                 if lr.get("error"):
                     lines.append(f"**Error:** {lr['error']}")
                 else:
+                    decode_str = f"{lr['decode_tok_s']:.1f} tok/s" if lr.get('decode_tok_s', 0) > 0 else "Not Received"
+                    prefill_str = f"{lr['prefill_tok_s']:.0f} tok/s" if lr.get('prefill_tok_s', 0) > 0 else "Not Received"
                     lines.append(f"TTFT: {lr['ttft_s']:.2f}s | "
-                                 f"Speed: {lr['tok_s']:.1f} tok/s | "
-                                 f"Total: {lr['total_s']:.2f}s | "
-                                 f"Tokens: {lr['tokens']}")
+                                 f"Prefill: {prefill_str} | "
+                                 f"Decode: {decode_str} | "
+                                 f"Tokens: {lr['tokens']} (prompt: {lr.get('prompt_tokens', '?')})")
+                    overhead = lr.get('overhead', {})
+                    if overhead:
+                        lines.append(f"Overhead: parse={overhead.get('parse_ms', 0):.1f}ms "
+                                     f"evict={overhead.get('evict_ms', 0):.1f}ms "
+                                     f"prefill={overhead.get('prefill_ms', 0):.0f}ms "
+                                     f"reload={overhead.get('reload_ms', 0):.0f}ms")
                     lines.append("")
                     # Prompt preview
                     lines.append(f"Prompt (first 200 chars): `{lr['prompt_preview'][:200]}`")

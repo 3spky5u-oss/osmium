@@ -183,11 +183,22 @@ class WeightLoader:
         return self._load_and_quantize(name, device)
 
     def load_attention_weights(
-        self, layer_idx: int, device: torch.device
+        self, layer_idx: int, device: torch.device,
+        proj_device: torch.device = None,
     ) -> Dict[str, Tuple[torch.Tensor, torch.Tensor] | torch.Tensor]:
-        """Load attention weights for one layer (MLA or GQA)."""
+        """Load attention weights for one layer (MLA or GQA).
+
+        Args:
+            device: Device for all weights by default (norms, biases, etc).
+            proj_device: Device for large projection weights (q/k/v/o_proj).
+                         Defaults to device. Pass CPU for AWQ mode where
+                         projections stay on CPU for quantization, while
+                         small weights (norms, biases) go directly to GPU.
+        """
+        if proj_device is None:
+            proj_device = device
         if self.cfg.is_gqa:
-            return self._load_gqa_attention(layer_idx, device)
+            return self._load_gqa_attention(layer_idx, device, proj_device)
         return self._load_mla_attention(layer_idx, device)
 
     def _load_mla_attention(
@@ -232,13 +243,21 @@ class WeightLoader:
         return weights
 
     def _load_gqa_attention(
-        self, layer_idx: int, device: torch.device
+        self, layer_idx: int, device: torch.device,
+        proj_device: torch.device = None,
     ) -> Dict[str, Tuple[torch.Tensor, torch.Tensor] | torch.Tensor]:
         """Load GQA attention weights for one layer (Qwen3, GLM-4.7).
 
         Loads: q_proj, k_proj, v_proj, o_proj, q_norm, k_norm.
         Also loads bias tensors when present (GLM-4.7 has attention_bias=true).
+
+        Args:
+            device: Device for small weights (norms, biases) — always GPU.
+            proj_device: Device for large projection weights. Defaults to device.
+                         CPU when AWQ will quantize them before GPU upload.
         """
+        if proj_device is None:
+            proj_device = device
         prefix = f"{self.cfg.layers_prefix}.layers.{layer_idx}.self_attn"
         weights = {}
         # Attention weights always loaded as BF16 — adaptive FP8 conversion
@@ -246,8 +265,8 @@ class WeightLoader:
         load_proj = self._load_bf16
 
         for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]:
-            weights[proj] = load_proj(f"{prefix}.{proj}.weight", device)
-            # Load bias if present (GLM-4.7)
+            weights[proj] = load_proj(f"{prefix}.{proj}.weight", proj_device)
+            # Load bias if present (GLM-4.7) — biases are small, always on GPU
             bias_name = f"{prefix}.{proj}.bias"
             if bias_name in self._weight_map:
                 weights[f"{proj}_bias"] = self._load_bf16(bias_name, device)
@@ -465,10 +484,13 @@ class WeightLoader:
         }
 
         # Load attention weights based on layer type
+        # Linear attention is NOT affected by AWQ (AWQ only applies to GQA layers),
+        # so linear attention always loads to the primary GPU device.
         if is_linear:
-            result["linear_attention"] = self.load_linear_attention_weights(layer_idx, attn_device)
+            result["linear_attention"] = self.load_linear_attention_weights(layer_idx, device)
         else:
-            result["attention"] = self.load_attention_weights(layer_idx, attn_device)
+            result["attention"] = self.load_attention_weights(
+                layer_idx, device, proj_device=attn_device)
 
         if result["is_moe"]:
             result["gate"] = self.load_moe_gate(layer_idx, device)

@@ -83,13 +83,17 @@ const KERNEL_NAMES: &[&str] = &[
     "reduce_ksplits_bf16",
     "reduce_ksplits_f32",
     "marlin_gemv_int4_fused_silu_accum_v2",
+    "marlin_gemv_int8_fused_silu_accum",
+    "marlin_gemv_int8_fused_silu_accum_v2",
     "reduce_ksplits_weighted_accum_bf16",
     "sigmoid_gate_inplace_bf16",
     "simple_int4_gemv_f32",
     "simple_int4_gemv_bf16",
     "marlin_gemv_int4_v2_batched",
+    "marlin_gemv_int8_v2_batched",
     "reduce_ksplits_bf16_batched",
     "fused_silu_w2_batched",
+    "fused_silu_w2_int8_batched",
     "multi_expert_weighted_add_bf16",
     "marlin_gemv_int4_f32",
     "marlin_gemv_int8",
@@ -861,10 +865,12 @@ struct CachedKernels {
     embedding_lookup: cudarc::driver::CudaFunction,
     marlin_gemv_int4: cudarc::driver::CudaFunction,
     fused_silu_accum: cudarc::driver::CudaFunction,
+    fused_silu_accum_int8: cudarc::driver::CudaFunction,
     // v2 kernels with K-splitting for better SM occupancy
     marlin_gemv_int4_v2: cudarc::driver::CudaFunction,
     reduce_ksplits_bf16: cudarc::driver::CudaFunction,
     fused_silu_accum_v2: cudarc::driver::CudaFunction,
+    fused_silu_accum_v2_int8: cudarc::driver::CudaFunction,
     reduce_ksplits_weighted_accum_bf16: cudarc::driver::CudaFunction,
     // Attention kernels (LA + GQA) — eliminates ~470 HashMap lookups per token
     uninterleave_qkvz: cudarc::driver::CudaFunction,
@@ -888,8 +894,10 @@ struct CachedKernels {
     marlin_gemv_int8_v2_fused_f32: cudarc::driver::CudaFunction,
     // Batched expert kernels — reduce launch overhead from 30/layer to 4/layer
     marlin_gemv_int4_v2_batched: cudarc::driver::CudaFunction,
+    marlin_gemv_int8_v2_batched: cudarc::driver::CudaFunction,
     reduce_ksplits_bf16_batched: cudarc::driver::CudaFunction,
     fused_silu_w2_batched: cudarc::driver::CudaFunction,
+    fused_silu_w2_int8_batched: cudarc::driver::CudaFunction,
     multi_expert_weighted_add_bf16: cudarc::driver::CudaFunction,
     // Graphable kernel variants (read position/token from GPU pointers)
     embedding_lookup_g: cudarc::driver::CudaFunction,
@@ -919,6 +927,8 @@ struct GpuDecodeGraph {
     eps: f32,
     intermediate_size: usize,
     group_size: usize,
+    /// Expert quantization bits: 4 (INT4 Marlin) or 8 (INT8 Marlin).
+    expert_bits: u8,
 
     weights: Vec<GpuWeight>,
     layers: Vec<GpuDecodeLayer>,
@@ -1559,7 +1569,7 @@ impl GpuDecodeStore {
     }
 
     /// Initialize the decode graph with model dimensions.
-    #[pyo3(signature = (hidden_size, num_layers, vocab_size, eps, max_experts_per_tok=10, max_intermediate_size=0, max_qkv_size=0, group_size=128))]
+    #[pyo3(signature = (hidden_size, num_layers, vocab_size, eps, max_experts_per_tok=10, max_intermediate_size=0, max_qkv_size=0, group_size=128, expert_bits=4))]
     fn configure(
         &mut self,
         hidden_size: usize,
@@ -1570,6 +1580,7 @@ impl GpuDecodeStore {
         max_intermediate_size: usize,
         max_qkv_size: usize,
         group_size: usize,
+        expert_bits: u8,
     ) -> PyResult<()> {
         let intermediate = if max_intermediate_size > 0 { max_intermediate_size } else { hidden_size * 4 };
         let qkv_size = if max_qkv_size > 0 { max_qkv_size } else { hidden_size * 3 };
@@ -1702,6 +1713,7 @@ impl GpuDecodeStore {
             eps,
             intermediate_size: intermediate,
             group_size,
+            expert_bits,
             weights: Vec::with_capacity(num_layers * 8),
             layers: Vec::with_capacity(num_layers),
             embedding_ptr: 0,
@@ -1888,9 +1900,11 @@ impl GpuDecodeStore {
                 embedding_lookup: get("embedding_lookup")?,
                 marlin_gemv_int4: get("marlin_gemv_int4")?,
                 fused_silu_accum: get("marlin_gemv_int4_fused_silu_accum")?,
+                fused_silu_accum_int8: get("marlin_gemv_int8_fused_silu_accum")?,
                 marlin_gemv_int4_v2: get("marlin_gemv_int4_v2")?,
                 reduce_ksplits_bf16: get("reduce_ksplits_bf16")?,
                 fused_silu_accum_v2: get("marlin_gemv_int4_fused_silu_accum_v2")?,
+                fused_silu_accum_v2_int8: get("marlin_gemv_int8_fused_silu_accum_v2")?,
                 reduce_ksplits_weighted_accum_bf16: get("reduce_ksplits_weighted_accum_bf16")?,
                 // Attention kernels (LA + GQA)
                 uninterleave_qkvz: get("uninterleave_qkvz")?,
@@ -1913,8 +1927,10 @@ impl GpuDecodeStore {
                 marlin_gemv_int8_v2: get("marlin_gemv_int8_v2")?,
                 marlin_gemv_int8_v2_fused_f32: get("marlin_gemv_int8_v2_fused_f32")?,
                 marlin_gemv_int4_v2_batched: get("marlin_gemv_int4_v2_batched")?,
+                marlin_gemv_int8_v2_batched: get("marlin_gemv_int8_v2_batched")?,
                 reduce_ksplits_bf16_batched: get("reduce_ksplits_bf16_batched")?,
                 fused_silu_w2_batched: get("fused_silu_w2_batched")?,
+                fused_silu_w2_int8_batched: get("fused_silu_w2_int8_batched")?,
                 multi_expert_weighted_add_bf16: get("multi_expert_weighted_add_bf16")?,
                 // Graphable variants
                 embedding_lookup_g: get("embedding_lookup_g")?,
@@ -5221,8 +5237,14 @@ impl GpuDecodeStore {
 
         let intermediate = graph.intermediate_size;
         let gs = graph.group_size;
-        let inv_wp = *graph.d_inv_weight_perm.device_ptr();
+        // Select inverse weight permutation based on expert quantization bits
+        let inv_wp = if graph.expert_bits == 8 {
+            *graph.d_inv_weight_perm_int8.device_ptr()
+        } else {
+            *graph.d_inv_weight_perm.device_ptr()
+        };
         let inv_sp = *graph.d_inv_scale_perm.device_ptr();
+        let is_int8 = graph.expert_bits == 8;
 
         let d_pos_ptr = *graph.d_graph_pos.as_ref().unwrap().device_ptr();
         let d_seq_len_ptr = *graph.d_graph_seq_len.as_ref().unwrap().device_ptr();
@@ -5267,8 +5289,13 @@ impl GpuDecodeStore {
                 if use_v2_w13 {
                     let w13_n_tiles = (w13_n + 15) / 16;
                     let w13_smem = (hs * 2 + 1024 * 4 + 64 * 4 + 16 * 16 * 4) as u32;
+                    let w13_kernel = if is_int8 {
+                        k.marlin_gemv_int8_v2_batched.clone()
+                    } else {
+                        k.marlin_gemv_int4_v2_batched.clone()
+                    };
                     unsafe {
-                        k.marlin_gemv_int4_v2_batched.clone().launch(
+                        w13_kernel.launch(
                             LaunchConfig {
                                 grid_dim: (w13_n_tiles as u32, w13_ksplits as u32, topk as u32),
                                 block_dim: (256, 1, 1),
@@ -5304,8 +5331,13 @@ impl GpuDecodeStore {
                 // Batched silu + w2
                 let w2_n_tiles = (hs + 15) / 16;
                 let w2_smem = (intermediate * 2 + 1024 * 4 + 64 * 4) as u32;
+                let w2_kernel = if is_int8 {
+                    k.fused_silu_w2_int8_batched.clone()
+                } else {
+                    k.fused_silu_w2_batched.clone()
+                };
                 unsafe {
-                    k.fused_silu_w2_batched.clone().launch(
+                    w2_kernel.launch(
                         LaunchConfig {
                             grid_dim: (w2_n_tiles as u32, 1, topk as u32),
                             block_dim: (256, 1, 1),
@@ -5378,7 +5410,7 @@ impl GpuDecodeStore {
                             sw13p, sw13s,
                             *graph.d_hidden.device_ptr(),
                             partial_ptr, inv_wp, inv_sp,
-                            hs, w13_n, gs, w13_ksplits, &k,
+                            hs, w13_n, gs, w13_ksplits, &k, is_int8,
                         ).map_err(|e| format!("shared w13 v2: {:?}", e))?;
                         self.launch_reduce_ksplits_bf16(
                             *graph.d_expert_gate_up.device_ptr(),
@@ -5389,7 +5421,7 @@ impl GpuDecodeStore {
                             sw13p, sw13s,
                             *graph.d_hidden.device_ptr(),
                             *graph.d_expert_gate_up.device_ptr(),
-                            inv_wp, inv_sp, hs, w13_n, gs,
+                            inv_wp, inv_sp, hs, w13_n, gs, is_int8,
                         ).map_err(|e| format!("shared w13 raw: {:?}", e))?;
                     }
 
@@ -5403,7 +5435,7 @@ impl GpuDecodeStore {
                         *graph.d_expert_gate_up.device_ptr(),
                         *graph.d_moe_out.device_ptr(),
                         inv_wp, inv_sp, intermediate, hs, gs,
-                        1.0, shared_gate_ptr, &k,
+                        1.0, shared_gate_ptr, &k, is_int8,
                     ).map_err(|e| format!("shared silu_accum: {:?}", e))?;
                 }
 
@@ -8995,8 +9027,13 @@ impl GpuDecodeStore {
         let gate_wid = moe.gate_wid;
         let gate_bias_ptr = moe.gate_bias_ptr;
         let e_score_corr_ptr = moe.e_score_corr_ptr;
-        let inv_wp = *graph.d_inv_weight_perm.device_ptr();
+        let inv_wp = if graph.expert_bits == 8 {
+            *graph.d_inv_weight_perm_int8.device_ptr()
+        } else {
+            *graph.d_inv_weight_perm.device_ptr()
+        };
         let inv_sp = *graph.d_inv_scale_perm.device_ptr();
+        let is_int8 = graph.expert_bits == 8;
 
         let w13_n = 2 * intermediate;
         let w13_k_tiles = hs / 16;
@@ -9268,7 +9305,7 @@ impl GpuDecodeStore {
                 if use_v2_w13 {
                     self.launch_marlin_gemv_v2(
                         w13p, w13s, hidden_ptr, partial_ptr, inv_wp, inv_sp,
-                        hs, w13_n, gs, w13_ksplits, k).map_err(|e| format!("{}", e))?;
+                        hs, w13_n, gs, w13_ksplits, k, is_int8).map_err(|e| format!("{}", e))?;
                     self.launch_reduce_ksplits_bf16(
                         *graph.d_expert_gate_up.device_ptr(), partial_ptr,
                         w13_n, w13_ksplits, k).map_err(|e| format!("{}", e))?;
@@ -9276,7 +9313,7 @@ impl GpuDecodeStore {
                     self.launch_marlin_gemv_raw(
                         w13p, w13s, hidden_ptr,
                         *graph.d_expert_gate_up.device_ptr(),
-                        inv_wp, inv_sp, hs, w13_n, gs).map_err(|e| format!("{}", e))?;
+                        inv_wp, inv_sp, hs, w13_n, gs, is_int8).map_err(|e| format!("{}", e))?;
                 }
 
                 // Fused silu + w2 + weighted accumulate
@@ -9285,7 +9322,7 @@ impl GpuDecodeStore {
                     *graph.d_expert_gate_up.device_ptr(),
                     accum_ptr, inv_wp, inv_sp,
                     intermediate, hs, gs,
-                    weight, 0u64, k).map_err(|e| format!("{}", e))?;
+                    weight, 0u64, k, is_int8).map_err(|e| format!("{}", e))?;
             }
 
             // Signal compute done for ping-pong
@@ -9341,7 +9378,7 @@ impl GpuDecodeStore {
                 self.launch_marlin_gemv_raw(
                     w13p, w13s, hidden_ptr,
                     *graph.d_expert_gate_up.device_ptr(),
-                    inv_wp, inv_sp, hs, 2 * intermediate, gs).map_err(|e| format!("{}", e))?;
+                    inv_wp, inv_sp, hs, 2 * intermediate, gs, is_int8).map_err(|e| format!("{}", e))?;
 
                 // w2 DMA (if not VRAM resident, first token only)
                 if se_vram.is_none() && t == 0 {
@@ -9372,7 +9409,7 @@ impl GpuDecodeStore {
                     *graph.d_expert_gate_up.device_ptr(),
                     accum_ptr, inv_wp, inv_sp,
                     intermediate, hs, gs,
-                    shared_weight, gate_weight_ptr, k).map_err(|e| format!("{}", e))?;
+                    shared_weight, gate_weight_ptr, k, is_int8).map_err(|e| format!("{}", e))?;
             }
         }
 
@@ -10903,11 +10940,18 @@ impl GpuDecodeStore {
     ) -> PyResult<()> {
         let graph = self.graph.as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let is_int8 = graph.expert_bits == 8;
+        let inv_wp = if is_int8 {
+            *graph.d_inv_weight_perm_int8.device_ptr()
+        } else {
+            *graph.d_inv_weight_perm.device_ptr()
+        };
         self.launch_marlin_gemv_raw(
             packed_ptr, scales_ptr, input_ptr, output_ptr,
-            *graph.d_inv_weight_perm.device_ptr(),
+            inv_wp,
             *graph.d_inv_scale_perm.device_ptr(),
             k, n, group_size,
+            is_int8,
         )
     }
 
@@ -10923,15 +10967,17 @@ impl GpuDecodeStore {
         k: usize,
         n: usize,
         group_size: usize,
+        is_int8: bool,
     ) -> PyResult<()> {
         if !self.kernels_loaded {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "Decode kernels not loaded"));
         }
 
-        let f = self.device.get_func(MODULE_NAME, "marlin_gemv_int4")
+        let kernel_name = if is_int8 { "marlin_gemv_int8" } else { "marlin_gemv_int4" };
+        let f = self.device.get_func(MODULE_NAME, kernel_name)
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
-                "marlin_gemv_int4 kernel not found"))?;
+                format!("{} kernel not found", kernel_name)))?;
 
         let n_tiles = (n + 15) / 16;
         // Shared memory: input BF16 [K*2] + inv_weight_perm [1024*4] + inv_scale_perm [64*4]
@@ -10978,6 +11024,7 @@ impl GpuDecodeStore {
         weight: f32,
         weight_ptr: u64, // optional device ptr: if non-zero, kernel reads sigmoid(*weight_ptr) instead of weight
         kernels: &CachedKernels,
+        is_int8: bool,
     ) -> PyResult<()> {
         let n_tiles = (n + 15) / 16;
         let smem_bytes = (k * 2 + 1024 * 4 + 64 * 4) as u32;
@@ -10987,8 +11034,14 @@ impl GpuDecodeStore {
             shared_mem_bytes: smem_bytes,
         };
 
+        let kernel = if is_int8 {
+            kernels.fused_silu_accum_int8.clone()
+        } else {
+            kernels.fused_silu_accum.clone()
+        };
+
         unsafe {
-            kernels.fused_silu_accum.clone().launch(cfg, (
+            kernel.launch(cfg, (
                 w2_packed_ptr,
                 w2_scales_ptr,
                 gate_up_ptr,
@@ -11042,6 +11095,7 @@ impl GpuDecodeStore {
         group_size: usize,
         k_splits: usize,
         kernels: &CachedKernels,
+        is_int8: bool,
     ) -> PyResult<()> {
         let n_tiles = (n + 15) / 16;
         // Shared mem: input BF16 [K*2] + inv_wperm [1024*4] + inv_sperm [64*4] + reduce [16*16*4]
@@ -11052,8 +11106,14 @@ impl GpuDecodeStore {
             shared_mem_bytes: smem_bytes,
         };
 
+        let kernel = if is_int8 {
+            kernels.marlin_gemv_int8_v2.clone()
+        } else {
+            kernels.marlin_gemv_int4_v2.clone()
+        };
+
         unsafe {
-            kernels.marlin_gemv_int4_v2.clone().launch(cfg, (
+            kernel.launch(cfg, (
                 packed_ptr,
                 scales_ptr,
                 input_ptr,
@@ -11065,7 +11125,7 @@ impl GpuDecodeStore {
                 group_size as i32,
                 k_splits as i32,
             )).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                format!("marlin_gemv_int4_v2 launch: {:?}", e)))?;
+                format!("marlin_gemv_v2 launch: {:?}", e)))?;
         }
         Ok(())
     }
@@ -11375,6 +11435,7 @@ impl GpuDecodeStore {
         group_size: usize,
         k_splits: usize,
         kernels: &CachedKernels,
+        is_int8: bool,
     ) -> PyResult<()> {
         let n_tiles = (n + 15) / 16;
         let smem_bytes = (k * 2 + 1024 * 4 + 64 * 4 + 16 * 16 * 4) as u32;
@@ -11384,8 +11445,14 @@ impl GpuDecodeStore {
             shared_mem_bytes: smem_bytes,
         };
 
+        let kernel = if is_int8 {
+            kernels.fused_silu_accum_v2_int8.clone()
+        } else {
+            kernels.fused_silu_accum_v2.clone()
+        };
+
         unsafe {
-            kernels.fused_silu_accum_v2.clone().launch(cfg, (
+            kernel.launch(cfg, (
                 w2_packed_ptr,
                 w2_scales_ptr,
                 gate_up_ptr,
@@ -11574,7 +11641,12 @@ impl GpuDecodeStore {
         let intermediate = graph.intermediate_size;
         let gs = graph.group_size;
         let w13_n = 2 * intermediate;
-        let inv_wp = *graph.d_inv_weight_perm.device_ptr();
+        let is_int8 = graph.expert_bits == 8;
+        let inv_wp = if is_int8 {
+            *graph.d_inv_weight_perm_int8.device_ptr()
+        } else {
+            *graph.d_inv_weight_perm.device_ptr()
+        };
         let inv_sp = *graph.d_inv_scale_perm.device_ptr();
         let copy_stream = self.copy_stream.0;
         let default_stream: cuda_sys::CUstream = std::ptr::null_mut();
@@ -11616,7 +11688,7 @@ impl GpuDecodeStore {
             *graph.d_hidden.device_ptr(),
             *graph.d_expert_gate_up.device_ptr(),
             inv_wp, inv_sp,
-            hs, w13_n, gs,
+            hs, w13_n, gs, is_int8,
         )?;
         self.device.synchronize()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
@@ -11689,7 +11761,12 @@ impl GpuDecodeStore {
         let gate_wid = moe.gate_wid;
         let gate_bias_ptr = moe.gate_bias_ptr;
         let e_score_corr_ptr = moe.e_score_corr_ptr;
-        let inv_wp = *graph.d_inv_weight_perm.device_ptr();
+        let is_int8 = graph.expert_bits == 8;
+        let inv_wp = if is_int8 {
+            *graph.d_inv_weight_perm_int8.device_ptr()
+        } else {
+            *graph.d_inv_weight_perm.device_ptr()
+        };
         let inv_sp = *graph.d_inv_scale_perm.device_ptr();
 
         // v2 K-split config for w13 GEMV (only use v2 if k_splits > 1)
@@ -12318,8 +12395,13 @@ impl GpuDecodeStore {
             // Batched w13 GEMV v2: all HCS experts in one launch
             let w13_n_tiles = (w13_n + 15) / 16;
             let w13_smem = (hs * 2 + 1024 * 4 + 64 * 4 + 16 * 16 * 4) as u32;
+            let w13_kernel = if is_int8 {
+                k.marlin_gemv_int8_v2_batched.clone()
+            } else {
+                k.marlin_gemv_int4_v2_batched.clone()
+            };
             unsafe {
-                k.marlin_gemv_int4_v2_batched.clone().launch(
+                w13_kernel.launch(
                     LaunchConfig {
                         grid_dim: (w13_n_tiles as u32, w13_ksplits as u32, hcs_batch_count as u32),
                         block_dim: (256, 1, 1),
@@ -12363,8 +12445,13 @@ impl GpuDecodeStore {
             // Batched silu+w2 GEMV: all experts in one launch, writes to per-expert output
             let w2_n_tiles = (hs + 15) / 16;
             let w2_smem = (intermediate * 2 + 1024 * 4 + 64 * 4) as u32;
+            let w2_kernel = if is_int8 {
+                k.fused_silu_w2_int8_batched.clone()
+            } else {
+                k.fused_silu_w2_batched.clone()
+            };
             unsafe {
-                k.fused_silu_w2_batched.clone().launch(
+                w2_kernel.launch(
                     LaunchConfig {
                         grid_dim: (w2_n_tiles as u32, 1, hcs_batch_count as u32),
                         block_dim: (256, 1, 1),
@@ -12418,7 +12505,7 @@ impl GpuDecodeStore {
                         w13p, w13s,
                         *graph.d_hidden.device_ptr(),
                         partial_ptr, inv_wp, inv_sp,
-                        hs, w13_n, gs, w13_ksplits, k,
+                        hs, w13_n, gs, w13_ksplits, k, is_int8,
                     )?;
                     self.launch_reduce_ksplits_bf16(
                         *graph.d_expert_gate_up.device_ptr(),
@@ -12431,7 +12518,7 @@ impl GpuDecodeStore {
                         *graph.d_hidden.device_ptr(),
                         *graph.d_expert_gate_up.device_ptr(),
                         inv_wp, inv_sp,
-                        hs, w13_n, gs,
+                        hs, w13_n, gs, is_int8,
                     )?;
                 }
                 self.launch_fused_silu_accum(
@@ -12440,7 +12527,7 @@ impl GpuDecodeStore {
                     *graph.d_moe_out.device_ptr(),
                     inv_wp, inv_sp,
                     intermediate, hs, gs,
-                    weight, 0u64, k,
+                    weight, 0u64, k, is_int8,
                 )?;
             }
         }
@@ -12542,7 +12629,7 @@ impl GpuDecodeStore {
                         base + w13p_off as u64, base + w13s_off as u64,
                         *graph.d_hidden.device_ptr(),
                         partial_ptr, inv_wp, inv_sp,
-                        hs, w13_n, gs, w13_ksplits, k,
+                        hs, w13_n, gs, w13_ksplits, k, is_int8,
                     )?;
                     self.launch_reduce_ksplits_bf16(
                         *graph.d_expert_gate_up.device_ptr(),
@@ -12555,7 +12642,7 @@ impl GpuDecodeStore {
                         *graph.d_hidden.device_ptr(),
                         *graph.d_expert_gate_up.device_ptr(),
                         inv_wp, inv_sp,
-                        hs, w13_n, gs,
+                        hs, w13_n, gs, is_int8,
                     )?;
                 }
 
@@ -12581,7 +12668,7 @@ impl GpuDecodeStore {
                     inv_wp, inv_sp,
                     intermediate, hs, gs,
                     weight, 0u64,
-                    k,
+                    k, is_int8,
                 )?;
                 if timing {
                     unsafe { cuda_sys::lib().cuStreamSynchronize(default_stream); }
@@ -12645,7 +12732,7 @@ impl GpuDecodeStore {
                         buf_w13_packed, buf_w13_scales,
                         *graph.d_hidden.device_ptr(),
                         partial_ptr, inv_wp, inv_sp,
-                        hs, w13_n, gs, w13_ksplits, k,
+                        hs, w13_n, gs, w13_ksplits, k, is_int8,
                     )?;
                     self.launch_reduce_ksplits_bf16(
                         *graph.d_expert_gate_up.device_ptr(),
@@ -12658,7 +12745,7 @@ impl GpuDecodeStore {
                         *graph.d_hidden.device_ptr(),
                         *graph.d_expert_gate_up.device_ptr(),
                         inv_wp, inv_sp,
-                        hs, w13_n, gs,
+                        hs, w13_n, gs, is_int8,
                     )?;
                 }
 
@@ -12691,7 +12778,7 @@ impl GpuDecodeStore {
                     inv_wp, inv_sp,
                     intermediate, hs, gs,
                     weight, 0u64,
-                    k,
+                    k, is_int8,
                 )?;
             }
         }
@@ -12754,7 +12841,7 @@ impl GpuDecodeStore {
                 *graph.d_hidden.device_ptr(),
                 *graph.d_expert_gate_up.device_ptr(),
                 inv_wp, inv_sp,
-                hs, 2 * intermediate, gs,
+                hs, 2 * intermediate, gs, is_int8,
             )?;
 
             // w2: DMA fallback path needs separate DMA for w2
@@ -12810,7 +12897,7 @@ impl GpuDecodeStore {
                 inv_wp, inv_sp,
                 intermediate, hs, gs,
                 shared_weight, gate_weight_ptr,
-                k,
+                k, is_int8,
             )?;
         }
 
@@ -13028,6 +13115,7 @@ impl GpuDecodeStore {
             self.configure(
                 hidden_size, num_layers, vocab_size, 1e-6,
                 topk, intermediate_size, hidden_size * 3, group_size,
+                store.gpu_num_bits,
             )?;
         }
 
@@ -13330,6 +13418,7 @@ impl GpuDecodeStore {
         self.configure(
             hidden_size, config.num_hidden_layers, 1, 1e-6,
             topk, intermediate_size, hidden_size * 3, group_size,
+            store.gpu_num_bits,
         )?;
 
         // Step 3: Upload gate weight for the target layer as FP32
@@ -13518,6 +13607,7 @@ impl GpuDecodeStore {
         self.configure(
             hidden_size, config.num_hidden_layers, 1, 1e-6,
             topk, intermediate_size, hidden_size * 3, group_size,
+            store.gpu_num_bits,
         )?;
 
         // Register ALL MoE layers with synthetic gate weights
@@ -14303,6 +14393,7 @@ impl GpuDecodeStore {
         self.configure(
             hidden_size, config.num_hidden_layers, 1, 1e-6,
             topk, intermediate_size, hidden_size * 3, group_size,
+            store.gpu_num_bits,
         )?;
 
         // Step 3: Register ALL MoE layers with synthetic gate weights
@@ -14524,6 +14615,7 @@ impl GpuDecodeStore {
         self.configure(
             hidden_size, config.num_hidden_layers, 1, 1e-6,
             topk, intermediate_size, hidden_size * 3, group_size,
+            store.gpu_num_bits,
         )?;
 
         let mut max_expert_bytes = 0usize;
@@ -14883,6 +14975,7 @@ impl GpuDecodeStore {
         self.configure(
             hidden_size, config.num_hidden_layers, 1, 1e-6,
             topk, intermediate_size, hidden_size * 3, group_size,
+            store.gpu_num_bits,
         )?;
 
         let mut max_expert_bytes = 0usize;
@@ -15076,7 +15169,12 @@ impl GpuDecodeStore {
         results.push("  -- Single Expert Compute (w13 GEMV + fused silu+w2+accum) --".to_string());
         {
             let graph = self.graph.as_ref().unwrap();
-            let inv_wp = *graph.d_inv_weight_perm.device_ptr();
+            let is_int8 = graph.expert_bits == 8;
+            let inv_wp = if is_int8 {
+                *graph.d_inv_weight_perm_int8.device_ptr()
+            } else {
+                *graph.d_inv_weight_perm.device_ptr()
+            };
             let inv_sp = *graph.d_inv_scale_perm.device_ptr();
             let hs = graph.hidden_size;
             let intermediate = graph.intermediate_size;
@@ -15098,14 +15196,14 @@ impl GpuDecodeStore {
                     w13p, w13s,
                     *graph.d_hidden.device_ptr(),
                     *graph.d_expert_gate_up.device_ptr(),
-                    inv_wp, inv_sp, hs, 2 * intermediate, gs,
+                    inv_wp, inv_sp, hs, 2 * intermediate, gs, is_int8,
                 )?;
                 self.launch_fused_silu_accum(
                     w2p, w2s,
                     *graph.d_expert_gate_up.device_ptr(),
                     *graph.d_moe_out.device_ptr(),
                     inv_wp, inv_sp,
-                    intermediate, hs, gs, 0.1f32, 0u64, k,
+                    intermediate, hs, gs, 0.1f32, 0u64, k, is_int8,
                 )?;
             }
             self.device.synchronize()
@@ -15119,14 +15217,14 @@ impl GpuDecodeStore {
                     w13p, w13s,
                     *graph.d_hidden.device_ptr(),
                     *graph.d_expert_gate_up.device_ptr(),
-                    inv_wp, inv_sp, hs, 2 * intermediate, gs,
+                    inv_wp, inv_sp, hs, 2 * intermediate, gs, is_int8,
                 )?;
                 self.launch_fused_silu_accum(
                     w2p, w2s,
                     *graph.d_expert_gate_up.device_ptr(),
                     *graph.d_moe_out.device_ptr(),
                     inv_wp, inv_sp,
-                    intermediate, hs, gs, 0.1f32, 0u64, k,
+                    intermediate, hs, gs, 0.1f32, 0u64, k, is_int8,
                 )?;
             }
             self.device.synchronize()
@@ -15147,6 +15245,7 @@ impl GpuDecodeStore {
                     *graph.d_hidden.device_ptr(),
                     *graph.d_expert_gate_up.device_ptr(),
                     inv_wp, inv_sp, hs, 2 * intermediate, gs,
+                    is_int8,
                 )?;
             }
             self.device.synchronize()
@@ -15162,6 +15261,7 @@ impl GpuDecodeStore {
                     *graph.d_moe_out.device_ptr(),
                     inv_wp, inv_sp,
                     intermediate, hs, gs, 0.1f32, 0u64, k,
+                    is_int8,
                 )?;
             }
             self.device.synchronize()
@@ -15194,6 +15294,7 @@ impl GpuDecodeStore {
                     *graph.d_hidden.device_ptr(),
                     partial_ptr, inv_wp, inv_sp,
                     hs, 2 * intermediate, gs, w13_ksplits, k,
+                    is_int8,
                 )?;
                 self.launch_reduce_ksplits_bf16(
                     *graph.d_expert_gate_up.device_ptr(),
@@ -15211,6 +15312,7 @@ impl GpuDecodeStore {
                     *graph.d_hidden.device_ptr(),
                     partial_ptr, inv_wp, inv_sp,
                     hs, 2 * intermediate, gs, w13_ksplits, k,
+                    is_int8,
                 )?;
                 self.launch_reduce_ksplits_bf16(
                     *graph.d_expert_gate_up.device_ptr(),
@@ -15230,6 +15332,7 @@ impl GpuDecodeStore {
                         *graph.d_expert_gate_up.device_ptr(),
                         partial_ptr, inv_wp, inv_sp,
                         intermediate, hs, gs, w2_ksplits, k,
+                        is_int8,
                     )?;
                     self.launch_reduce_ksplits_weighted_accum(
                         *graph.d_moe_out.device_ptr(),
@@ -15247,6 +15350,7 @@ impl GpuDecodeStore {
                         *graph.d_expert_gate_up.device_ptr(),
                         partial_ptr, inv_wp, inv_sp,
                         intermediate, hs, gs, w2_ksplits, k,
+                        is_int8,
                     )?;
                     self.launch_reduce_ksplits_weighted_accum(
                         *graph.d_moe_out.device_ptr(),
@@ -15292,7 +15396,12 @@ impl GpuDecodeStore {
         results.push(format!("  -- Full Layer Compute ({} experts, all HCS, v2 w13) --", topk));
         {
             let graph = self.graph.as_ref().unwrap();
-            let inv_wp = *graph.d_inv_weight_perm.device_ptr();
+            let is_int8 = graph.expert_bits == 8;
+            let inv_wp = if is_int8 {
+                *graph.d_inv_weight_perm_int8.device_ptr()
+            } else {
+                *graph.d_inv_weight_perm.device_ptr()
+            };
             let inv_sp = *graph.d_inv_scale_perm.device_ptr();
             let hs = graph.hidden_size;
             let intermediate = graph.intermediate_size;
@@ -15335,6 +15444,7 @@ impl GpuDecodeStore {
                             *graph.d_hidden.device_ptr(),
                             partial_ptr, inv_wp, inv_sp,
                             hs, 2 * intermediate, gs, w13_ksplits, k,
+                            is_int8,
                         )?;
                         self.launch_reduce_ksplits_bf16(
                             *graph.d_expert_gate_up.device_ptr(),
@@ -15347,6 +15457,7 @@ impl GpuDecodeStore {
                             *graph.d_moe_out.device_ptr(),
                             inv_wp, inv_sp,
                             intermediate, hs, gs, 0.1f32, 0u64, k,
+                            is_int8,
                         )?;
                     }
                 }
@@ -15362,6 +15473,7 @@ impl GpuDecodeStore {
                             *graph.d_hidden.device_ptr(),
                             partial_ptr, inv_wp, inv_sp,
                             hs, 2 * intermediate, gs, w13_ksplits, k,
+                            is_int8,
                         )?;
                         self.launch_reduce_ksplits_bf16(
                             *graph.d_expert_gate_up.device_ptr(),
@@ -15374,6 +15486,7 @@ impl GpuDecodeStore {
                             *graph.d_moe_out.device_ptr(),
                             inv_wp, inv_sp,
                             intermediate, hs, gs, 0.1f32, 0u64, k,
+                            is_int8,
                         )?;
                     }
                 }

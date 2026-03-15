@@ -1307,18 +1307,29 @@ impl WeightStore {
                         gpu_loaded = true;
                     }
                     Err(e) => {
-                        if *try_gs == cache_gs {
-                            log::warn!("Marlin cache invalid (gs={}): {e}", try_gs);
-                        }
+                        log::warn!("Marlin INT{} cache load failed (gs={}): {e}", gpu_num_bits, try_gs);
                     }
                 }
             }
         }
 
-        // Build Marlin cache if not found
+        // Build Marlin cache if not found or existing cache is invalid
         if !gpu_loaded {
+            // Delete stale/invalid cache files before rebuilding
+            for try_gs in &[cache_gs, group_size, 32, 64, 128] {
+                let stale_path = cache_path_marlin(model_dir, *try_gs, gpu_num_bits);
+                if stale_path.exists() {
+                    log::warn!(
+                        "Deleting stale/invalid Marlin INT{} cache (gs={}): {}",
+                        gpu_num_bits, try_gs, stale_path.display(),
+                    );
+                    if let Err(e) = std::fs::remove_file(&stale_path) {
+                        log::warn!("Failed to delete stale cache: {e}");
+                    }
+                }
+            }
             let mpath = cache_path_marlin(model_dir, cache_gs, gpu_num_bits);
-            log::info!("No Marlin INT{} cache found, building from safetensors...", gpu_num_bits);
+            log::info!("Building Marlin INT{} cache from safetensors...", gpu_num_bits);
             let built_gs = Self::build_marlin_cache_locked(
                 model_dir, &config, group_size, total_moe_layers, &mpath, config_hash, gpu_num_bits,
             )?;
@@ -3387,9 +3398,7 @@ impl WeightStore {
                         gpu_loaded = true;
                     }
                     Err(e) => {
-                        if *try_gs == cache_gs {
-                            log::warn!("Marlin cache invalid (gs={}): {e}", try_gs);
-                        }
+                        log::warn!("Marlin INT{} cache load failed (gs={}): {e}", gpu_num_bits, try_gs);
                     }
                 }
             }

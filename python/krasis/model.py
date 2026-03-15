@@ -648,12 +648,20 @@ class KrasisModel:
             print(f"\n\033[1m\033[36m▸ Offloading attention for streaming decode\033[0m", flush=True)
             self._init_stream_attention()
         else:
-            # GPU-Max: attention weights permanently resident on GPU
             dev = self.all_devices[0]
-            attn_mb = self._estimate_attention_vram() >> 20
             free_mb = torch.cuda.mem_get_info(dev)[0] >> 20
-            logger.info("Attention resident on GPU: %d MB, GPU free: %d MB", attn_mb, free_mb)
-            print(f"  \033[0;32mAttention resident on GPU ({attn_mb} MB), {free_mb} MB free\033[0m", flush=True)
+            if self.quant_cfg.attention == "awq":
+                # AWQ: attention weights are on CPU, will be quantized to INT4/INT8
+                # and uploaded to GPU in setup_gpu_decode_store(). BF16 never touches GPU.
+                logger.info("Attention on CPU (AWQ: will quantize and upload in decode setup), GPU free: %d MB",
+                            free_mb)
+                print(f"  \033[0;32mAttention on CPU (AWQ pending), {free_mb} MB free\033[0m", flush=True)
+            else:
+                # BF16: attention weights permanently resident on GPU
+                attn_mb = self._estimate_attention_vram() >> 20
+                logger.info("Attention resident on GPU: %d MB, GPU free: %d MB",
+                            attn_mb, free_mb)
+                print(f"  \033[0;32mAttention resident on GPU ({attn_mb} MB), {free_mb} MB free\033[0m", flush=True)
 
         # Phase 2: Expert weights (Rust engine)
         cpu_start = time.perf_counter()
@@ -1053,8 +1061,14 @@ class KrasisModel:
             self._attn_offloaded = True
             logger.info("Incremental attention offload: %d layers, peak VRAM bounded to ~1 layer", L)
         else:
+            # When AWQ is configured, load attention weights to CPU (not GPU).
+            # AWQ quantizes BF16→INT4 on CPU then uploads only the packed INT4 to GPU
+            # in setup_gpu_decode_store(). Loading BF16 to GPU first wastes VRAM and
+            # risks OOM on large models (e.g. Q235B: ~12.8 GB BF16 attention).
+            awq_active = self.quant_cfg.attention == "awq"
+            _attn_dev = torch.device('cpu') if awq_active else None
             for layer_idx in range(L):
-                weights = loader.load_layer(layer_idx, primary_dev)
+                weights = loader.load_layer(layer_idx, primary_dev, attn_device=_attn_dev)
                 layer = TransformerLayer(
                     self.cfg, layer_idx, weights, primary_dev,
                     krasis_engine=None,
@@ -3847,6 +3861,7 @@ class KrasisModel:
             max_intermediate_size=self.cfg.moe_intermediate_size,
             max_qkv_size=max_qkv,
             group_size=128,
+            expert_bits=self.quant_cfg.gpu_expert_bits,
         )
 
         # Register embedding
@@ -4333,6 +4348,14 @@ class KrasisModel:
             store.set_timing(True)
             logger.info("GPU decode timing enabled (KRASIS_DECODE_TIMING=1)")
 
+        # Log actual attention VRAM after AWQ quantization (if applicable)
+        if self.quant_cfg.attention == "awq":
+            attn_mb = self._estimate_attention_vram() >> 20
+            dev = torch.device(self.ranks[0].device)
+            free_mb = torch.cuda.mem_get_info(dev)[0] >> 20
+            logger.info("Attention after AWQ quantization: %d MB, GPU free: %d MB", attn_mb, free_mb)
+            print(f"  \033[0;32mAttention after AWQ: {attn_mb} MB, {free_mb} MB free\033[0m", flush=True)
+
         logger.info("GPU decode store configured: %d layers, store_addr=%d",
                      len(self.layers), store.gpu_store_addr())
         return store
@@ -4374,6 +4397,7 @@ class KrasisModel:
             max_intermediate_size=self.cfg.moe_intermediate_size,
             max_qkv_size=max_qkv,
             group_size=128,
+            expert_bits=self.quant_cfg.gpu_expert_bits,
         )
 
         # Embedding — not needed on aux (segment_skip_embedding=true), but register
