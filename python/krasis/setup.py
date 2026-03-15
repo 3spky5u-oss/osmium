@@ -535,6 +535,12 @@ def _install_session_deps():
     # Install Bun if missing
     if not shutil.which("bun"):
         print(f"  Installing Bun...")
+        # Bun's installer requires unzip — install it if missing (common on fresh WSL2)
+        if not shutil.which("unzip"):
+            if distro == "debian":
+                _run(sudo + ["apt-get", "install", "-y", "unzip"], check=False)
+            elif distro == "rhel":
+                _run(sudo + ["dnf", "install", "-y", "unzip"], check=False)
         # Bun's official installer doesn't need sudo — installs to ~/.bun
         ret = _run(["bash", "-c", "curl -fsSL https://bun.sh/install | bash"], check=False)
         if ret.returncode != 0:
