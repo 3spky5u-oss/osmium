@@ -1480,6 +1480,32 @@ class GpuPrefillManager:
         # Ensure DMA buffer sizes/shapes are computed
         self._init_dma_buffers()
 
+        # Estimate total pinned RAM needed and check if we have enough.
+        # Each layer needs w13p + w13s + w2p + w2s bytes, times num_moe_layers.
+        per_layer_bytes = (self._dma_size_w13p + self._dma_size_w13s
+                           + self._dma_size_w2p + self._dma_size_w2s)
+        total_pinned_bytes = per_layer_bytes * self._num_moe_layers
+        try:
+            import psutil
+            avail_ram = psutil.virtual_memory().available
+        except ImportError:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        avail_ram = int(line.split()[1]) * 1024
+                        break
+                else:
+                    avail_ram = 0
+        # Require at least 10 GB headroom after pinning
+        headroom = 10 * 1024 ** 3
+        if avail_ram > 0 and total_pinned_bytes + headroom > avail_ram:
+            logger.info(
+                "Skipping prefill pinned buffers: need %.1f GB but only %.1f GB available "
+                "(keeping %.1f GB headroom). Using double-buffered DMA instead.",
+                total_pinned_bytes / 1e9, avail_ram / 1e9, headroom / 1e9,
+            )
+            return
+
         t0 = time.perf_counter()
         total_bytes = 0
 
