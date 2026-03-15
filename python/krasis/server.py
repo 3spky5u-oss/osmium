@@ -475,6 +475,13 @@ def main():
     import os # Ensure os is in local scope
     os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True" # Mitigate fragmentation
 
+    # WSL2: add CUDA driver library path so Rust cudarc can find libcuda.so
+    _wsl_cuda = "/usr/lib/wsl/lib"
+    if os.path.isdir(_wsl_cuda):
+        ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+        if _wsl_cuda not in ld_path:
+            os.environ["LD_LIBRARY_PATH"] = f"{_wsl_cuda}:{ld_path}" if ld_path else _wsl_cuda
+
     # Register cleanup early to prevent CUDA zombie processes
     atexit.register(_cleanup_cuda)
     def _force_exit_handler(sig, frame):

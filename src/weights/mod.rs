@@ -1950,6 +1950,10 @@ impl WeightStore {
         config_hash: u64,
         gpu_bits: u8,
     ) -> Result<usize, String> {
+        eprintln!(
+            "  \x1b[1;33m▸ Building GPU INT{} Marlin cache: {} layers from safetensors\x1b[0m",
+            gpu_bits, num_moe_layers,
+        );
         log::info!(
             "Streaming build MARLIN cache (INT{}): {} MoE layers from safetensors → {}",
             gpu_bits, num_moe_layers, cache_path.display(),
@@ -2215,7 +2219,14 @@ impl WeightStore {
 
             let layers_done = moe_idx - start_moe_layer + 1;
             let layer_elapsed = layer_start.elapsed();
+            let overall_elapsed = overall_start.elapsed().as_secs_f64();
+            let avg_per_layer = overall_elapsed / layers_done as f64;
+            let remaining = (num_moe_layers - layers_done) as f64 * avg_per_layer;
             if layers_done % 5 == 0 || layers_done == num_moe_layers {
+                eprintln!(
+                    "    GPU Marlin: {layers_done}/{num_moe_layers} layers ({:.0}s elapsed, ~{:.0}s remaining)",
+                    overall_elapsed, remaining,
+                );
                 crate::syscheck::log_memory_usage(&format!(
                     "Marlin cache: {layers_done}/{num_moe_layers} layers ({:.1}s/layer, io={:.1}s repack={:.1}s)",
                     layer_elapsed.as_secs_f64(),
@@ -2236,6 +2247,7 @@ impl WeightStore {
         // Stream shared experts
         if config.n_shared_experts > 0 {
             let shared_name = detect_shared_expert_name(&index.weight_map);
+            eprintln!("    GPU Marlin: writing shared experts...");
             log::info!("Streaming shared experts ({} layers, naming='{}')...", num_moe_layers, shared_name);
             for moe_idx in start_moe_layer..(start_moe_layer + num_moe_layers) {
                 let layer_idx = moe_idx + config.first_k_dense_replace;
@@ -2269,6 +2281,10 @@ impl WeightStore {
 
         let elapsed = overall_start.elapsed();
         let size = std::fs::metadata(cache_path).map(|m| m.len()).unwrap_or(0);
+        eprintln!(
+            "  \x1b[0;32m✓ GPU INT{} Marlin cache built: {:.1} GB in {:.0}s\x1b[0m",
+            gpu_bits, size as f64 / 1e9, elapsed.as_secs_f64(),
+        );
         log::info!(
             "Marlin cache built: {:.1} GB in {:.1}s ({:.1} GB/s)",
             size as f64 / 1e9,
@@ -2371,6 +2387,10 @@ impl WeightStore {
                     .unwrap_or_default()
                     .trim()
                     .to_string();
+                eprintln!(
+                    "  \x1b[1;33m▸ Another process is building Marlin INT{} cache, waiting...\x1b[0m",
+                    gpu_bits,
+                );
                 log::info!(
                     "Another process (PID {}) is building Marlin INT{} cache, waiting... Lock: {}",
                     if holder_pid.is_empty() { "unknown".to_string() } else { holder_pid },
@@ -2514,12 +2534,17 @@ impl WeightStore {
 
         let is_partial = start_moe_layer > 0 || num_layers_to_load < total_moe_layers;
         if is_partial {
+            eprintln!(
+                "    Loading GPU Marlin cache: layers {}-{} of {}...",
+                start_moe_layer, start_moe_layer + num_layers_to_load, total_moe_layers,
+            );
             log::info!(
                 "Loading MARLIN cache (partial): layers [{}-{}), {} of {} ({})",
                 start_moe_layer, start_moe_layer + num_layers_to_load,
                 num_layers_to_load, total_moe_layers, path.display(),
             );
         } else {
+            eprintln!("    Loading GPU Marlin cache: {} layers...", total_moe_layers);
             log::info!("Loading MARLIN cache: {} (all {} layers)", path.display(), total_moe_layers);
         }
         let load_start = std::time::Instant::now();
@@ -2583,6 +2608,10 @@ impl WeightStore {
         drop(file);
 
         let elapsed = load_start.elapsed();
+        eprintln!(
+            "    GPU Marlin cache loaded: {:.1} GB in {:.0}s",
+            offset as f64 / 1e9, elapsed.as_secs_f64(),
+        );
         log::info!(
             "MARLIN cache loaded in {:.1}s: {} layers × {} experts (+ {} shared), {:.1} GB",
             elapsed.as_secs_f64(),
@@ -2622,6 +2651,10 @@ impl WeightStore {
         config_hash: u64,
         cpu_num_bits: u8,
     ) -> Result<usize, String> {
+        eprintln!(
+            "  \x1b[1;33m▸ Building CPU INT{} expert cache: {} layers from safetensors\x1b[0m",
+            cpu_num_bits, num_moe_layers,
+        );
         log::info!(
             "Streaming build CPU INT{} cache: {} MoE layers from safetensors → {}",
             cpu_num_bits, num_moe_layers, cache_path.display(),
@@ -2792,7 +2825,14 @@ impl WeightStore {
 
             let layers_done = moe_idx - start_moe_layer + 1;
             let layer_elapsed = layer_start.elapsed();
+            let overall_elapsed = overall_start.elapsed().as_secs_f64();
+            let avg_per_layer = overall_elapsed / layers_done as f64;
+            let remaining = (num_moe_layers - layers_done) as f64 * avg_per_layer;
             if layers_done % 5 == 0 || layers_done == num_moe_layers {
+                eprintln!(
+                    "    CPU INT{}: {layers_done}/{num_moe_layers} layers ({:.0}s elapsed, ~{:.0}s remaining)",
+                    cpu_num_bits, overall_elapsed, remaining,
+                );
                 crate::syscheck::log_memory_usage(&format!(
                     "CPU cache: {layers_done}/{num_moe_layers} layers ({:.1}s/layer, io={:.1}s transpose={:.1}s)",
                     layer_elapsed.as_secs_f64(),
@@ -2813,6 +2853,7 @@ impl WeightStore {
         // Stream shared experts
         if config.n_shared_experts > 0 {
             let shared_name = detect_shared_expert_name(&index.weight_map);
+            eprintln!("    CPU INT{}: writing shared experts...", cpu_num_bits);
             log::info!("Streaming shared experts for CPU cache ({} layers, naming='{}')...", num_moe_layers, shared_name);
             for moe_idx in start_moe_layer..(start_moe_layer + num_moe_layers) {
                 let layer_idx = moe_idx + config.first_k_dense_replace;
@@ -2850,6 +2891,10 @@ impl WeightStore {
 
         let elapsed = overall_start.elapsed();
         let size = std::fs::metadata(cache_path).map(|m| m.len()).unwrap_or(0);
+        eprintln!(
+            "  \x1b[0;32m✓ CPU INT{} cache built: {:.1} GB in {:.0}s\x1b[0m",
+            cpu_num_bits, size as f64 / 1e9, elapsed.as_secs_f64(),
+        );
         log::info!(
             "CPU INT{} cache built: {:.1} GB in {:.1}s ({:.1} GB/s)",
             cpu_num_bits,
@@ -2950,12 +2995,17 @@ impl WeightStore {
 
         let is_partial = start_moe_layer > 0 || num_layers_to_load < total_moe_layers;
         if is_partial {
+            eprintln!(
+                "    Loading CPU INT{} cache: layers {}-{} of {}...",
+                expected_bits, start_moe_layer, start_moe_layer + num_layers_to_load, total_moe_layers,
+            );
             log::info!(
                 "Loading CPU INT{} cache (partial): layers [{}-{}), {} of {} ({})",
                 expected_bits, start_moe_layer, start_moe_layer + num_layers_to_load,
                 num_layers_to_load, total_moe_layers, path.display(),
             );
         } else {
+            eprintln!("    Loading CPU INT{} cache: {} layers...", expected_bits, total_moe_layers);
             log::info!("Loading CPU INT{} cache: {} (all {} layers)", expected_bits, path.display(), total_moe_layers);
         }
         let load_start = std::time::Instant::now();
@@ -3031,6 +3081,10 @@ impl WeightStore {
         drop(file);
 
         let elapsed = load_start.elapsed();
+        eprintln!(
+            "    CPU INT{} cache loaded: {:.1} GB in {:.0}s",
+            expected_bits, offset as f64 / 1e9, elapsed.as_secs_f64(),
+        );
         log::info!(
             "CPU INT{} cache loaded in {:.1}s: {} layers × {} experts (+ {} shared), {:.1} GB",
             expected_bits,
@@ -3670,6 +3724,10 @@ impl WeightStore {
     ) -> Result<(u8, u8), String> {
         use crate::gguf;
 
+        eprintln!(
+            "  \x1b[1;33m▸ Building CPU cache from GGUF: {} layers\x1b[0m",
+            total_moe_layers,
+        );
         log::info!(
             "Building GGUF→AVX2 CPU cache: {} MoE layers → {}",
             total_moe_layers, cache_path.display(),
