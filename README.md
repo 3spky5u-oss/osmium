@@ -10,22 +10,13 @@ If you want to easily monitor Krasis during runs, [check out ktop](https://githu
 
 ## Krasis runs MoE LLMs fast on consumer level hardware
 
-Krasis can run MoE language models that are much too large to fit in a consumer GPU (multi-hundred gigabyte modesl with 100 - 500+ billion parameters) on consumer or accessible server hardware you can actually buy without a second mortgage and your own personal power station. 
+Krasis can run MoE language models that are much too large to fit in a consumer GPU (multi-hundred gigabyte modesl with 80- 500+ billion parameters) on consumer or accessible server hardware that doesn't require the huge cost to host the entire model in VRAM. 
 
-**Most importantly, it runs these models at usable speeds.**
+## Results vs Llama.cpp
 
-## Qwen3-Coder-Next Results (80B params, 3324 tok/sec prefill on 1x 5080 16GB)
 
-Qwen3-Coder-Next (80B params, 148 GB BF16) is a model which will clearly not fit inside a single consumer GPU unless very heavily quantised to Q2 or less.
 
-At Q4 Qwen3-Coder-Next is around 37GB, too much to fit on even the largest consumer GPUs. 
 
-Krasis is able to run Qwen3-Coder-Next (Q4 quantised) with **one 16GB GPU** at the following speeds:
-
-- 5900X, 3200 DDR4, 1x 5080 16GB (PCIE4.0x16) : **3324 tok/sec prefill, 14.93 tok/sec decode**
-- Epyc 7742, 2666 DDR4, 1x RTX Ada 2000 16GB (PCIE4.0x8) : **1060 tok/sec prefill, 18.9 tok/sec decode**
-
-Krasis can likely run QCN at speed with even lower VRAM limited GPUs than these (further testing is planned).  Qwen 235B will run with a 16GB card given sufficient system RAM (around 230GB).
 
 ## Why LLM's run slow, and how Krasis runs them fast
 
@@ -47,22 +38,12 @@ Krasis employs a different approach that utilises the GPU and system RAM more he
 ## Krasis tradeoffs
 In order to achieve these speeds, Krasis has a few requirements.
 
-- **Krasis uses more system RAM than other runtimes**, you may need 2x the model weights worth of system ram (so to run a model which is 30GB at Q4 you will need 60GB of system ram), but this is generally **far more obtainable and cost effective than the equivalent VRAM**.
-- Krasis must be given the **BF16 safetensors model** downloaded from [HuggingFace](https://huggingface.co/)
-- Krasis can build everything it needs from this model or if you prefer you can give it **both** the BF16 safetensors and a second GGUF model with an optimised quantisation you prefer (e.g. unsloth Q4_K models)
 - Krasis currently only works with **NVidia GPUs**
+- Krasis must be given the **BF16 safetensors model** downloaded from [HuggingFace](https://huggingface.co/)
+- **Krasis uses comparable system RAM to other runtimes**.  Krasis will auto-quantize to INT4 or INT8 from the safetensors model provided and build a cache on disk, then load that into system RAM.
 - Krasis **will take some time to load on the first run** as it is doing a lot of pre-run work to optimise everything for runtime, much of this is cached for later runs though so subsequent runs will be quicker.
-- Krasis optimises models and caches them in <home folder>/.krasis, these can be large so you may need disk space for the original model BF16 model plus **2x the quantized model** (for QCN at Q4 this would be 149GB + 38GB + 38GB = ~225GB).
-- **Krasis is optimised to run models at Q4 and Q8**, which are generally very good tradeoffs vs either running the full precision weights or heavily quantised models much lowered quality.
-
-## Krasis TODO
-Krasis is a new project, and although I believe the results are very promising there is more work to do in various areas.
-
-- Decode speed would benefit from further optimisation.
-- Decode could benefit significantly from speculative draft models (perhaps 2-3x).
-- Concurrent usage of the server hasn't been tested yet and is likely not optimal.
-- Multi-GPU has been explored but it is generally not as fast as one GPU yet, needs further exploration.
-- More models and architectures to support.
+- Krasis optimises models and caches them in <home folder>/.krasis, these can be large so you may need disk space for the original model BF16 model plus the quantised model size.
+- **Krasis is optimised to run models at Q4 and Q8**, which are generally very good trade-offs vs either running the full precision weights or heavily quantised models much lowered quality.
 
 ## Supported Models
 

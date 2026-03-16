@@ -1523,7 +1523,21 @@ class Launcher:
 def parse_args() -> argparse.Namespace:
     from krasis import __version__
     parser = argparse.ArgumentParser(
-        description="Krasis — Interactive MoE inference server launcher",
+        description="Krasis — High-performance MoE inference engine",
+        epilog=(
+            "subcommands (use before any flags):\n"
+            "  krasis                  Launch interactive TUI configurator\n"
+            "  krasis chat [args]      Chat client (connect to running server)\n"
+            "  krasis kill             Terminate all running krasis instances\n"
+            "\n"
+            "examples:\n"
+            "  krasis                              # interactive TUI\n"
+            "  krasis --config model.conf          # non-interactive with config file\n"
+            "  krasis chat                         # chat with running server\n"
+            "  krasis chat --port 8013             # chat on non-default port\n"
+            "  krasis kill                         # stop all krasis processes\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--config", default=None,
@@ -1752,12 +1766,89 @@ def _check_gpu_deps():
         sys.exit(1)
 
 
+def _do_kill():
+    """Terminate all running krasis server processes (and only krasis)."""
+    import signal
+    import glob as globmod
+
+    my_pid = os.getpid()
+    my_ppid = os.getppid()
+    killed = []
+
+    # Scan /proc for krasis processes — more reliable than pgrep
+    for proc_dir in globmod.glob("/proc/[0-9]*"):
+        try:
+            pid = int(os.path.basename(proc_dir))
+        except ValueError:
+            continue
+
+        # Skip self and parent
+        if pid == my_pid or pid == my_ppid:
+            continue
+
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmdline = f.read().decode("utf-8", errors="replace").replace("\x00", " ").strip()
+        except (OSError, PermissionError):
+            continue
+
+        if not cmdline:
+            continue
+
+        # Must be a krasis process — match server, chat, launcher, etc.
+        # But not editors, shells, or this kill command
+        if "krasis" not in cmdline:
+            continue
+        if "krasis kill" in cmdline:
+            continue
+        # Skip dev script itself (bash ./dev ...)
+        if cmdline.startswith("bash") and "/dev " in cmdline:
+            continue
+        # Must be a Python/krasis process, not e.g. vim editing a krasis file
+        is_krasis = False
+        if "python" in cmdline and "krasis" in cmdline:
+            is_krasis = True
+        elif cmdline.strip().startswith("krasis"):
+            is_krasis = True
+        if not is_krasis:
+            continue
+
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed.append((pid, cmdline))
+            print(f"  Terminated PID {pid}: {cmdline[:80]}")
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            print(f"  Permission denied for PID {pid}: {cmdline[:80]}")
+
+    if not killed:
+        print("No running krasis processes found.")
+    else:
+        print(f"\nTerminated {len(killed)} process(es).")
+
+        # Give them a moment to exit, then SIGKILL stragglers
+        import time
+        time.sleep(2)
+        for pid, cmdline in killed:
+            try:
+                os.kill(pid, 0)  # check if still alive
+                os.kill(pid, signal.SIGKILL)
+                print(f"  Force-killed PID {pid}")
+            except (ProcessLookupError, PermissionError):
+                pass
+
+
 def main():
-    # Handle "krasis chat [args]" subcommand early — no GPU detection needed
+    # Handle subcommands early — before argparse, no GPU detection needed
     if len(sys.argv) > 1 and sys.argv[1] == "chat":
         sys.argv = [sys.argv[0]] + sys.argv[2:]  # strip "chat" from argv
         from krasis.chat import main as chat_main
         chat_main()
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "kill":
+        _do_kill()
         return
 
     args = parse_args()
