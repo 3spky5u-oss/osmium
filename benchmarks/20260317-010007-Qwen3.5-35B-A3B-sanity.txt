@@ -1,0 +1,537 @@
+Sanity Test: Qwen3.5-35B-A3B @ http://localhost:8012
+Date: 2026-03-17T01:00:07.813073
+
+--- Prompt 1/14 [turn 1/3] ---
+PROMPT: Hi
+RESPONSE: 
+
+Hello! How can I help you today?
+TIME: (pp: 11t 686ms 16t/s - tg: 2012t>11t 22.3s 90.5t/s)
+
+--- Prompt 2/14 [turn 2/3] ---
+PROMPT: What's your name?
+RESPONSE: 
+
+Hello! I am Qwen3.5. How can I assist you today?
+TIME: (pp: 35t 689ms 51t/s - tg: 49t>19t 690ms 97.0t/s)
+
+--- Prompt 3/14 [turn 3/3] ---
+PROMPT: Who trained you?
+RESPONSE: 
+
+Hello! I am Qwen3.5. I was developed by the Qwen team. How can I assist you today?
+TIME: (pp: 66t 682ms 97t/s - tg: 28t>28t 573ms 96.0t/s)
+
+--- Prompt 4/14 [turn 1/3] ---
+PROMPT: What is 2+2?
+RESPONSE: 
+
+4
+TIME: (pp: 17t 683ms 25t/s - tg: 78t>3t 845ms 94.6t/s)
+
+--- Prompt 5/14 [turn 2/3] ---
+PROMPT: Now multiply that by 10
+RESPONSE: 
+
+The result is 40.
+TIME: (pp: 35t 686ms 51t/s - tg: 4t>9t 144ms 83.4t/s)
+
+--- Prompt 6/14 [turn 3/3] ---
+PROMPT: And divide the result by 5
+RESPONSE: 
+
+The result is 8.
+TIME: (pp: 59t 685ms 86t/s - tg: 58t>8t 697ms 93.2t/s)
+
+--- Prompt 7/14 ---
+PROMPT: What is the largest animal in the world?
+RESPONSE: 
+
+The largest animal in the world is the **blue whale** (*Balaenoptera musculus*).
+
+Here are a few key facts about them:
+
+*   **Size:** They can grow up to **30 meters (98 feet)** in length.
+*   **Weight:** They can weigh up to **200 tons** (approximately 400,000 pounds).
+*   **Historical Context:** The blue whale is also the largest animal known to have ever lived on Earth, surpassing even the largest dinosaurs.
+*   **Body Parts:** Their heart is the size of a small car, and their tongue alone can weigh as much as an elephant.
+
+While the African Bush Elephant is the largest **land** animal, the blue whale holds the title for the largest animal overall.
+TIME: (pp: 19t 683ms 28t/s - tg: 790t>171t 10.6s 90.7t/s)
+
+--- Prompt 8/14 ---
+PROMPT: What is the largest body of water in the world?
+RESPONSE: 
+
+The largest body of water in the world is the **Pacific Ocean**.
+
+It covers approximately **63 million square miles** (165 million square kilometers), which is about one-third of the Earth's total surface area.
+
+However, there is a common distinction made between oceans and inland water bodies:
+*   **Largest Ocean:** The Pacific Ocean.
+*   **Largest Lake (Inland):** The Caspian Sea (which is technically the world's largest lake, not a sea).
+TIME: (pp: 21t 684ms 31t/s - tg: 550t>106t 7.2s 91.5t/s)
+
+--- Prompt 9/14 ---
+PROMPT: Describe the binary chop algorithm in depth
+RESPONSE: 
+
+# The Binary Chop Algorithm (Binary Search)
+
+The **Binary Chop** algorithm, more formally known in computer science as **Binary Search**, is one of the most fundamental and efficient algorithms for searching a specific value within a collection. It is a quintessential example of the **Divide and Conquer** paradigm.
+
+While Linear Search checks elements one by one ($O(n)$), Binary Search eliminates half of the remaining search space with every comparison, achieving logarithmic time complexity ($O(\log n)$).
+
+---
+
+## 1. Core Prerequisites
+Before understanding the algorithm, one must understand its strict requirements:
+1.  **Sorted Data:** The input collection (array, list, or vector) **must be sorted** in ascending or descending order.
+2.  **Random Access:** The data structure must allow access to any element in constant time (e.g., an array). It does not work efficiently on linked lists because accessing the "middle" element is slow.
+
+---
+
+## 2. The Conceptual Mechanism
+Imagine a dictionary. If you are looking for the word "Python," you do not start at page 1. You open the book roughly in the middle.
+*   If the word is alphabetically **before** the current page, you know the answer is in the first half.
+*   If the word is alphabetically **after**, you know the answer is in the second half.
+*   You repeat this process on the chosen half until you find the word or determine it doesn't exist.
+
+The "Chop" refers to the act of cutting the search space in half at every iteration.
+
+---
+
+## 3. Step-by-Step Logic
+Let $A$ be a sorted array of size $n$. We are searching for a target value $T$.
+
+1.  **Initialize Pointers:**
+    *   `low` (left bound) = index $0$
+    *   `high` (right bound) = index $n-1$
+
+2.  **The Loop:** Continue while `low` $\le$ `high`.
+    *   **Calculate Midpoint:** Find the middle index.
+        $$mid = \lfloor \frac{low + high}{2} \rfloor$$
+    *   **Compare:** Check $A[mid]$ against $T$.
+        *   **Match:** If $A[mid] == T$, return $mid$. The search is successful.
+        *   **Less Than:** If $T < A[mid]$, the target must be in the left half. Update `high = mid - 1`.
+        *   **Greater Than:** If $T > A[mid]$, the target must be in the right half. Update `low = mid + 1`.
+
+3.  **Termination:** If the loop ends without a match, the target is not in the array.
+
+---
+
+## 4. Implementation (Python)
+Here is the standard iterative implementation.
+
+```python
+def binary_chop(arr, target):
+    low = 0
+    high = len(arr) - 1
+
+    while low <= high:
+        # Critical Safety Check: Prevent integer overflow
+        # (low + high) might exceed max integer in languages like C++ or Java
+        mid = low + (high - low) // 2 
+
+        if arr[mid] == target:
+            return mid
+        elif arr[mid] < target:
+            low = mid + 1
+        else:
+            high = mid - 1
+            
+    return -1  # Target not found
+```
+
+---
+
+## 5. Complexity Analysis
+
+### Time Complexity
+The time complexity is derived from how many times we can divide $n$ by 2 before reaching 1.
+$$n \times (\frac{1}{2})^k = 1 \implies 2^k = n \implies k = \log_2 n$$
+
+*   **Best Case:** $O(1)$ (The target is found immediately at the middle).
+*   **Average Case:** $O(\log n)$.
+*   **Worst Case:** $O(\log n)$ (The target is at the ends or not present).
+
+**Comparison:** For an array of 1,000,000 elements:
+*   Linear Search takes up to 1,000,000 operations.
+*   Binary Search takes up to $\approx 20$ operations ($\log_2 1,000,000 \approx 19.9$).
+
+### Space Complexity
+*   **Iterative Approach:** $O(1)$. Only a few variables (`low`, `high`, `mid`) are used.
+*   **Recursive Approach:** $O(\log n)$ due to the function call stack.
+
+---
+
+## 6. Critical Implementation Pitfalls
+
+### A. Integer Overflow
+In languages with fixed-size integers (like C++ or Java), calculating `mid` using `(low + high) / 2` can cause overflow if `low` and `high` are large positive integers.
+**Solution:** Use `mid = low + (high - low) / 2`. This is mathematically equivalent but safe from overflow.
+
+### B. Infinite Loops
+If the update logic is incorrect, the pointers may never cross, causing an infinite loop.
+*   **Correct:** `high = mid - 1` and `low = mid + 1`.
+*   **Incorrect:** `high = mid` or `low = mid` without the offset. If `low` and `high` are adjacent (e.g., 5 and 6), `mid` becomes 5. If you set `high = mid`, it stays 5, and the loop never progresses.
+
+### C. Floating Point Indices
+If the array size is odd, the division results in a float. The algorithm must use **floor division** (round down) to ensure the index is an integer.
+
+---
+
+## 7. Advanced Variations
+
+Standard binary search returns *any* index where the match is found. However, specific problems require modifications.
+
+### 1. Finding the First or Last Occurrence (Duplicates)
+If the array contains duplicates (e.g., `[1, 3, 5, 5, 5, 7]` and target is `5`), standard search might return index 3 or 4.
+*   **First Occurrence:** When `arr[mid] == target`, do not return. Instead, record `mid` as a potential answer and search the **left** half (`high = mid - 1`) to see if an earlier occurrence exists.
+*   **Last Occurrence:** When `arr[mid] == target`, record `mid` and search the **right** half (`low = mid + 1`).
+
+### 2. Binary Search on Answer
+Sometimes the answer isn't an index in an array, but a value within a range (e.g., "Find the minimum capacity required to ship packages in $D$ days").
+*   Define a search range $[L, R]$.
+*   Pick a value $mid$.
+*   Write a function `check(mid)` that returns true/false.
+*   If `check(mid)` is true, try smaller values; if false, try larger values.
+
+### 3. Rotated Sorted Array
+A sorted array that has been rotated (e.g., `[4, 5, 6, 7, 0, 1, 2]`).
+*   The algorithm must determine which half is *sorted* and which is *rotated* to decide where to search.
+*   Logic: If `arr[low] <= arr[mid]`, the left half is sorted. Check if target is in that range. Otherwise, search the right.
+
+---
+
+## 8. Real-World Applications
+1.  **Database Indexing:** B-Trees and B+ Trees use binary search logic to locate records quickly.
+2.  **Dictionary/Thesaurus:** Finding the correct spelling or definition.
+3.  **Debugging:** "Binary Search Debugging" is a technique where you comment out half the code to isolate a bug.
+4.  **Game Development:** Spatial partitioning (e.g., finding which tile a player is standing on in a grid).
+5.  **Compiler Optimization:** Symbol tables often use binary search for variable lookups.
+
+---
+
+## 9. Summary
+The Binary Chop is a highly efficient algorithm that trades **data ordering** (requiring sorted input) for **search speed** ($O(\log n)$).
+
+| Feature | Detail |
+| :--- | :--- |
+| **Paradigm** | Divide and Conquer |
+| **Input Requirement** | Sorted Array / Random Access |
+| **Time Complexity** | $O(\log n)$ |
+| **Space Complexity** | $O(1)$ (Iterative) |
+| **Key Optimization** | `mid = low + (high - low) / 2` |
+| **Main Limitation** | Requires data to be sorted; rebuilding the sort is costly for frequent updates. |
+
+Understanding the Binary Chop is essential for any computer scientist, as it forms the basis for more complex data structures like Binary Search Trees and is a common pattern in competitive programming and system design.
+TIME: (pp: 17t 684ms 25t/s - tg: 1097t>1990t 34.4s 89.8t/s)
+
+--- Prompt 10/14 ---
+PROMPT: If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long does it take for 20 towels to dry under the exact same conditions?
+RESPONSE: 
+
+It takes **4 hours**.
+
+**Reasoning:**
+This is a classic logic puzzle. The time it takes for clothes to dry depends on the environmental conditions (sun, wind, heat) rather than the number of items hanging, provided they have enough space on the line to dry without blocking each other. Since all the towels are drying simultaneously under the exact same conditions, adding more towels (up to the capacity of the line) does not increase the drying time.
+TIME: (pp: 48t 692ms 69t/s - tg: 1120t>96t 13.4s 90.4t/s)
+
+--- Prompt 11/14 [turn 1/3] ---
+PROMPT: Tell me facts about the blue whale
+RESPONSE: 
+
+Here are some fascinating facts about the **blue whale** (*Balaenoptera musculus*):
+
+**Record-Breaking Size**
+*   **Largest Animal Ever:** The blue whale is the largest animal known to have ever lived on Earth, surpassing even the largest dinosaurs.
+*   **Length:** They can grow up to **100 feet (30 meters)** long.
+*   **Weight:** They can weigh as much as **200 tons** (approximately 400,000 pounds).
+
+**Unique Anatomy**
+*   **The Heart:** A blue whale's heart is the size of a small car and weighs about **400 pounds (180 kg)**.
+*   **The Tongue:** A single tongue can weigh as much as an **elephant** (around 2,700 pounds or 1,300 kg).
+*   **Blood Volume:** Their blood volume is so vast that it takes about an hour to circulate from the heart to the rest of the body.
+
+**Diet and Feeding**
+*   **Krill:** They primarily feed on tiny shrimp-like crustaceans called **krill**.
+*   **Consumption:** A single blue whale can consume up to **4 tons (8,000 pounds)** of krill per day during feeding season.
+*   **Baleen:** Instead of teeth, they have baleen plates in their mouths to filter water and trap prey.
+
+**Communication and Sound**
+*   **Loudest Animal:** The blue whale produces the loudest sounds of any animal on the planet.
+*   **Decibels:** Their calls can reach up to **188 decibels**.
+*   **Range:** These low-frequency rumbles can be heard by other whales over **500 miles (800 km)** away, allowing them to communicate across vast ocean distances.
+
+**Lifespan and Reproduction**
+*   **Longevity:** They can live for **70 to 90 years**.
+*   **Gestation:** Females are pregnant for about **10 to 12 months**.
+*   **Growth:** A newborn calf is already about **23 feet (7 meters)** long and weighs 3 tons. They drink about 100 gallons of milk per day to grow rapidly.
+
+**Conservation Status**
+*   **Endangered:** Due to commercial whaling in the 20th century, their population dropped by over 90%. They are currently classified as **Endangered**.
+*   **Recovery:** Populations are slowly recovering, but they remain vulnerable to ship strikes, pollution, and climate change affecting krill populations.
+TIME: (pp: 17t 688ms 25t/s - tg: 1795t>577t 26.4s 89.9t/s)
+
+--- Prompt 12/14 [turn 2/3] ---
+PROMPT: Tell me more about whales in general
+RESPONSE: 
+
+Here is a more general overview of **whales** (*Cetacea*):
+
+### **Classification & Evolution**
+*   **Mammals:** Whales are warm-blooded mammals, not fish. They breathe air, give birth to live young, and nurse them.
+*   **Evolution:** They evolved from land-dwelling ancestors that returned to the ocean millions of years ago. Their hind legs shrank and disappeared, and their front legs became flippers.
+*   **Two Groups:** There are two main groups of whales:
+    *   **Baleen Whales:** Have baleen plates (instead of teeth) to filter-feed.
+    *   **Toothed Whales:** Have teeth and hunt for prey like fish and squid.
+
+### **Size & Weight**
+*   **The Blue Whale:** The largest animal ever, reaching up to 30 meters (100 feet) and weighing 150-190 tons.
+*   **The Sperm Whale:** The largest toothed whale, with the largest brain of any animal.
+*   **The Fin Whale:** The second-largest animal, reaching up to 26 meters (85 feet).
+*   **The Minke Whale:** The smallest whale, reaching up to 9 meters (30 feet).
+
+### **Diet & Feeding**
+*   **Filter Feeding:** Baleen whales (like Blue, Humpback, and Gray) use baleen plates to strain krill and small fish from the water.
+*   **Hunting:** Toothed whales (like Sperm, Orca, and Dolphin) hunt individually or in pods.
+*   **The Krill:** A single Blue Whale can consume up to 4 tons of krill per day.
+
+### **Senses & Communication**
+*   **Echolocation:** Toothed whales use echolocation to navigate and hunt in dark waters.
+*   **Whale Songs:** Humpback whales are famous for their complex, changing songs.
+*   **Low-Frequency Sounds:** Blue whales produce the loudest animal sounds, reaching up to 188 decibels.
+
+### **Reproduction & Lifespan**
+*   **Gestation:** Females are pregnant for about 10-12 months (varies by species).
+*   **Lifespan:** They can live for 70-90 years (some species up to 100+).
+*   **Calves:** Newborn calves are already large (e.g., a Blue Whale calf is ~7 meters long and weighs ~3 tons).
+
+### **Conservation**
+*   **Threats:** Commercial whaling, pollution, and climate change are major threats.
+*   **Status:** Many species are classified as "Endangered" or "Vulnerable."
+*   **Recovery:** Populations are slowly recovering due to international bans on commercial whaling.
+
+### **Fun Facts**
+*   **Blubber:** They have thick blubber layers to insulate them in cold water.
+*   **Deep Diving:** Sperm whales can dive over 3,000 meters (10,000 feet) deep.
+*   **Sleep:** They sleep with one half of their brain at a time to stay alert for predators.
+*   **Migration:** Many species migrate thousands of miles between feeding and breeding grounds.
+
+### **Interesting Note**
+*   **The Orca (Killer Whale):** While technically the largest dolphin, it's often grouped with whales due to its size and intelligence.
+
+This overview covers the general biology, behavior, and conservation of whales. Let me know if you want to dive deeper into a specific species or topic! 🐋
+TIME: (pp: 609t 701ms 869t/s - tg: 785t>793t 17.6s 89.6t/s)
+
+--- Prompt 13/14 [turn 3/3] ---
+PROMPT: Where do whales live geographically?
+RESPONSE: 
+
+Here is a geographical overview of **where whales live** (*Cetacea*):
+
+### **Habitat & Range**
+*   **Global Distribution:** Whales live in **all oceans** from the Arctic to the Antarctic.
+*   **Temperature Tolerance:** They live in **all temperature zones**, from the **freezing** (0°C / 32°F) to **tropical** (30°C / 86°F).
+*   **Depth:** Some species can dive to **3,000 meters (10,000 feet)** deep.
+*   **Coastal vs. Open Ocean:** Some live **coastally** (near land) and others **open-ocean** (far from land).
+
+### **Specific Species Ranges**
+*   **Blue Whale:** They live in **all oceans**, but primarily in the **Pacific** and **Atlantic** oceans.
+*   **Humpback Whale:** They live in **all oceans** and migrate between **tropical breeding grounds** and **polar feeding grounds**.
+*   **Sperm Whale:** They live in **deep, open waters** and rarely come to the surface.
+*   **Orca (Killer Whale):** They live in **all oceans** and are found in **both polar** and **tropical** waters.
+*   **Fin Whale:** They live in **all oceans** and are found in **both polar** and **tropical** waters.
+*   **Minke Whale:** They live in **all oceans** and are found in **both polar** and **tropical** waters.
+*   **Gray Whale:** They live in the **Pacific** and **Atlantic** oceans.
+*   **Right Whale:** They live in the **North Atlantic** and **North Pacific** oceans.
+*   **Beluga Whale:** They live in the **Arctic** and **sub-Arctic** oceans.
+*   **Narwhal:** They live in the **Arctic** and **sub-Arctic** oceans.
+
+### **Migration Patterns**
+*   **Polar to Tropical:** Many species migrate from **polar** (cold) feeding grounds to **tropical** (warm) breeding grounds.
+*   **Distance:** Some species can migrate up to **10,000 miles (16,000 km)** per year.
+*   **Seasonal:** Migration is usually **seasonal**, occurring in **spring** and **autumn**.
+
+### **Depth & Environment**
+*   **Surface:** Most whales live **near the surface** (0-100 meters).
+*   **Deep:** Some species (like Sperm) live **deep** (up to 3,000 meters).
+*   **Coastal:** Some species (like Gray and Humpback) live **coastally**.
+*   **Open Ocean:** Some species (like Sperm and Blue) live **open ocean**.
+
+### **Conservation & Threats**
+*   **Commercial Whaling:** Historical whaling has reduced populations significantly.
+*   **Pollution:** Plastic, oil, and noise pollution threaten whales.
+*   **Climate Change:** Warming oceans and melting ice affect their food sources and migration.
+*   **Ship Strikes:** Ship strikes are a major threat to large whales.
+*   **Fishing Gear:** Entanglement in fishing gear is a major threat.
+
+### **Fun Facts**
+*   **Arctic:** The Arctic is home to **Beluga** and **Narwhal**.
+*   **Antarctic:** The Antarctic is home to **Blue** and **Humpback** whales.
+*   **Pacific:** The Pacific is home to **Blue**, **Humpback**, and **Sperm** whales.
+*   **Atlantic:** The Atlantic is home to **Blue**, **Humpback**, and **Sperm** whales.
+*   **Indian:** The Indian Ocean is home to **Blue** and **Humpback** whales.
+*   **Southern:** The Southern Ocean is home to **Blue** and **Humpback** whales.
+
+This overview covers the **geographical distribution**, **habitat**, **migration**, **depth**, **conservation**, and **fun facts** about where whales live. Let me know if you want to dive deeper into a specific species or region! 🐋🌍🌊
+TIME: (pp: 1417t 706ms 2008t/s - tg: 941t>941t 21.0s 89.5t/s)
+
+--- Prompt 14/14 ---
+PROMPT: Write me a quicksort implementation in Rust
+RESPONSE: 
+
+# Quicksort Implementation in Rust
+
+Here's a clean, idiomatic implementation of the quicksort algorithm in Rust, including both in-place and functional versions, along with test cases and usage examples.
+
+## 1. In-Place Quicksort (Mutable Reference)
+
+```rust
+fn quicksort<T: Ord>(arr: &mut [T]) {
+    if arr.len() <= 1 {
+        return;
+    }
+    quicksort_recursive(arr, 0, arr.len() - 1);
+}
+
+fn quicksort_recursive<T: Ord>(arr: &mut [T], left: usize, right: usize) {
+    if left >= right {
+        return;
+    }
+
+    let pivot_index = partition(arr, left, right);
+    if pivot_index > 0 {
+        quicksort_recursive(arr, left, pivot_index - 1);
+    }
+    quicksort_recursive(arr, pivot_index + 1, right);
+}
+
+fn partition<T: Ord>(arr: &mut [T], left: usize, right: usize) -> usize {
+    let pivot = arr[right];
+    let mut i = left;
+
+    for j in left..right {
+        if arr[j] <= pivot {
+            arr.swap(i, j);
+            i += 1;
+        }
+    }
+
+    arr.swap(i, right);
+    i
+}
+```
+
+## 2. Functional Version (Returns New Vector)
+
+```rust
+fn quicksort_vec<T: Ord + Clone>(arr: &[T]) -> Vec<T> {
+    if arr.len() <= 1 {
+        return arr.to_vec();
+    }
+
+    let pivot = &arr[arr.len() / 2];
+    let (left, middle, right): (Vec<T>, Vec<T>, Vec<T>) = arr.iter()
+        .cloned()
+        .partition3(|x| x < *pivot, |x| x == *pivot, |x| x > *pivot);
+
+    let mut result = Vec::new();
+    result.extend(quicksort_vec(&left));
+    result.extend(middle);
+    result.extend(quicksort_vec(&right));
+    result
+}
+
+fn partition3<T, F1, F2, F3>(
+    iter: impl IntoIterator<Item = T>,
+    f1: F1, f2: F2, f3: F3
+) -> (Vec<T>, Vec<T>, Vec<T>)
+where
+    F1: Fn(&T) -> bool,
+    F2: Fn(&T) -> bool,
+    F3: Fn(&T) -> bool,
+{
+    let (mut left, mut middle, mut right) = (Vec::new(), Vec::new(), Vec::new());
+    for item in iter {
+        if f1(&item) {
+            left.push(item);
+        } else if f2(&item) {
+            middle.push(item);
+        } else {
+            right.push(item);
+        }
+    }
+    (left, middle, right)
+}
+```
+
+## 3. Example Usage and Tests
+
+```rust
+fn main() {
+    let mut data = vec![64, 34, 25, 12, 22, 11, 90];
+    println!("Original: {:?}", data);
+
+    quicksort(&mut data);
+    println!("Sorted: {:?}", data);
+
+    // Functional version
+    let data2 = vec![5, 2, 8, 2, 9, 1, 5];
+    let sorted = quicksort_vec(&data2);
+    println!("Functional sort: {:?}", sorted);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_empty() {
+        let mut arr = vec![];
+        quicksort(&mut arr);
+        assert!(arr.is_empty());
+    }
+
+    #[test]
+    fn test_single() {
+        let mut arr = vec![42];
+        quicksort(&mut arr);
+        assert_eq!(arr, vec![42]);
+    }
+
+    #[test]
+    fn test_sorted() {
+        let mut arr = vec![1, 2, 3, 4, 5];
+        quicksort(&mut arr);
+        assert_eq!(arr, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_reversed() {
+        let mut arr = vec![5, 4, 3, 2, 1];
+        quicksort(&mut arr);
+        assert_eq!(arr, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_with_duplicates() {
+        let mut arr = vec![3, 1, 2, 3, 1, 2];
+        quicksort(&mut arr);
+        assert_eq!(arr, vec![1, 1, 2, 2, 3, 3]);
+    }
+}
+```
+
+## Key Features
+
+- **In-place sorting:** Modifies the original array for memory efficiency.
+- **Functional variant:** Returns a new sorted vector.
+- **Generic and reusable:** Works with any `Ord`-compatible type.
+- **Test coverage:** Includes unit tests for edge cases.
+- **Clean structure:** Separates concerns with helper functions.
+
+This implementation balances performance, clarity, and idiomatic Rust style.
+TIME: (pp: 18t 688ms 26t/s - tg: 74t>1212t 14.2s 90.3t/s)
+

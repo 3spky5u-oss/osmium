@@ -1,0 +1,452 @@
+Sanity Test: Qwen3.5-35B-A3B @ http://localhost:8012
+Date: 2026-03-16T22:40:01.641964
+
+--- Prompt 1/14 [turn 1/3] ---
+PROMPT: Hi
+RESPONSE: 
+
+Hi there! 👋 How's it going? Let me know if there's anything I can help you with today!
+TIME: (pp: 11t 683ms 16t/s - tg: 1106t>26t 10.8s 104.5t/s)
+
+--- Prompt 2/14 [turn 2/3] ---
+PROMPT: What's your name?
+RESPONSE: 
+
+I'm Qwen3.5. How can I assist you today?
+TIME: (pp: 50t 692ms 72t/s - tg: 7t>17t 207ms 111.2t/s)
+
+--- Prompt 3/14 [turn 3/3] ---
+PROMPT: Who trained you?
+RESPONSE: 
+
+I'm Qwen3.5, a large language model trained by Tongyi Lab. I'm here to help with writing, coding, analysis, and more! What do you need? 🚀
+
+**Quick facts:**
+- **Name:** Qwen3.5
+- **Developer:** Tongyi Lab
+- **Purpose:** Assist with tasks like answering questions, creating content, and solving problems
+
+What's on your mind? 😊
+TIME: (pp: 79t 678ms 116t/s - tg: 101t>93t 1.8s 106.8t/s)
+
+--- Prompt 4/14 [turn 1/3] ---
+PROMPT: What is 2+2?
+RESPONSE: 
+
+2 + 2 = 4
+TIME: (pp: 17t 682ms 25t/s - tg: 224t>9t 2.1s 108.9t/s)
+
+--- Prompt 5/14 [turn 2/3] ---
+PROMPT: Now multiply that by 10
+RESPONSE: 
+
+4 × 10 = 40
+TIME: (pp: 41t 684ms 60t/s - tg: 52t>11t 560ms 110.6t/s)
+
+--- Prompt 6/14 [turn 3/3] ---
+PROMPT: And divide the result by 5
+RESPONSE: 
+
+40 ÷ 5 = 8
+TIME: (pp: 67t 678ms 99t/s - tg: 76t>11t 784ms 109.7t/s)
+
+--- Prompt 7/14 ---
+PROMPT: What is the largest animal in the world?
+RESPONSE: 
+
+The largest animal in the world is the **blue whale** (*Balaenoptera musculus*).
+
+Here are a few key facts about its size:
+*   **Length:** They can grow up to **98 feet (30 meters)** long.
+*   **Weight:** They can weigh as much as **200 tons** (approximately 400,000 pounds).
+*   **Comparison:** The blue whale is not only the largest animal currently living but also the largest animal known to have ever lived, surpassing even the largest dinosaurs.
+
+For comparison, a blue whale's tongue alone can weigh as much as an elephant, and its heart is about the size of a small car.
+TIME: (pp: 19t 685ms 28t/s - tg: 1056t>151t 11.6s 104.4t/s)
+
+--- Prompt 8/14 ---
+PROMPT: What is the largest body of water in the world?
+RESPONSE: 
+
+The largest body of water on Earth is the **Pacific Ocean**.
+
+It covers approximately **63 million square miles** (165 million square kilometers), which is about 30% of the planet's surface area.
+
+If you are specifically asking about the largest **lake**, that title belongs to the **Caspian Sea**. Despite its name, it is technically a lake because it is landlocked and does not connect to the world's oceans.
+TIME: (pp: 21t 682ms 31t/s - tg: 813t>95t 8.6s 104.9t/s)
+
+--- Prompt 9/14 ---
+PROMPT: Describe the binary chop algorithm in depth
+RESPONSE: 
+
+Here is an in-depth description of the **Binary Chop** (more formally known as **Binary Search**) algorithm.
+
+---
+
+### 1. Overview and Definition
+The Binary Chop is a classic algorithm used to find the position of a target value within a **sorted** array or list. It operates on the principle of **Divide and Conquer**.
+
+Unlike a Linear Search, which checks every element sequentially ($O(n)$), the Binary Chop eliminates half of the remaining search space with every comparison. This makes it significantly faster for large datasets, achieving a time complexity of $O(\log n)$.
+
+**Key Terminology:**
+*   **Target:** The value you are searching for.
+*   **Midpoint:** The element in the middle of the current search range.
+*   **Bounds:** The `low` (start index) and `high` (end index) of the current search window.
+
+---
+
+### 2. Prerequisites
+For the Binary Chop to function correctly, two strict conditions must be met:
+1.  **Sorted Data:** The data must be sorted in ascending (or descending) order. If the data is unsorted, the logic of "discarding the left or right half" is invalid.
+2.  **Random Access:** The data structure must allow for $O(1)$ access to the middle element. This works perfectly for **Arrays** (vectors, lists), but is inefficient for **Linked Lists** (where you must traverse to the middle, negating the speed benefit).
+
+---
+
+### 3. The Logic (Step-by-Step)
+Imagine you are looking for a word in a physical dictionary. You wouldn't start at page 1; you would open the book to the middle.
+1.  **Check the Middle:** Look at the word in the middle of the current section.
+2.  **Compare:**
+    *   If the word matches, **Return Success**.
+    *   If the target word comes *before* the middle word alphabetically, **Discard the right half** and repeat on the left.
+    *   If the target word comes *after* the middle word, **Discard the left half** and repeat on the right.
+3.  **Repeat:** Continue this process until the target is found or the search space is empty.
+
+**The "Chop":**
+The algorithm "chops" the search space in half at every iteration.
+*   Iteration 1: $N$ items remain.
+*   Iteration 2: $N/2$ items remain.
+*   Iteration 3: $N/4$ items remain.
+*   ...
+*   Iteration $k$: $N/2^k = 1$ item remains.
+
+---
+
+### 4. Mathematical Complexity
+The efficiency is derived from logarithmic growth.
+
+**Time Complexity:**
+*   **Best Case:** $O(1)$ (The target is exactly in the middle).
+*   **Average Case:** $O(\log n)$.
+*   **Worst Case:** $O(\log n)$ (The target is at the very end or not present).
+*   *Why?* If we have $N$ elements, the maximum number of comparisons required is $\log_2(N)$. For example, to search a list of 1,000,000 items, a Binary Chop takes at most 20 comparisons ($2^{20} \approx 1,048,576$). A Linear Search would take up to 1,000,000.
+
+**Space Complexity:**
+*   **Iterative Approach:** $O(1)$ (Constant space, only variables for pointers).
+*   **Recursive Approach:** $O(\log n)$ (Due to the call stack depth).
+
+---
+
+### 5. Implementation Details
+
+#### A. The Midpoint Trap (Integer Overflow)
+A common pitfall in languages like C++ or Java (where integers have fixed sizes) is calculating the midpoint:
+```python
+# DANGEROUS if low and high are very large
+mid = (low + high) / 2
+```
+If `low` and `high` are both near the maximum integer value, `low + high` will overflow (wrap around to a negative number), causing a crash or incorrect logic.
+
+**The Safe Calculation:**
+```python
+mid = low + (high - low) / 2
+```
+This subtracts first, preventing overflow, then adds back to the base index.
+
+#### B. Iterative Implementation (Python)
+```python
+def binary_search(arr, target):
+    low = 0
+    high = len(arr) - 1
+
+    while low <= high:
+        # Safe midpoint calculation
+        mid = low + (high - low) // 2
+        
+        if arr[mid] == target:
+            return mid
+        elif arr[mid] < target:
+            low = mid + 1
+        else:
+            high = mid - 1
+            
+    return -1  # Target not found
+```
+*Note:* The condition `low <= high` is crucial. If it were `low < high`, a single remaining element might be skipped.
+
+#### C. Recursive Implementation (Python)
+```python
+def binary_search_recursive(arr, target, low, high):
+    if low > high:
+        return -1
+    
+    mid = low + (high - low) // 2
+    
+    if arr[mid] == target:
+        return mid
+    elif arr[mid] < target:
+        return binary_search_recursive(arr, target, mid + 1, high)
+    else:
+        return binary_search_recursive(arr, target, low, mid - 1)
+```
+
+---
+
+### 6. Variations and Edge Cases
+In production or interview settings, the basic algorithm is rarely enough. You must handle variations:
+
+#### A. Duplicates
+Standard Binary Search returns *any* index where the target exists. If the array is `[1, 2, 2, 2, 3]` and you search for `2`, it might return index 2.
+*   **First Occurrence:** Modify the logic. If `arr[mid] == target`, do not return immediately. Instead, store `mid` as a potential answer and search the **left** half (`high = mid - 1`) to see if an earlier `2` exists.
+*   **Last Occurrence:** Similar, but search the **right** half (`low = mid + 1`) when a match is found.
+
+#### B. Rotated Sorted Array
+Sometimes data is sorted but then "rotated" (e.g., `[4, 5, 6, 7, 0, 1, 2]`).
+*   **Logic:** You must determine which half is *sorted* before deciding which half to discard.
+*   **Complexity:** Still $O(\log n)$, but the logic requires checking `arr[low]` vs `arr[mid]`.
+
+#### C. Floating Point Precision
+When searching for floats, direct equality (`==`) is dangerous due to precision errors.
+*   **Solution:** Use a tolerance epsilon: `abs(arr[mid] - target) < epsilon`.
+
+---
+
+### 7. Pros and Cons
+
+| Pros | Cons |
+| :--- | :--- |
+| **Extremely Fast:** Logarithmic time makes it ideal for massive datasets. | **Requires Sorting:** If data is dynamic (frequent insertions/deletions), keeping it sorted is expensive ($O(n \log n)$ or $O(n)$). |
+| **Low Memory:** Iterative version uses constant memory. | **Not for Linked Lists:** You cannot jump to the middle in $O(1)$ time. |
+| **Deterministic:** Performance is predictable regardless of data distribution. | **Binary Search Trees (BST):** While similar, a BST handles dynamic data better than a static sorted array. |
+
+---
+
+### 8. Comparison: Linear vs. Binary
+
+| Feature | Linear Search | Binary Search |
+| :--- | :--- | :--- |
+| **Data Requirement** | Unsorted | Sorted |
+| **Time Complexity** | $O(n)$ | $O(\log n)$ |
+| **Space Complexity** | $O(1)$ | $O(1)$ (Iterative) |
+| **Data Structure** | Lists, Arrays, Linked Lists | Arrays, Vectors |
+| **Best For** | Small datasets, Unsorted data | Large datasets, Static data |
+
+---
+
+### 9. Summary
+The Binary Chop is one of the most fundamental algorithms in computer science. Its power lies in the exponential reduction of the search space. However, its utility is constrained by the requirement for sorted data and random access.
+
+**When to use it:**
+1.  You have a large, static, sorted dataset.
+2.  You need to find a specific value quickly.
+3.  You need to find the "insertion point" for a new value in a sorted list (often used in database indexing).
+
+**When NOT to use it:**
+1.  The data is unsorted (Sort it first if you search multiple times).
+2.  The data is a Linked List.
+3.  The dataset is tiny (Linear search has less overhead).
+TIME: (pp: 17t 681ms 25t/s - tg: 1115t>1995t 30.2s 102.9t/s)
+
+--- Prompt 10/14 ---
+PROMPT: If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long does it take for 20 towels to dry under the exact same conditions?
+RESPONSE: 
+
+It takes **4 hours**.
+
+Here is the reasoning: The towels dry simultaneously. As long as there is enough space on the clothesline to hang all the towels at once without blocking the sun or airflow, they will all dry in the same amount of time. The number of towels does not change the drying speed of each individual towel.
+TIME: (pp: 48t 686ms 70t/s - tg: 917t>70t 9.6s 102.9t/s)
+
+--- Prompt 11/14 [turn 1/3] ---
+PROMPT: Tell me facts about the blue whale
+RESPONSE: 
+
+Here are some fascinating facts about the blue whale, the largest animal to ever exist on Earth:
+
+**Size and Weight**
+*   **The Biggest Ever:** A blue whale is larger than any known dinosaur. They can grow up to **30 meters (98 feet)** long.
+*   **Massive Weight:** They can weigh as much as **200 tons** (roughly 30 elephants).
+*   **Heart Size:** Their heart is about the size of a small car and weighs approximately **600 pounds (270 kg)**.
+*   **Tongue Weight:** Their tongue alone can weigh as much as a full-grown elephant.
+*   **Blood Volume:** They have enough blood to fill about **2,000 gallons (7,500 liters)**.
+
+**Diet and Eating Habits**
+*   **Krill Specialists:** Blue whales are baleen whales, meaning they don't have teeth. Instead, they have plates of keratin (like fingernails) that filter tiny shrimp-like creatures called **krill** from the water.
+*   **Huge Appetite:** During feeding season, a blue whale can eat up to **4 tons of krill per day**.
+*   **Throat Grooves:** They have pleats in their throat skin that expand like an accordion, allowing them to gulp massive amounts of water and krill before filtering it out.
+
+**Communication and Sound**
+*   **Loudest Animal:** The blue whale is the loudest animal on Earth. Their calls can reach up to **188 decibels**.
+*   **Long Distance:** These low-frequency sounds can travel hundreds of miles underwater, allowing them to communicate with other whales across vast ocean distances.
+
+**Biology and Life Cycle**
+*   **Mammals, Not Fish:** Like humans, blue whales breathe air, are warm-blooded, and nurse their young.
+*   **Huge Babies:** A newborn calf is already massive, measuring about **7 meters (23 feet)** long and weighing **3 tons** at birth.
+*   **Milk Power:** Calf milk is extremely rich (about 35% fat), allowing them to gain up to **90 kilograms (200 pounds)** per day.
+*   **Lifespan:** They can live for **80 to 90 years**, though some studies suggest they may live even longer.
+
+**Conservation**
+*   **Near Extinction:** In the early 20th century, commercial whaling nearly wiped them out. By the 1960s, their population had dropped by 90%.
+*   **Protected Status:** Hunting is now banned globally, and their population is slowly recovering, though they are still listed as "Endangered."
+*   **Habitat:** They are found in oceans all over the world, from the poles to the tropics, but they tend to migrate between feeding grounds in the summer and breeding grounds in the winter.
+TIME: (pp: 17t 685ms 25t/s - tg: 888t>635t 14.7s 103.4t/s)
+
+--- Prompt 12/14 [turn 2/3] ---
+PROMPT: Tell me more about whales in general
+RESPONSE: 
+
+While the blue whale is the undisputed giant of the ocean, it is just one of over 90 species of cetaceans (whales, dolphins, and porpoises). Here is a broader look at the world of whales in general, covering their biology, behavior, and diversity.
+
+### 1. They Are All Mammals
+Despite living in the ocean, whales are not fish. They share key traits with humans and land mammals:
+*   **Warm-Blooded:** They maintain a constant body temperature.
+*   **Breathe Air:** They have lungs and must surface to breathe through a blowhole (a modified nostril on top of the head).
+*   **Live Birth:** They give birth to live young (calves) rather than laying eggs.
+*   **Nursing:** Females produce milk to feed their calves. Whale milk is incredibly rich in fat (about 40–50%) to help calves build blubber quickly.
+
+### 2. Two Main Groups: Baleen vs. Toothed
+Whales are generally divided into two suborders based on how they eat:
+*   **Mysticeti (Baleen Whales):** These whales do not have teeth. Instead, they have keratin plates (baleen) hanging from their upper jaw. They filter feed by taking in large mouthfuls of water and pushing it out, trapping krill, plankton, or small fish.
+    *   *Examples:* Blue Whale, Humpback Whale, Gray Whale, Right Whale.
+*   **Odontoceti (Toothed Whales):** These whales have teeth and are active predators. They hunt larger prey like fish, squid, and seals.
+    *   *Examples:* Orca (Killer Whale), Sperm Whale, Beluga, and most dolphins (which are technically small whales).
+
+### 3. Incredible Anatomy and Adaptations
+*   **Blubber:** A thick layer of fat under the skin that insulates them from cold water and stores energy.
+*   **Diving Ability:** Some whales can hold their breath for over 90 minutes. The Sperm Whale can dive deeper than 3,000 meters (nearly 2 miles) in search of giant squid.
+*   **Sleep:** Whales cannot afford to sleep with both brain hemispheres shut down (like humans) because they need to consciously breathe. They practice "unihemispheric sleep," where one half of the brain sleeps while the other stays awake to control swimming and breathing.
+*   **Blowholes:** When they exhale at the surface, the warm air meets the cold air, creating a visible "spout" of mist and water vapor.
+
+### 4. Intelligence and Communication
+*   **Complex Songs:** Humpback whales are famous for their complex, evolving songs that can last for hours and be heard for miles underwater.
+*   **Echolocation:** Toothed whales use sound to navigate and hunt. They click their tongues or vocalize, and the sound bounces off objects (like fish or the sea floor) to create a "sound picture."
+*   **Social Structures:** Many whales, especially Orcas (Killer Whales), live in tight-knit family pods with distinct cultures, dialects, and hunting techniques passed down from mothers to offspring.
+
+### 5. Migration and Habitat
+*   **Long Distances:** Some whales migrate the longest distances of any mammal. Gray whales travel up to 20,000 kilometers (12,000 miles) round trip from feeding grounds in the Arctic to breeding grounds in Mexico.
+*   **Global Range:** Whales live in oceans all over the world, from the freezing Antarctic to tropical waters. Some species, like the River Dolphin, even live in freshwater rivers.
+
+### 6. Conservation and Threats
+Many whale populations face significant threats:
+*   **Bycatch:** Accidental entanglement in fishing nets.
+*   **Ship Strikes:** Collisions with large vessels.
+*   **Pollution:** Plastic waste and chemical runoff enter the food chain.
+*   **Noise Pollution:** Sonar and shipping noise interfere with their echolocation and communication.
+*   **Climate Change:** Melting ice affects the availability of krill and alters migration routes.
+
+While the Blue Whale is the largest, the diversity of the whale family shows how well-adapted these mammals are to life in the sea. From the tiny Vaquita (one of the smallest dolphins/whales) to the massive Sperm Whale, they play a critical role in ocean health.
+TIME: (pp: 667t 690ms 967t/s - tg: 2322t>970t 32.2s 102.3t/s)
+
+--- Prompt 13/14 [turn 3/3] ---
+PROMPT: Where do whales live geographically?
+RESPONSE: 
+
+Whales are found in every ocean on Earth, from the freezing poles to the tropical equator. Their geography is dictated by a need to balance feeding in nutrient-rich cold waters with breeding in warm, safe waters. While they are global citizens, their specific locations are often tightly linked to the seasonal cycles of the ocean.
+
+Here is a breakdown of where whales live geographically:
+
+### 1. The Poles: The Summer Feeding Grounds
+During the summer, most whale species migrate to the Arctic and Antarctic oceans.
+*   **Why?** The cold water is rich in nutrients, leading to massive blooms of krill and plankton.
+*   **Who?** Blue whales, Humpback whales, and Minke whales spend their summers here, eating massive amounts to build up fat reserves for the winter.
+*   **The Ice:** The **Bowhead Whale** lives in the Arctic year-round, using its massive head to break through ice to breathe.
+
+### 2. The Tropics: The Winter Breeding Grounds
+During the winter, most whales migrate to warmer waters closer to the equator.
+*   **Why?** Calves are born here because the warm water helps them survive. Newborns have very little blubber and cannot handle the freezing polar water.
+*   **Who?** Gray whales breed in the lagoons of Baja California, Mexico. Humpbacks breed in the waters of Hawaii and the Caribbean.
+
+### 3. Coastal vs. Open Ocean
+*   **Coastal Whales:** Some species prefer shallow waters near the shore. The **Gray Whale**, for example, is often seen close to the coast during migration.
+*   **Pelagic Whales:** Others, like the **Blue Whale** and **Sperm Whale**, spend most of their lives in the deep, open ocean, far from land.
+
+### 4. Freshwater Rivers
+While most whales are marine, some species live in freshwater.
+*   **River Dolphins:** The **Amazon River Dolphin** (Boto) and the **Ganges River Dolphin** are found in the rivers of South America and India.
+
+### 5. Specific Hotspots
+*   **Chatham Island, New Zealand:** A major feeding ground for Blue Whales.
+*   **Monterey Bay, California:** Famous for Humpback and Gray whale sightings.
+*   **Antarctic Peninsula:** A critical feeding ground for many baleen whales.
+*   **Baffin Bay, Canada:** Home to the largest population of Bowhead Whales.
+
+### 6. Migration Routes
+*   **The Great Circle:** Many whales follow specific migration routes that can be thousands of miles long. The **Gray Whale** migration is one of the longest known of any mammal.
+*   **Seasonal Shifts:** They move from the poles in the summer to the tropics in the winter, essentially following the food and warmth.
+
+### 7. Conservation Areas
+*   **Marine Protected Areas:** Many countries have established sanctuaries to protect whales from ship strikes and fishing gear.
+*   **International Waters:** Whales often cross international borders, requiring global cooperation to protect them.
+
+### Fun Fact
+The smallest whale, the **Vaquita**, is found only in the Gulf of California, Mexico, making it one of the most geographically restricted whale species.
+TIME: (pp: 1652t 749ms 2206t/s - tg: 1950t>701t 25.9s 102.2t/s)
+
+--- Prompt 14/14 ---
+PROMPT: Write me a quicksort implementation in Rust
+RESPONSE: 
+
+Here is an idiomatic, in-place Quicksort implementation in Rust. It uses slices (`&mut [T]`) to allow sorting any type that implements the `Ord` trait without allocating extra memory.
+
+```rust
+fn quicksort<T: Ord>(arr: &mut [T]) {
+    // Base case: slices of length 0 or 1 are already sorted
+    if arr.len() <= 1 {
+        return;
+    }
+
+    // Partition the array and get the pivot index
+    let pivot_index = partition(arr);
+
+    // Recursively sort the sub-slices
+    // Note: The pivot is now at pivot_index, so we skip it
+    quicksort(&mut arr[..pivot_index]);
+    quicksort(&mut arr[pivot_index + 1..]);
+}
+
+fn partition<T: Ord>(arr: &mut [T]) -> usize {
+    // Choose the last element as the pivot
+    let pivot = arr[arr.len() - 1];
+    
+    // 'i' tracks the position where the next smaller element should go
+    let mut i = 0;
+    
+    // Iterate through all elements except the pivot
+    for j in 0..arr.len() - 1 {
+        if arr[j] <= pivot {
+            arr.swap(i, j);
+            i += 1;
+        }
+    }
+    
+    // Place the pivot in its correct sorted position
+    arr.swap(i, arr.len() - 1);
+    
+    i
+}
+
+fn main() {
+    let mut data = vec![10, 80, 30, 90, 40, 50, 70];
+    
+    println!("Before: {:?}", data);
+    
+    // Convert Vec to mutable slice for sorting
+    quicksort(&mut data);
+    
+    println!("After:  {:?}", data);
+}
+```
+
+### Key Implementation Details
+
+1.  **Generics (`<T: Ord>`)**: The function works on any type that can be ordered (e.g., `i32`, `String`, `u8`).
+2.  **In-Place Sorting**: It operates on `&mut [T]` (slices) rather than `Vec<T>`. This means it sorts the data in memory without creating new vectors, making it memory efficient.
+3.  **Lomuto Partition Scheme**: The `partition` function uses the last element as a pivot. It rearranges elements so that everything smaller than the pivot is on the left, and everything larger is on the right.
+4.  **Recursion**: The function splits the slice into two smaller slices (`arr[..pivot_index]` and `arr[pivot_index + 1..]`) and calls itself on them.
+
+### Performance Notes
+*   **Average Time Complexity:** $O(n \log n)$
+*   **Worst Time Complexity:** $O(n^2)$ (Occurs if the array is already sorted and the pivot is always the smallest or largest element).
+*   **Space Complexity:** $O(\log n)$ (Due to recursion stack).
+
+**Note:** For production code, Rust's standard library `slice.sort()` (which uses Introsort) is generally preferred as it handles worst-case scenarios better and is highly optimized. Use this implementation primarily for learning or algorithmic exercises.
+TIME: (pp: 18t 689ms 26t/s - tg: 3229t>715t 38.4s 102.6t/s)
+

@@ -1,0 +1,488 @@
+Sanity Test: Qwen3.5-35B-A3B @ http://localhost:8012
+Date: 2026-03-16T22:25:13.354788
+
+--- Prompt 1/14 [turn 1/3] ---
+PROMPT: Hi
+RESPONSE: 
+
+Hello! How can I help you today?
+TIME: (pp: 11t 701ms 16t/s - tg: 593t>11t 5.8s 104.2t/s)
+
+--- Prompt 2/14 [turn 2/3] ---
+PROMPT: What's your name?
+RESPONSE: 
+TIME: (pp: 35t 686ms 51t/s - tg: 28t>0t 241ms 111.9t/s)
+
+--- Prompt 3/14 [turn 3/3] ---
+PROMPT: Who trained you?
+RESPONSE: 
+TIME: (pp: 34t 688ms 49t/s - tg: 75t>0t 672ms 110.0t/s)
+
+--- Prompt 4/14 [turn 1/3] ---
+PROMPT: What is 2+2?
+RESPONSE: 
+
+2 + 2 = 4
+TIME: (pp: 17t 680ms 25t/s - tg: 207t>9t 2.0s 108.4t/s)
+
+--- Prompt 5/14 [turn 2/3] ---
+PROMPT: Now multiply that by 10
+RESPONSE: 
+TIME: (pp: 41t 686ms 60t/s - tg: 10t>0t 81ms 111.5t/s)
+
+--- Prompt 6/14 [turn 3/3] ---
+PROMPT: And divide the result by 5
+RESPONSE: 
+
+4 ÷ 5 = **0.8** (or 4/5 as a fraction)
+TIME: (pp: 41t 684ms 60t/s - tg: 44t>23t 597ms 110.6t/s)
+
+--- Prompt 7/14 ---
+PROMPT: What is the largest animal in the world?
+RESPONSE: 
+
+The largest animal in the world is the **blue whale** (*Balaenoptera musculus*).
+
+Here are some key facts about its size:
+*   **Length:** They can grow up to **30 meters (98 feet)** long.
+*   **Weight:** They can weigh as much as **200 tons (181 metric tonnes)**.
+*   **Comparison:** The blue whale is not only the largest animal alive today but is also considered the largest animal to have ever lived, surpassing even the biggest dinosaurs in terms of mass.
+
+To put their size in perspective, a blue whale's heart is about the size of a small car, and its tongue weighs as much as an elephant.
+TIME: (pp: 19t 682ms 28t/s - tg: 1121t>151t 12.3s 103.3t/s)
+
+--- Prompt 8/14 ---
+PROMPT: What is the largest body of water in the world?
+RESPONSE: 
+
+The largest body of water in the world is the **Pacific Ocean**.
+
+Here is a breakdown depending on how you define "body of water":
+
+*   **Largest Ocean:** The **Pacific Ocean**, covering approximately 63 million square miles (165 million square kilometers). It is larger than all of the Earth's land area combined.
+*   **Largest Inland Body of Water (Lake):** The **Caspian Sea**. Despite its name, it is a landlocked body of water (a lake). It covers about 143,000 square miles (371,000 square kilometers).
+*   **Largest Freshwater Lake (by surface area):** **Lake Superior** (in North America), covering about 31,700 square miles (82,000 square kilometers).
+*   **Largest Freshwater Lake (by volume):** **Lake Baikal** (in Russia), which holds more water than all the North American Great Lakes combined.
+TIME: (pp: 21t 707ms 30t/s - tg: 1227t>213t 13.9s 103.4t/s)
+
+--- Prompt 9/14 ---
+PROMPT: Describe the binary chop algorithm in depth
+RESPONSE: 
+
+# The Binary Chop Algorithm (Binary Search)
+
+The **Binary Chop**, more formally known as **Binary Search**, is one of the most fundamental and efficient algorithms in computer science. It is a classic example of the **Divide and Conquer** paradigm.
+
+While "Binary Search" is the modern standard terminology, "Binary Chop" is a descriptive colloquialism often used in older computer science literature or specific educational contexts to emphasize the action of "chopping" the search space in half at every step.
+
+---
+
+## 1. Core Concept and Prerequisites
+
+### The Goal
+To find a specific target value within a collection of data.
+
+### The Prerequisite
+The data structure **must be sorted** (either in ascending or descending order). If the data is unsorted, the binary chop algorithm cannot guarantee correctness, and a linear search or sorting must be performed first.
+
+### The Intuition
+Imagine looking up a word in a physical dictionary. You do not start at page 1 and read every word. Instead, you open the book roughly in the middle.
+1.  If the word you want comes alphabetically *before* the middle word, you ignore the entire second half of the book.
+2.  If it comes *after*, you ignore the first half.
+3.  You repeat this process with the remaining half until you find the word or determine it is missing.
+
+The Binary Chop implements this logic mathematically.
+
+---
+
+## 2. Step-by-Step Logic
+
+The algorithm maintains two pointers (or indices) representing the boundaries of the current search space: `left` (start) and `right` (end).
+
+1.  **Calculate Midpoint:** Find the middle index of the current range.
+    $$mid = \lfloor \frac{left + right}{2} \rfloor$$
+2.  **Compare:** Compare the value at `array[mid]` with the `target`.
+    *   **Match:** If `array[mid] == target`, the search is successful. Return `mid`.
+    *   **Target is Smaller:** If `target < array[mid]`, the target must be in the left half. Update `right = mid - 1`.
+    *   **Target is Larger:** If `target > array[mid]`, the target must be in the right half. Update `left = mid + 1`.
+3.  **Repeat:** Continue the loop while `left <= right`.
+4.  **Failure:** If the loop terminates (when `left > right`) without a match, the target is not in the array. Return `-1` (or null).
+
+---
+
+## 3. Concrete Example
+
+Let us search for the target **`7`** in the sorted array:
+`[1, 3, 5, 7, 9, 11, 13]`
+Indices: `0, 1, 2, 3, 4, 5, 6`
+
+**Iteration 1:**
+*   `left` = 0, `right` = 6
+*   `mid` = (0 + 6) / 2 = **3**
+*   `array[3]` = **7**
+*   **Match Found!** Return index 3.
+
+**Scenario 2 (Target = 10):**
+**Iteration 1:**
+*   `left` = 0, `right` = 6
+*   `mid` = 3, `array[3]` = 7
+*   10 > 7, so search right. `left` = 4.
+
+**Iteration 2:**
+*   `left` = 4, `right` = 6
+*   `mid` = (4 + 6) / 2 = **5**
+*   `array[5]` = 11
+*   10 < 11, so search left. `right` = 4.
+
+**Iteration 3:**
+*   `left` = 4, `right` = 4
+*   `mid` = **4**
+*   `array[4]` = 9
+*   10 > 9, so search right. `left` = 5.
+
+**Termination:**
+*   `left` (5) > `right` (4). Loop ends.
+*   Return -1 (Not found).
+
+---
+
+## 4. Implementation
+
+### Iterative Approach (Preferred)
+This approach uses constant space and is generally preferred in production environments to avoid stack overflow risks.
+
+```python
+def binary_chop(arr, target):
+    left = 0
+    right = len(arr) - 1
+
+    while left <= right:
+        # Calculate mid safely to avoid overflow in languages with fixed-size integers
+        mid = left + (right - left) // 2
+        
+        if arr[mid] == target:
+            return mid
+        elif arr[mid] < target:
+            left = mid + 1
+        else:
+            right = mid - 1
+            
+    return -1
+```
+
+### Recursive Approach
+This mirrors the logical structure of the problem but uses stack space.
+
+```python
+def binary_chop_recursive(arr, target, left, right):
+    if left > right:
+        return -1
+
+    mid = left + (right - left) // 2
+    
+    if arr[mid] == target:
+        return mid
+    elif arr[mid] < target:
+        return binary_chop_recursive(arr, target, mid + 1, right)
+    else:
+        return binary_chop_recursive(arr, target, left, mid - 1)
+```
+
+---
+
+## 5. Complexity Analysis
+
+### Time Complexity: $O(\log n)$
+*   **Why?** At every step, the search space is divided by 2. If you have $n$ items, the number of times you can divide $n$ by 2 before reaching 1 is $\log_2 n$.
+*   **Best Case:** $O(1)$ (The middle element is the target immediately).
+*   **Average/Worst Case:** $O(\log n)$.
+*   **Comparison:** For a list of 1,000,000 items, a Linear Search takes up to 1,000,000 operations. Binary Chop takes roughly 20 operations ($\log_2 1,000,000 \approx 20$).
+
+### Space Complexity
+*   **Iterative:** $O(1)$ (Only a few variables for indices are needed).
+*   **Recursive:** $O(\log n)$ (Due to the call stack depth).
+
+---
+
+## 6. Critical Pitfalls and Edge Cases
+
+When implementing Binary Chop, developers frequently encounter specific bugs.
+
+### 1. Integer Overflow (The "Mid" Bug)
+In languages like C++ or Java, calculating the midpoint as `(left + right) / 2` can cause an integer overflow if `left` and `right` are very large numbers (close to the maximum integer limit), resulting in a negative index.
+*   **Fix:** Use `left + (right - left) / 2`.
+
+### 2. Infinite Loops
+If the boundaries are updated incorrectly, the search range never shrinks.
+*   **Bad:** `right = mid` instead of `right = mid - 1`. If `mid` equals `left`, `left` and `right` never cross, causing an infinite loop.
+*   **Fix:** Ensure `left = mid + 1` and `right = mid - 1`.
+
+### 3. Off-by-One Errors
+The loop condition `left < right` vs `left <= right` changes the behavior.
+*   `left <= right`: Standard for finding a specific element.
+*   `left < right`: Often used for finding the *insertion point* or lower bound.
+
+### 4. Duplicates
+If the array contains multiple instances of the target (e.g., `[1, 3, 5, 5, 5, 7]`), the standard Binary Chop will return *one* of the indices, but not necessarily the first or last.
+*   **Fix:** To find the first occurrence, modify the logic to continue searching the left half even after a match is found.
+
+---
+
+## 7. Advanced Variations
+
+### Lower Bound (First Occurrence)
+Used to find the index of the first element that is greater than or equal to the target.
+*   **Logic:** If `arr[mid] >= target`, move `right` to `mid`, but keep `left` as `mid` (do not subtract 1).
+
+### Upper Bound (Last Occurrence)
+Used to find the index of the first element that is strictly greater than the target.
+*   **Logic:** If `arr[mid] <= target`, move `left` to `mid + 1`.
+
+### Rotated Sorted Array
+If a sorted array is rotated (e.g., `[4, 5, 6, 7, 0, 1, 2]`), standard binary chop fails.
+*   **Logic:** You must first determine which half of the array is sorted. Compare `arr[left]` and `arr[mid]`. If `arr[left] <= arr[mid]`, the left half is sorted. Adjust search logic accordingly.
+
+---
+
+## 8. Why "Chop"?
+The term "Chop" is less formal than "Search" but highlights the algorithm's efficiency mechanism.
+1.  **Linear Search:** You "scan" the data.
+2.  **Binary Chop:** You "chop" the problem size in half.
+This distinction is often taught to emphasize that the algorithm does not iterate through data; it eliminates the data.
+
+## 9. Summary
+*   **Algorithm:** Binary Chop (Binary Search).
+*   **Input:** Sorted array/list.
+*   **Output:** Index of target or -1.
+*   **Complexity:** $O(\log n)$ time, $O(1)$ space (iterative).
+*   **Key Constraint:** Data must be sorted.
+*   **Key Warning:** Watch out for integer overflow in midpoint calculation and ensure boundary updates prevent infinite loops.
+
+The Binary Chop is the gold standard for searching in static, sorted datasets and forms the basis for more complex data structures like Binary Search Trees (BST) and balanced trees (AVL, Red-Black).
+TIME: (pp: 17t 684ms 25t/s - tg: 1386t>2260t 35.5s 102.8t/s)
+
+--- Prompt 10/14 ---
+PROMPT: If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long does it take for 20 towels to dry under the exact same conditions?
+RESPONSE: 
+
+It takes **4 hours**.
+
+Here is the reasoning:
+The towels dry simultaneously, not sequentially. If the sun and wind are drying the towels, adding more towels to the line (assuming there is enough space to hang them all at once) does not change the amount of time it takes for the sun to dry each individual towel.
+
+Just like it takes 1 hour for 1 person to sing a song, it also takes 1 hour for 4 people to sing the same song together.
+TIME: (pp: 48t 688ms 70t/s - tg: 1820t>104t 18.7s 102.6t/s)
+
+--- Prompt 11/14 [turn 1/3] ---
+PROMPT: Tell me facts about the blue whale
+RESPONSE: 
+
+Here are some fascinating facts about the blue whale (*Balaenoptera musculus*):
+
+**1. They are the largest animals ever known**
+The blue whale is larger than any dinosaur that has ever lived. An adult blue whale can reach lengths of up to **100 feet (30 meters)** and weigh as much as **200 tons (181,436 kg)**.
+
+**2. Their heart is car-sized**
+A blue whale's heart weighs about **400 pounds (180 kg)** and is roughly the size of a small car. When it beats, the pressure can be felt from a mile away.
+
+**3. Their tongue weighs as much as an elephant**
+The tongue of a fully grown blue whale can weigh up to **6,000 pounds (2,700 kg)**, which is roughly the same weight as an adult African elephant.
+
+**4. They are the loudest animal on Earth**
+A blue whale's vocalizations can reach **188 decibels**. They communicate using low-frequency infrasound that can travel for hundreds of miles underwater. A single call can be heard by other whales up to **1,000 miles (1,600 km)** away.
+
+**5. They eat massive amounts of tiny food**
+Despite their size, they feed primarily on **krill** (tiny shrimp-like crustaceans). A single blue whale can consume up to **4 to 6 tons of krill per day** during feeding season. They take in huge mouthfuls of water and filter the krill out with their baleen plates.
+
+**6. They are mammals, not fish**
+Like humans, blue whales breathe air through lungs, give birth to live young, nurse their calves with milk, and are warm-blooded. They must come to the surface to breathe.
+
+**7. Their calves are huge at birth**
+A blue whale calf is born weighing about **3 tons (6,000 lbs)** and measuring **23 feet (7 meters)** long. They grow incredibly fast, gaining up to **200 pounds (90 kg) per day**.
+
+**8. They have lived for a long time**
+Blue whales can live for **70 to 90 years**, and some studies suggest certain individuals may live even longer.
+
+**9. Conservation status**
+Due to commercial whaling in the 20th century, their population was reduced by about 90%. They are currently listed as **Endangered** by the IUCN. While whaling is now banned, they still face threats from ship strikes, ocean noise pollution, and climate change affecting krill populations.
+
+**10. Their eyes are massive**
+A blue whale's eye is about **12 inches (30 cm)** in diameter, roughly the size of a soccer ball.
+TIME: (pp: 17t 683ms 25t/s - tg: 1038t>607t 16.0s 103.0t/s)
+
+--- Prompt 12/14 [turn 2/3] ---
+PROMPT: Tell me more about whales in general
+RESPONSE: 
+
+Here is a more accurate and general overview of whales, correcting some common misconceptions and highlighting their fascinating biology:
+
+### 1. Whales are Mammals, Not Fish
+Like humans, whales are warm-blooded mammals. They breathe air through lungs, give birth to live young (calves), and nurse their offspring with milk. Unlike fish, they cannot breathe underwater and must surface regularly to exhale and inhale through a blowhole on top of their heads.
+
+### 2. Two Main Families
+Whales belong to the order *Cetacea* and are divided into two primary groups:
+*   **Toothed Whales (Odontocetes):** These have teeth and use echolocation (sonar) to hunt. Examples include sperm whales, orcas, and dolphins. They tend to be more social and vocal.
+*   **Baleen Whales (Mysticetes):** These lack teeth and instead have baleen plates made of keratin (like fingernails) to filter food from the water. Examples include the blue whale, humpback, and gray whale. They are generally larger and feed on krill and small fish.
+
+### 3. Physical Adaptations
+*   **Blubber:** A thick layer of fat under the skin that insulates them in freezing waters and provides energy reserves.
+*   **Streamlined Bodies:** Their shape reduces drag, allowing them to swim efficiently at high speeds.
+*   **Flukes:** Their tails are horizontal (unlike fish, which have vertical tails), which they move up and down to propel themselves.
+
+### 4. Communication and Intelligence
+*   **Songs:** Baleen whales, particularly humpbacks, are famous for complex songs that can travel hundreds of miles underwater.
+*   **Echolocation:** Toothed whales emit clicks that bounce off objects, allowing them to "see" with sound in dark or murky waters.
+*   **Social Structures:** Many species live in pods with complex social hierarchies, cooperative hunting strategies, and even cultural transmission of behaviors (like specific hunting techniques passed down from mother to calf).
+
+### 5. Size and Scale (Corrected)
+*   **Largest Animal:** The blue whale is the largest animal known to have *ever* lived on Earth, exceeding even the largest dinosaurs.
+*   **Weight:** A fully grown blue whale can weigh up to **190 tons** (approx. 172,000 kg).
+*   **Heart:** Their heart is roughly the size of a small car (like a Volkswagen Beetle) and weighs about **400 to 600 pounds** (180 to 270 kg).
+*   **Tongue:** A blue whale's tongue can weigh about **2.7 tons** (approx. 6,000 lbs), roughly the weight of a large hippo or rhino, but not a full-sized elephant.
+*   **Eyes:** Their eyes are about **5 inches (12 cm)** in diameter, roughly the size of a grapefruit or small soccer ball.
+
+### 6. Conservation Status
+*   **Vulnerable:** While the blue whale is not "Endangered" by the IUCN (it is listed as **Vulnerable**), their populations have not fully recovered from historical whaling.
+*   **Threats:** Modern threats include ship strikes, fishing gear entanglement, ocean noise pollution (which interferes with communication), and climate change affecting their food sources.
+
+### 7. Diversity
+There are over 90 species of whales, dolphins, and porpoises. They range from the massive blue whale to the tiny **vaquita** (a porpoise that is critically endangered) and the **killer whale** (which is actually the largest species of dolphin).
+
+### 8. Migration
+Many whale species undertake the longest migrations of any mammal. For example, gray whales can travel over **12,000 miles (19,000 km)** in a year, moving from breeding grounds in warm waters to feeding grounds in polar regions.
+TIME: (pp: 639t 689ms 928t/s - tg: 2324t>863t 31.3s 101.9t/s)
+
+--- Prompt 13/14 [turn 3/3] ---
+PROMPT: Where do whales live geographically?
+RESPONSE: 
+TIME: (pp: 1517t 716ms 2118t/s - tg: 606t>0t 5.9s 101.8t/s)
+
+--- Prompt 14/14 ---
+PROMPT: Write me a quicksort implementation in Rust
+RESPONSE: 
+
+# Quicksort Implementation in Rust
+
+Here's a clean, idiomatic Rust implementation of the quicksort algorithm with proper documentation and tests:
+
+```rust
+/// Sorts a mutable slice in-place using quicksort.
+///
+/// # Example
+/// ```
+/// let mut data = vec![5, 2, 8, 1, 9];
+/// quicksort(&mut data);
+/// assert_eq!(data, vec![1, 2, 5, 8, 9]);
+/// ```
+pub fn quicksort<T: Ord>(arr: &mut [T]) {
+    if arr.len() <= 1 {
+        return;
+    }
+    quicksort_impl(arr, 0, arr.len() - 1);
+}
+
+/// Internal recursive implementation using indices.
+fn quicksort_impl<T: Ord>(arr: &mut [T], low: usize, high: usize) {
+    if low < high {
+        let pivot_index = partition(arr, low, high);
+        quicksort_impl(arr, low, pivot_index - 1);
+        quicksort_impl(arr, pivot_index + 1, high);
+    }
+}
+
+/// Partitions the array around a pivot element.
+///
+/// Returns the final index of the pivot.
+fn partition<T: Ord>(arr: &mut [T], low: usize, high: usize) -> usize {
+    let pivot = arr[high];
+    let mut i = low;
+
+    for j in low..high {
+        if arr[j] <= pivot {
+            arr.swap(i, j);
+            i += 1;
+        }
+    }
+
+    arr.swap(i, high);
+    i
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_empty() {
+        let mut arr: Vec<i32> = vec![];
+        quicksort(&mut arr);
+        assert!(arr.is_empty());
+    }
+
+    #[test]
+    fn test_single_element() {
+        let mut arr = vec![42];
+        quicksort(&mut arr);
+        assert_eq!(arr, vec![42]);
+    }
+
+    #[test]
+    fn test_already_sorted() {
+        let mut arr = vec![1, 2, 3, 4, 5];
+        quicksort(&mut arr);
+        assert_eq!(arr, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_reverse_sorted() {
+        let mut arr = vec![5, 4, 3, 2, 1];
+        quicksort(&mut arr);
+        assert_eq!(arr, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_unsorted() {
+        let mut arr = vec![3, 1, 4, 1, 5, 9, 2, 6];
+        quicksort(&mut arr);
+        assert_eq!(arr, vec![1, 1, 2, 3, 4, 5, 6, 9]);
+    }
+
+    #[test]
+    fn test_strings() {
+        let mut arr = vec!["banana", "apple", "cherry"];
+        quicksort(&mut arr);
+        assert_eq!(arr, vec!["apple", "banana", "cherry"]);
+    }
+}
+
+fn main() {
+    let mut numbers = vec![64, 34, 25, 12, 22, 11, 90];
+    println!("Before: {:?}", numbers);
+    quicksort(&mut numbers);
+    println!("After:  {:?}", numbers);
+}
+```
+
+## Key Features
+
+- **Generic over `Ord`**: Works with any type that implements the `Ord` trait (e.g., `i32`, `String`, etc.)
+- **In-place sorting**: Efficient memory usage with no extra allocations
+- **Index-based recursion**: Avoids borrow checker complications by using indices instead of slicing
+- **Comprehensive tests**: Validates edge cases and typical scenarios
+- **Production-ready**: Suitable for integration into larger projects
+
+## Usage
+
+1. Copy the code into a `src/main.rs` or module file.
+2. Run with `cargo test` to execute tests.
+3. Run with `cargo run` to see the example in action.
+
+## Notes
+
+- Time Complexity: Average O(n log n), Worst-case O(n²)
+- Space Complexity: O(log n) due to recursion stack
+- Stable: No (quicksort is inherently unstable)
+
+This implementation is efficient, safe, and idiomatic for Rust.
+TIME: (pp: 18t 684ms 26t/s - tg: 518t>1040t 15.1s 102.9t/s)
+

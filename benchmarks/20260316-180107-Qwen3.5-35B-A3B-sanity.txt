@@ -1,0 +1,274 @@
+Sanity Test: Qwen3.5-35B-A3B @ http://localhost:8012
+Date: 2026-03-16T18:01:07.769241
+
+--- Prompt 1/9 ---
+PROMPT: Hi
+RESPONSE: 
+TIME: prefill: 11tok 701ms 16t/s, decode: 10tok(think:10) 0.1s 95.7t/s, total: 0.8s
+
+--- Prompt 2/9 ---
+PROMPT: Who trained you?
+RESPONSE: 
+
+I was developed by the **Tongyi Lab** at **Alibaba Cloud**. I am part of the Qwen series of large language models.
+TIME: prefill: 14tok 681ms 21t/s, decode: 893tok(think:861) 9.8s 91.0t/s, total: 10.5s
+
+--- Prompt 3/9 ---
+PROMPT: What is 2+2?
+RESPONSE: 
+
+4
+TIME: prefill: 17tok 716ms 24t/s, decode: 95tok(think:92) 1.0s 97.0t/s, total: 1.7s
+
+--- Prompt 4/9 ---
+PROMPT: What is the largest animal in the world?
+RESPONSE: 
+
+The largest animal in the world is the **blue whale** (*Balaenoptera musculus*).
+
+Here are some key facts about them:
+
+*   **Size:** They can grow up to **30 meters (98 feet)** in length.
+*   **Weight:** They can weigh up to **200 tons (190,000 kilograms)**.
+*   **Significance:** The blue whale is not only the largest animal currently living on Earth, but it is also the largest animal known to have **ever lived**, surpassing even the largest dinosaurs.
+
+**For context:**
+*   The largest land animal is the **African bush elephant**.
+*   The largest bird is the **ostrich**.
+*   The largest reptile is the **saltwater crocodile**.
+TIME: prefill: 19tok 697ms 27t/s, decode: 959tok(think:789) 10.6s 90.6t/s, total: 11.3s
+
+--- Prompt 5/9 ---
+PROMPT: What is the largest body of water in the world?
+RESPONSE: 
+
+The largest body of water on Earth is the **Pacific Ocean**.
+
+Here are a few key details:
+*   **Area:** It covers approximately **63 million square miles** (163 million square kilometers), which is more than all of the Earth's land area combined.
+*   **Coverage:** It covers about **30% of the Earth's surface** and holds about **50% of the world's free water**.
+
+**Note on Lakes:**
+If you are asking about the largest *lake* (a landlocked body of water), that title belongs to the **Caspian Sea**. Despite its name, it is a lake because it is landlocked. It covers about 143,000 square miles (371,000 square kilometers).
+TIME: prefill: 21tok 682ms 31t/s, decode: 1067tok(think:900) 11.8s 90.6t/s, total: 12.5s
+
+--- Prompt 6/9 ---
+PROMPT: Write me a poem
+RESPONSE: 
+
+### The Moment Before Dawn
+
+The world is hushed in shades of blue,  
+Before the gold begins to rise.  
+The night has given way to you,  
+With quiet steps and soft surprise.  
+
+The stars are gone, the dark is deep,  
+But in the air, a promise waits.  
+For all the promises we keep,  
+Are written in the morning's gates.  
+
+The sun will come, the birds will sing,  
+The day will start, the light will grow.  
+But hold the quiet, hold the thing,  
+The space where dreams begin to show.  
+
+And though the night will return again,  
+And shadows fall on field and stone,  
+The light will break through once again,  
+And claim the world as its own home.
+TIME: prefill: 14tok 694ms 20t/s, decode: 4256tok(think:4097) 47.4s 89.8t/s, total: 48.1s
+
+--- Prompt 7/9 ---
+PROMPT: If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long does it take for 20 towels to dry under the exact same conditions?
+RESPONSE: 
+
+It will take **4 hours**.
+
+**Reasoning:**
+This is a classic logic puzzle. The towels dry simultaneously, not sequentially. If the environment (sun, wind, temperature) remains the same, each towel takes 4 hours to dry regardless of how many other towels are hanging next to it (assuming there is enough space on the line for all 20 towels to hang without blocking each other).
+TIME: prefill: 48tok 687ms 70t/s, decode: 1476tok(think:1391) 16.4s 89.8t/s, total: 17.1s
+
+--- Prompt 8/9 ---
+PROMPT: Tell me facts about the blue whale
+RESPONSE: 
+
+Here are some fascinating facts about the **blue whale** (*Balaenoptera musculus*):
+
+### 1. They are the largest animals to ever live on Earth
+The blue whale is larger than any known dinosaur.
+*   **Length:** They can grow up to **98 feet (30 meters)** long.
+*   **Weight:** They can weigh as much as **400,000 pounds (190 metric tonnes)**.
+*   **Comparison:** Their heart alone weighs as much as a small car, and their tongue weighs as much as an elephant.
+
+### 2. They are the loudest animals on the planet
+Blue whales produce the loudest sounds of any animal.
+*   **Decibels:** Their calls can reach **188 decibels**.
+*   **Range:** These low-frequency rumbles can be heard by other whales up to **1,000 miles (1,600 km)** away. They use these sounds to communicate across vast ocean distances.
+
+### 3. They eat massive amounts of small food
+Despite their size, they don't eat sharks or fish.
+*   **Diet:** They primarily eat **krill** (small, shrimp-like crustaceans).
+*   **Consumption:** A large blue whale can eat up to **4 tons (8,000 lbs) of krill per day** during feeding season. They filter feed by taking huge mouthfuls of water and pushing it out through their baleen plates, trapping the krill inside.
+
+### 4. Their anatomy is built for deep diving
+*   **Heart Rate:** When resting on the surface, their heart beats about 15 times per minute. However, when diving, it can slow down to **2 beats per minute** to conserve oxygen.
+*   **Lungs:** They can hold their breath for up to **30 minutes** while diving, though they usually dive for about 10 to 15 minutes.
+
+### 5. They grow incredibly fast as calves
+*   **Growth:** A newborn blue whale calf is about **23 feet (7 meters)** long and weighs 3 tons.
+*   **Milk:** They drink about **100 gallons (380 liters)** of milk per day. Their mother's milk is very rich (40% fat), allowing them to gain up to **200 pounds (90 kg)** every single day.
+
+### 6. They are endangered
+*   **History:** In the early 20th century, commercial whaling nearly drove them to extinction. At one point, there were fewer than 2,000 blue whales left.
+*   **Status:** Today, their population is estimated between **10,000 and 25,000**. They are still listed as "Endangered" by the IUCN, though their numbers are slowly recovering.
+
+### 7. They live in oceans worldwide
+Blue whales are found in all of the world's oceans, except for the Arctic and Antarctic. They usually migrate between feeding grounds in polar waters during the summer and warmer tropical waters during the winter.
+
+### 8. They have unique breathing habits
+*   **Blowhole:** Like all whales, they breathe air through a blowhole on top of their head.
+*   **The "Spout":** When they exhale, the warm air meets the cold outside air, creating a visible mist or "spout" that can shoot up to **30 feet (10 meters)** in the air.
+TIME: prefill: 17tok 687ms 25t/s, decode: 1751tok(think:991) 19.5s 89.8t/s, total: 20.2s
+
+--- Prompt 9/9 ---
+PROMPT: Write me a quicksort implementation in Rust
+RESPONSE: 
+
+Here is a clean, idiomatic implementation of Quicksort in Rust.
+
+This implementation is **in-place** (modifies the input slice), uses **generics** (works with any type implementing `Ord`), and respects Rust's **borrow checker** by splitting the slice into disjoint mutable borrows for recursion.
+
+```rust
+/// Public entry point for the sort.
+/// It sorts the slice in-place.
+pub fn quicksort<T: Ord>(arr: &mut [T]) {
+    if arr.len() <= 1 {
+        return;
+    }
+
+    // 1. Select a pivot (Middle element is a good heuristic to avoid worst-case on sorted data)
+    let len = arr.len();
+    let pivot_index = len / 2;
+    
+    // Move pivot to the end to use standard Lomuto partition scheme
+    arr.swap(pivot_index, len - 1);
+    
+    // 2. Partition the array
+    let split_index = partition(arr);
+    
+    // 3. Recursively sort the sub-slices
+    // We use split_at_mut to get two disjoint mutable borrows.
+    // Rust's borrow checker allows this because the slices do not overlap.
+    // Note: The pivot is at split_index, so we sort:
+    // - left: 0..split_index (elements < pivot)
+    // - right: split_index+1..end (elements > pivot)
+    
+    // split_at_mut returns (left, right). 
+    // 'left' is 0..split_index. 
+    // 'right' is split_index..end.
+    // We want to exclude the pivot itself from the recursive calls.
+    
+    let (left, right) = arr.split_at_mut(split_index);
+    
+    // 'right' includes the pivot at index 0 of the slice.
+    // We skip the pivot (index 0) by taking the slice starting at 1.
+    if !right.is_empty() {
+        // We need to ignore the pivot element at right[0]
+        // We can just recurse on right[1..]
+        // However, split_at_mut already took the ownership of the borrows.
+        // We must ensure 'right' is not empty before indexing.
+        // Since we split at 'split_index', 'right' starts at 'split_index'.
+        // The pivot is at 'split_index'.
+        // So 'right[0]' is the pivot.
+        // We want to sort 'right[1..]'.
+        // But we need to be careful: if 'right' has length 1, right[1..] is empty.
+        // We can handle this by checking len.
+        
+        // Actually, a safer way without creating a new slice reference manually:
+        // We just call quicksort on the sub-slices.
+        // 'left' is already 0..split_index.
+        // 'right' is split_index..end.
+        // We want to sort 'right' excluding the first element (the pivot).
+        // So we create a slice reference for the rest.
+        
+        // SAFETY: right[1..] is safe if right.len() >= 1.
+        // If right.len() == 1, right[1..] is empty, which is fine.
+        // We can just pass &mut right[1..].
+        
+        // But wait, we need to check if right is empty before indexing?
+        // split_at_mut guarantees 'right' is the second part.
+        // If split_index == len, 'right' is empty.
+        // If split_index == len-1, 'right' is length 1.
+        
+        // To avoid 'right[1..]' panic on empty slice:
+        if right.len() > 1 {
+            let (pivot_slice, rest) = right.split_at_mut(1);
+            // pivot_slice contains the pivot, we don't recurse on it.
+            // rest contains the elements > pivot.
+            quicksort(rest);
+        }
+        
+        // Recurse on left
+        if !left.is_empty() {
+            quicksort(left);
+        }
+    }
+}
+
+/// Helper function to partition the array around the last element (which is the pivot).
+/// Returns the index where the pivot settled.
+fn partition<T: Ord>(arr: &mut [T]) -> usize {
+    let len = arr.len();
+    if len <= 1 {
+        return 0;
+    }
+
+    let pivot = arr[len - 1];
+    let mut store_index = 0;
+
+    for i in 0..len - 1 {
+        if arr[i] <= pivot {
+            arr.swap(i, store_index);
+            store_index += 1;
+        }
+    }
+
+    // Place pivot in the correct position
+    arr.swap(store_index, len - 1);
+    
+    store_index
+}
+
+fn main() {
+    let mut data = vec![3, 6, 8, 10, 1, 2, 1];
+    
+    println!("Before: {:?}", data);
+    quicksort(&mut data);
+    println!("After: {:?}", data);
+
+    // Test with strings
+    let mut words = vec!["pear", "apple", "cherry"];
+    quicksort(&mut words);
+    println!("Words: {:?}", words);
+}
+```
+
+### Key Implementation Details
+
+1.  **In-Place Sorting**: The function takes `&mut [T]`, modifying the memory directly without allocating a new vector.
+2.  **Generic**: It uses `T: Ord`, meaning it works with any type that can be compared (integers, strings, floats, etc.).
+3.  **Borrow Checker Safety**:
+    *   After partitioning, the array is split into two parts: elements smaller than the pivot and elements larger.
+    *   `split_at_mut` creates two disjoint mutable borrows (`left` and `right`). Rust allows this because the slices do not overlap.
+    *   We skip the pivot element (which sits at the boundary) to avoid infinite recursion.
+4.  **Pivot Selection**: We pick the middle element and swap it to the end. This is a simple optimization to reduce the probability of hitting the $O(n^2)$ worst-case on already sorted data.
+5.  **Base Case**: The recursion stops when the slice length is 0 or 1.
+
+### Note on Production
+While this is a correct algorithmic implementation, for production code, you should use the standard library's highly optimized and tested sort:
+```rust
+data.sort(); // or data.sort_unstable();
+```
+TIME: prefill: 18tok 688ms 26t/s, decode: 6501tok(think:5051) 72.4s 89.8t/s, total: 73.1s
+

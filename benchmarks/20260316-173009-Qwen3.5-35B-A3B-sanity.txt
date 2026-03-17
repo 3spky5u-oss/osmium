@@ -1,0 +1,277 @@
+Sanity Test: Qwen3.5-35B-A3B @ http://localhost:8012
+Date: 2026-03-16T17:30:09.628359
+
+--- Prompt 1/9 ---
+PROMPT: Hi
+RESPONSE: 
+
+Hello! 👋 
+
+How can I assist you today? Feel free to ask me any questions or let me know if you need help with anything specific. I'm here to help!
+TIME: 1.8s, ~37 tok, ~20.1 tok/s
+
+--- Prompt 2/9 ---
+PROMPT: Who trained you?
+RESPONSE: 
+
+I was trained by the **Tongyi Lab** under Alibaba Cloud. My development leverages large-scale, high-quality corpora and advanced machine learning techniques to achieve capabilities in natural language understanding, logical reasoning, code generation, and multi-modal analysis. If you have specific tasks or questions, feel free to ask!
+TIME: 1.4s, ~84 tok, ~61.3 tok/s
+
+--- Prompt 3/9 ---
+PROMPT: What is 2+2?
+RESPONSE: 
+
+2 + 2 = **4**.
+TIME: 2.0s, ~4 tok, ~2.0 tok/s
+
+--- Prompt 4/9 ---
+PROMPT: What is the largest animal in the world?
+RESPONSE: 
+
+The largest animal in the world is the **blue whale** (*Balaenoptera musculus*).
+
+Here are some key facts about them:
+
+*   **Length:** They can grow up to **30 meters (98 feet)** long.
+*   **Weight:** They can weigh up to **200 metric tons** (approximately 440,000 pounds).
+*   **Comparison:** They are larger than any known dinosaur or land animal. For comparison, the largest land animal is the African bush elephant, which weighs up to 6 tons.
+
+While some extinct dinosaurs (like the Argentinosaurus) were longer, the blue whale is generally considered the largest animal known to have ever lived based on verified mass estimates.
+TIME: 16.1s, ~158 tok, ~9.8 tok/s
+
+--- Prompt 5/9 ---
+PROMPT: What is the largest body of water in the world?
+RESPONSE: 
+
+The largest body of water in the world is the **Pacific Ocean**.
+
+It covers approximately **165 million square kilometers** (63 million square miles), which is more than twice the size of the second-largest ocean, the Atlantic.
+
+However, there is a common distinction made in geography:
+*   **Largest Lake:** The **Caspian Sea** is the world's largest lake (a landlocked body of water), with a surface area of about 371,000 square kilometers.
+*   **Largest Freshwater Lake by Volume:** **Lake Baikal** in Russia.
+*   **Largest Freshwater Lake by Surface Area:** **Lake Superior** in North America.
+
+So, while the Pacific Ocean is the largest overall body of water, the Caspian Sea is the largest lake.
+TIME: 31.0s, ~175 tok, ~5.7 tok/s
+
+--- Prompt 6/9 ---
+PROMPT: Write me a poem
+RESPONSE: 
+
+**The Quiet Hour**
+
+The clock has lost its ticking hand,
+And shadows stretch across the floor.
+A quiet world begins to stand,
+Beyond the reach of yesterday's roar.
+
+The moon is a coin in a pocket deep,
+Spending light on the sleeping street.
+The world is a promise, a secret keep,
+For the ones who listen to the heartbeat.
+
+So let the words be soft and low,
+Like rain upon a roof of snow.
+The only thing we really know,
+Is that the light will end the snow.
+
+Wait, let me fix the last line.
+*The only thing we really know,*
+*Is that the light will end the flow.*
+
+Okay, let's finalize.
+
+**The Quiet Hour**
+
+The clock has lost its ticking hand,
+And shadows stretch across the floor.
+A quiet world begins to stand,
+Beyond the reach of yesterday's roar.
+
+The moon is a coin in a pocket deep,
+Spending light on the sleeping street.
+The world is a promise, a secret keep,
+For the ones who listen to the heartbeat.
+
+So let the words be soft and slow,
+Like rain upon a roof of tin.
+The only thing we really know,
+Is that the light will end the din.
+
+*Wait, I'll make it better.*
+
+**The Architecture of Light**
+
+The sun forgets to rise on time,
+The moon forgets to shine.
+But you are here, and I am mine,
+In this small, borrowed time.
+
+We walk the edge of what is true,
+A shadow on the wall.
+The world is vast, but we are few,
+And love is all we call.
+
+So let the poem be the breath,
+The pause between the words we speak.
+For in the silence, life is death,
+In the quiet, we are meek.
+
+*Okay, I'll go with a version that feels more hopeful.*
+
+**The Space Between**
+
+There is a space between the thought,
+Before the word is spoken.
+A quiet place where dreams are caught,
+Before they're lost or broken.
+
+It is the breath before the song,
+The pause before the rain.
+It is where we belong,
+In the quiet, soft and plain.
+
+So take your time, and let it be,
+The silence is the key.
+To open up the world to see,
+And find the light inside the sea.
+
+*Okay, that's the one. It's simple, rhythmic, and positive.*
+TIME: 48.1s, ~497 tok, ~10.3 tok/s
+
+--- Prompt 7/9 ---
+PROMPT: If it takes 4 hours for 4 towels to dry on a clothesline in the sun, how long does it take for 20 towels to dry under the exact same conditions?
+RESPONSE: 
+
+It takes **4 hours**.
+
+Here is the reasoning:
+Drying time depends on the environmental conditions (sun, wind, heat), not on the number of towels. Since the towels dry simultaneously on the clothesline, adding more towels (assuming the line is long enough to hold them without overlapping) does not increase the time required for each towel to dry.
+
+Therefore, whether it is 4 towels or 20 towels, the time remains the same.
+TIME: 14.7s, ~106 tok, ~7.2 tok/s
+
+--- Prompt 8/9 ---
+PROMPT: Tell me facts about the blue whale
+RESPONSE: 
+
+Here are some fascinating facts about the **blue whale** (*Balaenoptera musalis*):
+
+### 🌊 Size & Weight
+*   **Largest Animal Ever:** The blue whale is the largest animal known to have ever lived on Earth, even larger than the biggest dinosaurs.
+*   **Massive Length:** They can grow up to **100 feet (30 meters)** long.
+*   **Huge Weight:** They can weigh up to **200 tons (190,000 kg)**. That is roughly the weight of 33 African elephants.
+
+### 🫀 Anatomy & Body Parts
+*   **Giant Heart:** Their heart is the size of a small car and weighs about **400 to 600 pounds (180 to 270 kg)**. Blood pressure is so high it can be heard from 2 meters away.
+*   **Heavy Tongue:** Their tongue alone weighs about as much as an **elephant** (around 6,000 lbs or 2,700 kg).
+*   **Blood Volume:** They have about 1,300 gallons (4,900 liters) of blood in their bodies.
+*   **Mammals, Not Fish:** Despite living in the ocean, they are mammals. They breathe air through a blowhole on top of their head and give birth to live young.
+
+### 🍽️ Diet & Feeding
+*   **Krill Hunters:** They eat almost exclusively tiny shrimp-like crustaceans called **krill**.
+*   **Huge Appetite:** A large blue whale can eat up to **4 tons (3.6 tonnes) of krill per day** during feeding season.
+*   **Filter Feeding:** They take in massive mouthfuls of water and food, then push the water out through baleen plates in their mouth to trap the krill.
+
+### 📢 Communication
+*   **Loudest Animal:** The blue whale produces the loudest sounds of any animal on the planet.
+*   **Decibels:** Their calls can reach **188 decibels**.
+*   **Long Distance:** These low-frequency sounds can travel for hundreds of miles underwater, allowing them to communicate across entire ocean basins.
+
+### 👶 Reproduction & Lifespan
+*   **Giant Babies:** A blue whale calf is born weighing about **3 tons (6,000 lbs)** and is about **23 feet (7 meters)** long.
+*   **Fast Growth:** Calves grow about **200 pounds (90 kg) per day** and drink up to 100 gallons of milk a day.
+*   **Long Life:** They can live for **80 to 90 years**, with some individuals potentially reaching 110 years old.
+
+### 🛡️ Conservation Status
+*   **Near Extinction:** Due to commercial whaling in the 20th century, their population dropped by over 90%.
+*   **Endangered:** They are currently listed as **Endangered** by the IUCN.
+*   **Recovery:** Populations are slowly recovering, but they remain vulnerable to ship strikes, ocean noise, and climate change (which affects krill populations).
+TIME: 19.8s, ~625 tok, ~31.5 tok/s
+
+--- Prompt 9/9 ---
+PROMPT: Write me a quicksort implementation in Rust
+RESPONSE: 
+
+Here is an idiomatic, in-place Quicksort implementation in Rust.
+
+It uses a mutable slice (`&mut [T]`), generic types constrained by `Ord`, and recursion. It avoids unnecessary allocations by sorting the array in place.
+
+```rust
+/// Sorts a slice in place using the Quicksort algorithm.
+/// 
+/// # Type Parameters
+/// * `T`: The type of the elements, which must implement `Ord` for comparison.
+/// 
+/// # Panics
+/// This function will panic if `i` or `j` are out of bounds during the swap,
+/// but the logic below guarantees indices remain within valid bounds.
+fn quicksort<T: Ord>(arr: &mut [T]) {
+    let len = arr.len();
+    
+    // Base case: arrays of size 0 or 1 are already sorted
+    if len <= 1 {
+        return;
+    }
+
+    // 1. Choose a pivot. Here we pick the middle element.
+    let pivot_idx = len / 2;
+    
+    // Move the pivot to the end of the slice for easier partitioning
+    // (We swap it to index 0 first, then to the end)
+    arr.swap(0, pivot_idx);
+    arr.swap(0, len - 1);
+
+    // 2. Partitioning (Lomuto scheme)
+    // `split` tracks the boundary between elements < pivot and elements >= pivot
+    let mut split = 0;
+    
+    // Iterate through the slice excluding the last element (the pivot)
+    for i in 0..(len - 1) {
+        // If current element is smaller than pivot, move it to the left side
+        if arr[i] < arr[len - 1] {
+            arr.swap(i, split);
+            split += 1;
+        }
+    }
+    
+    // Place the pivot in its correct sorted position
+    arr.swap(len - 1, split);
+
+    // 3. Recursive calls
+    // Sort the left part (elements smaller than pivot)
+    if split > 0 {
+        quicksort(&mut arr[..split]);
+    }
+    
+    // Sort the right part (elements larger than pivot)
+    if split + 1 < len {
+        quicksort(&mut arr[split + 1..]);
+    }
+}
+
+fn main() {
+    let mut data = vec![3, 6, 8, 10, 1, 2, 1];
+    
+    println!("Before: {:?}", data);
+    quicksort(&mut data);
+    println!("After:  {:?}", data);
+    
+    // Test with strings (which also implement Ord)
+    let mut words = vec!["pear", "apple", "banana"];
+    println!("Words Before: {:?}", words);
+    quicksort(&mut words);
+    println!("Words After:  {:?}", words);
+}
+```
+
+### Key Implementation Details
+
+1.  **Generics (`<T: Ord>`)**: The function works on any type that implements the `Ord` trait (like `i32`, `String`, `char`), allowing for generic comparisons without needing `Clone` or `Copy`.
+2.  **In-Place**: It takes `&mut [T]` (a mutable slice) and sorts the data directly in memory, avoiding the allocation overhead of creating new vectors during recursion.
+3.  **Pivot Strategy**: It picks the middle element as a pivot. While standard Quicksort can degrade to $O(n^2)$ on specific inputs, picking the middle is generally better than picking the first or last element for already-sorted data.
+4.  **Recursion**: It recursively sorts the sub-slices created by the partitioning step.
+5.  **Safety**: It relies on `arr.swap()` which is safe within the bounds of the slice, ensuring no undefined behavior.
+TIME: 62.0s, ~760 tok, ~12.3 tok/s
+
