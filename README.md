@@ -19,13 +19,9 @@ System specification:
 - 1x Epyc 7742
 - 8 channels system RAM (not heavily used by Krasis since Krasis now runs both prefill and decode on GPU)
 - 1x 5090 on PCIE 4.0 (bottlenecked to 32GB/sec since the 5090 support PCIE 5.0 at 64GB/sec)
-- **Most models (Qwen-3.5-35B at Q4 being the exception) are unable to entirely fit in GPU VRAM.**  
-  - In this case Llama **allocates some layers to the GPU and runs the rest on CPU**.
-  - Krasis instead **streams through VRAM** as necessary using algorithms optimised for the prefill stage and then the decode stage.
 - Model:
   - Q4 model (BF16 attention in Krasis - AWQ is also supported for more limited VRAM cards)
-- Llama params:
-  - -ngl 99 -ncmoe -t 48 --mlock -fa on 
+  - Note that most models cannot fit entirely in VRAM
 
 ### Krasis results (1x 5090 32GB, PCIE 4.0 only):
 
