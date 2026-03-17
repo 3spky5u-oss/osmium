@@ -32,7 +32,7 @@ System specification:
 | **Qwen3.5-122B-A10B** |  122B  |     234 GB / 56GB     | 2897 tok/sec | 27.7 tok/sec  |
 | **Qwen3-235B-A22B**   |  235B  |    438 GB / 110GB     | 2124 tok/sec | 9.3 tok/sec   |
 
-### Krasis results (1x **5080 16GB**, PCIE 4.0 only, compared to Llama.cpp on 32GB 5090)
+### Krasis results (1x **5080 16GB**, PCIE 4.0 only)
 
 | Model                | Params | BF16 Size / INT4 Size | Prefill (pp) | Decode (tg)  |
 | -------------------- | :----: | :-------------------: | ------------ | ------------ |
