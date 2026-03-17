@@ -29,27 +29,18 @@ System specification:
 
 ### Krasis results (1x 5090 32GB, PCIE 4.0 only):
 
-| Model                 | Params | BF16 Size / INT4 Size | Prefill (pp) | Decode (tg)   | Factor vs Llama         |
-| :-------------------- | :----: | :-------------------: | ------------ | ------------- | ----------------------- |
-| **Qwen3.5-35B-A3B**   |  35B   |     67 GB / 16GB      | 4475 tok/sec | 109.1 tok/sec | **0.78x pp / 0.52x tg** |
-| **Qwen3-Coder-Next**  |  80B   |     159 GB / 38GB     | 3560 tok/sec | 70.3 tok/sec  | **4.45x pp / 4.01x tg** |
-| **Qwen3.5-122B-A10B** |  122B  |     234 GB / 56GB     | 2897 tok/sec | 27.7 tok/sec  | **8.9x pp / 10.2x tg**  |
-| **Qwen3-235B-A22B**   |  235B  |    438 GB / 110GB     | 2124 tok/sec | 9.3 tok/sec   | **14.5x pp / 7.94x tg** |
-
-### Llama.cpp results (1x 5090 32GB, PCIE 4.0 only):
-
-| Model                 | Params | BF16 Size / INT4 Size | Prefill (pp) | Decode (tg)  |
-| --------------------- | :----: | :-------------------: | ------------ | ------------ |
-| **Qwen3.5-35B-A3B**   |  35B   |     67 GB / 16GB      | 5692 tok/sec | 210 tok/sec  |
-| **Qwen3-Coder-Next**  |  80B   |     159 GB / 38GB     | 800 tok/sec  | 17.5 tok/sec |
-| **Qwen3.5-122B-A10B** |  122B  |     234 GB / 56GB     | 309 tok/sec  | 2.69 tok/sec |
-| **Qwen3-235B-A22B**   |  235B  |    438 GB / 110GB     | 146 tok/sec  | 1.17 tok/sec |
+| Model                 | Params | BF16 Size / INT4 Size | Prefill (pp) | Decode (tg)   |
+| :-------------------- | :----: | :-------------------: | ------------ | ------------- |
+| **Qwen3.5-35B-A3B**   |  35B   |     67 GB / 16GB      | 4475 tok/sec | 109.1 tok/sec |
+| **Qwen3-Coder-Next**  |  80B   |     159 GB / 38GB     | 3560 tok/sec | 70.3 tok/sec  |
+| **Qwen3.5-122B-A10B** |  122B  |     234 GB / 56GB     | 2897 tok/sec | 27.7 tok/sec  |
+| **Qwen3-235B-A22B**   |  235B  |    438 GB / 110GB     | 2124 tok/sec | 9.3 tok/sec   |
 
 ### Krasis results (1x **5080 16GB**, PCIE 4.0 only, compared to Llama.cpp on 32GB 5090)
 
-| Model                | Params | BF16 Size / INT4 Size | Prefill (pp) | Decode (tg)  | Factor               |
-| -------------------- | :----: | :-------------------: | ------------ | ------------ | -------------------- |
-| **Qwen3-Coder-Next** |  80B   |     159 GB / 38GB     | 1801 tok/sec | 26.8 tok/sec | **2.25x pp / 1.53x** |
+| Model                | Params | BF16 Size / INT4 Size | Prefill (pp) | Decode (tg)  |
+| -------------------- | :----: | :-------------------: | ------------ | ------------ |
+| **Qwen3-Coder-Next** |  80B   |     159 GB / 38GB     | 1801 tok/sec | 26.8 tok/sec | 
 
 ## Krasis tradeoffs
 
