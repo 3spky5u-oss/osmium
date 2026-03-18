@@ -12,6 +12,10 @@ If you want to easily monitor Krasis during runs, [check out ktop](https://githu
 
 Krasis can run large language models that are much too large to fit in a consumer GPU (multi-hundred gigabyte model with 80- 500+ billion parameters) on consumer or accessible server hardware that doesn't require the huge cost to host the entire model in VRAM. 
 
+## Latest News
+
+* Multi-GPU pre-release now available via the install link in the [ADVANCED.md](https://github.com/brontoguana/krasis/blob/main/ADVANCED.md) doc.  This won't improve prefill speed but could improve decode speed on multi GPU systems with similar GPUs.
+
 ## Benchmarks
 
 ### 1x RTX 5090 32GB (PCIE 4.0)
