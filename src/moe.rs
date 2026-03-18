@@ -2823,6 +2823,66 @@ impl KrasisEngine {
         Ok(())
     }
 
+    /// Get raw pointers to per-layer contiguous expert weight buffers.
+    ///
+    /// Returns (w13p_ptr, w13p_len, w13s_ptr, w13s_len, w2p_ptr, w2p_len, w2s_ptr, w2s_len).
+    /// These point directly into the LayerExpertBacking — zero-copy, already pinned by decode.
+    /// Used by prefill to create torch tensor views without allocating duplicate pinned memory.
+    pub fn get_layer_buffer_ptrs(
+        &self, moe_layer_idx: usize,
+    ) -> PyResult<(usize, usize, usize, usize, usize, usize, usize, usize)> {
+        let store = self.store.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Model not loaded"))?;
+        if moe_layer_idx >= store.layer_backings_gpu.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "MoE layer {} out of range (have {} layer backings)",
+                moe_layer_idx, store.layer_backings_gpu.len(),
+            )));
+        }
+        let backing = &store.layer_backings_gpu[moe_layer_idx];
+        Ok((
+            backing.w13_packed.as_ptr() as usize, backing.w13_packed.len(),
+            backing.w13_scales.as_ptr() as usize, backing.w13_scales.len(),
+            backing.w2_packed.as_ptr() as usize, backing.w2_packed.len(),
+            backing.w2_scales.as_ptr() as usize, backing.w2_scales.len(),
+        ))
+    }
+
+    /// Get raw pointers to shared expert weight components for a layer.
+    ///
+    /// Returns (w13p_ptr, w13p_len, w13s_ptr, w13s_len, w2p_ptr, w2p_len, w2s_ptr, w2s_len).
+    /// Points directly into the shared expert's data (which has its own contiguous_backing).
+    pub fn get_shared_expert_ptrs(
+        &self, moe_layer_idx: usize,
+    ) -> PyResult<(usize, usize, usize, usize, usize, usize, usize, usize)> {
+        let store = self.store.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Model not loaded"))?;
+        if store.shared_experts_gpu.is_empty() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err("No shared experts"));
+        }
+        if moe_layer_idx >= store.shared_experts_gpu.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Shared expert layer {} out of range (have {})",
+                moe_layer_idx, store.shared_experts_gpu.len(),
+            )));
+        }
+        let expert = &store.shared_experts_gpu[moe_layer_idx];
+        Ok((
+            expert.w13_packed.as_ptr() as usize, expert.w13_packed.len() * 4,
+            expert.w13_scales.as_ptr() as usize, expert.w13_scales.len() * 2,
+            expert.w2_packed.as_ptr() as usize, expert.w2_packed.len() * 4,
+            expert.w2_scales.as_ptr() as usize, expert.w2_scales.len() * 2,
+        ))
+    }
+
+    /// Check whether per-layer expert backings are available.
+    /// Returns true if layer_backings_gpu is populated (i.e. experts use per-layer storage).
+    pub fn has_layer_backings(&self) -> PyResult<bool> {
+        let store = self.store.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Model not loaded"))?;
+        Ok(!store.layer_backings_gpu.is_empty())
+    }
+
     /// Get shared expert w13 packed + scales + w2 packed + scales for a layer.
     /// Returns (w13_packed, w13_scales, w2_packed, w2_scales) bytes.
     pub fn get_shared_expert_weights<'py>(

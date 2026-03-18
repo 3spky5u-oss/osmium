@@ -13719,21 +13719,100 @@ impl GpuDecodeStore {
         // Without pinning, CUDA must bounce through a staging buffer, halving effective bandwidth.
         // NOTE: We use DEFAULT flag (0), NOT DEVICEMAP (0x02). Benchmarking showed DEVICEMAP
         // causes a 30% DMA regression even when not using mapped reads.
+        //
+        // With per-layer backing, we pin 4 buffers per layer instead of N per-expert buffers.
+        // This reduces cuMemHostRegister calls from ~24K (QCN: 512*48) to ~192 (4*48).
         let t_pin = std::time::Instant::now();
         let mut pinned_regions = 0usize;
         let mut pinned_bytes = 0usize;
         let mut pin_failures = 0usize;
 
+        // Pin per-layer backing buffers (routed experts)
         for moe_idx in 0..n_moe_layers {
-            let gpu_experts = &store.experts_gpu[moe_idx];
-            for expert in gpu_experts.iter() {
-                if let Some(ref backing) = expert.contiguous_backing {
-                    // Pin contiguous backing buffer (1 call instead of 4)
+            if moe_idx < store.layer_backings_gpu.len() {
+                // Per-layer backing: pin 4 contiguous buffers per layer
+                let backing = &store.layer_backings_gpu[moe_idx];
+                let regions: [(&[u8], &str); 4] = [
+                    (&backing.w13_packed, "w13p"),
+                    (&backing.w13_scales, "w13s"),
+                    (&backing.w2_packed, "w2p"),
+                    (&backing.w2_scales, "w2s"),
+                ];
+                for (buf, label) in &regions {
+                    if buf.is_empty() { continue; }
+                    let err = unsafe {
+                        cuda_sys::lib().cuMemHostRegister_v2(
+                            buf.as_ptr() as *mut std::ffi::c_void,
+                            buf.len(),
+                            0, // CU_MEMHOSTREGISTER_DEFAULT
+                        )
+                    };
+                    if err == cuda_sys::CUresult::CUDA_SUCCESS {
+                        pinned_regions += 1;
+                        pinned_bytes += buf.len();
+                    } else {
+                        pin_failures += 1;
+                        if pin_failures == 1 {
+                            log::warn!("First pin failure at moe_idx={} {}: {:?} (size={})",
+                                moe_idx, label, err, buf.len());
+                        }
+                    }
+                }
+            } else {
+                // Fallback for experts without per-layer backing (e.g. GGUF path):
+                // pin each expert's contiguous backing or individual components
+                let gpu_experts = &store.experts_gpu[moe_idx];
+                for expert in gpu_experts.iter() {
+                    if let Some(ref backing) = expert.contiguous_backing {
+                        let err = unsafe {
+                            cuda_sys::lib().cuMemHostRegister_v2(
+                                backing.as_ptr() as *mut std::ffi::c_void,
+                                backing.len(),
+                                0,
+                            )
+                        };
+                        if err == cuda_sys::CUresult::CUDA_SUCCESS {
+                            pinned_regions += 1;
+                            pinned_bytes += backing.len();
+                        } else {
+                            pin_failures += 1;
+                        }
+                    } else if !expert.borrowed {
+                        let regions: [(usize, usize); 4] = [
+                            (expert.w13_packed.as_ptr() as usize, expert.w13_packed.len() * 4),
+                            (expert.w13_scales.as_ptr() as usize, expert.w13_scales.len() * 2),
+                            (expert.w2_packed.as_ptr() as usize, expert.w2_packed.len() * 4),
+                            (expert.w2_scales.as_ptr() as usize, expert.w2_scales.len() * 2),
+                        ];
+                        for (ptr, size) in regions {
+                            if size == 0 { continue; }
+                            let err = unsafe {
+                                cuda_sys::lib().cuMemHostRegister_v2(
+                                    ptr as *mut std::ffi::c_void,
+                                    size,
+                                    0,
+                                )
+                            };
+                            if err == cuda_sys::CUresult::CUDA_SUCCESS {
+                                pinned_regions += 1;
+                                pinned_bytes += size;
+                            } else {
+                                pin_failures += 1;
+                            }
+                        }
+                    }
+                    // borrowed experts: skip — their data is already pinned via layer backing
+                }
+            }
+            // Pin shared expert buffers (still per-expert, one per layer)
+            if moe_idx < store.shared_experts_gpu.len() {
+                let se = &store.shared_experts_gpu[moe_idx];
+                if let Some(ref backing) = se.contiguous_backing {
                     let err = unsafe {
                         cuda_sys::lib().cuMemHostRegister_v2(
                             backing.as_ptr() as *mut std::ffi::c_void,
                             backing.len(),
-                            0, // CU_MEMHOSTREGISTER_DEFAULT
+                            0,
                         )
                     };
                     if err == cuda_sys::CUresult::CUDA_SUCCESS {
@@ -13741,18 +13820,13 @@ impl GpuDecodeStore {
                         pinned_bytes += backing.len();
                     } else {
                         pin_failures += 1;
-                        if pin_failures == 1 {
-                            log::warn!("First pin failure at moe_idx={}: {:?} (size={})",
-                                moe_idx, err, backing.len());
-                        }
                     }
                 } else {
-                    // Fallback: pin each weight buffer separately (4 calls)
                     let regions: [(usize, usize); 4] = [
-                        (expert.w13_packed.as_ptr() as usize, expert.w13_packed.len() * 4),
-                        (expert.w13_scales.as_ptr() as usize, expert.w13_scales.len() * 2),
-                        (expert.w2_packed.as_ptr() as usize, expert.w2_packed.len() * 4),
-                        (expert.w2_scales.as_ptr() as usize, expert.w2_scales.len() * 2),
+                        (se.w13_packed.as_ptr() as usize, se.w13_packed.len() * 4),
+                        (se.w13_scales.as_ptr() as usize, se.w13_scales.len() * 2),
+                        (se.w2_packed.as_ptr() as usize, se.w2_packed.len() * 4),
+                        (se.w2_scales.as_ptr() as usize, se.w2_scales.len() * 2),
                     ];
                     for (ptr, size) in regions {
                         if size == 0 { continue; }
@@ -13760,7 +13834,7 @@ impl GpuDecodeStore {
                             cuda_sys::lib().cuMemHostRegister_v2(
                                 ptr as *mut std::ffi::c_void,
                                 size,
-                                0, // CU_MEMHOSTREGISTER_DEFAULT
+                                0,
                             )
                         };
                         if err == cuda_sys::CUresult::CUDA_SUCCESS {
@@ -13768,37 +13842,7 @@ impl GpuDecodeStore {
                             pinned_bytes += size;
                         } else {
                             pin_failures += 1;
-                            if pin_failures == 1 {
-                                log::warn!("First pin failure at moe_idx={}: {:?} (size={})",
-                                    moe_idx, err, size);
-                            }
                         }
-                    }
-                }
-            }
-            // Also pin shared expert buffers
-            if moe_idx < store.shared_experts_gpu.len() {
-                let se = &store.shared_experts_gpu[moe_idx];
-                let regions: [(usize, usize); 4] = [
-                    (se.w13_packed.as_ptr() as usize, se.w13_packed.len() * 4),
-                    (se.w13_scales.as_ptr() as usize, se.w13_scales.len() * 2),
-                    (se.w2_packed.as_ptr() as usize, se.w2_packed.len() * 4),
-                    (se.w2_scales.as_ptr() as usize, se.w2_scales.len() * 2),
-                ];
-                for (ptr, size) in regions {
-                    if size == 0 { continue; }
-                    let err = unsafe {
-                        cuda_sys::lib().cuMemHostRegister_v2(
-                            ptr as *mut std::ffi::c_void,
-                            size,
-                            0,
-                        )
-                    };
-                    if err == cuda_sys::CUresult::CUDA_SUCCESS {
-                        pinned_regions += 1;
-                        pinned_bytes += size;
-                    } else {
-                        pin_failures += 1;
                     }
                 }
             }

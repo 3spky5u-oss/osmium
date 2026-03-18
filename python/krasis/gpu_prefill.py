@@ -1461,16 +1461,28 @@ class GpuPrefillManager:
             self._dma_shared_shape_w2s = (1, shared_N // gs, K_w2)
             self._dma_shared_initialized = True
 
+    @staticmethod
+    def _tensor_from_ptr(ptr: int, nbytes: int) -> torch.Tensor:
+        """Create a CPU tensor viewing memory at the given raw pointer (zero-copy).
+
+        The tensor does NOT own the memory — the Rust LayerExpertBacking does.
+        The memory will be pinned by cuMemHostRegister during decode store setup,
+        so .to(device, non_blocking=True) gets full async PCIe bandwidth.
+        """
+        import ctypes
+        c_buf = (ctypes.c_uint8 * nbytes).from_address(ptr)
+        return torch.frombuffer(c_buf, dtype=torch.uint8)
+
     def build_prefill_pinned_bufs(self):
-        """Build per-layer pinned buffers for zero-copy prefill DMA.
+        """Create zero-copy tensor views into Rust per-layer expert buffers.
 
-        Allocates one set of pinned buffers per MoE layer and fills them
-        from the Rust expert store. Called once at startup. Eliminates the
-        per-request CPU memcpy in preload_layer_group() — prefill just
-        kicks async DMA directly from these pre-built buffers.
+        Instead of allocating separate pinned memory and copying all expert data
+        (which doubled RAM usage), this creates torch tensor views pointing directly
+        into the Rust LayerExpertBacking buffers. These buffers are pinned by
+        cuMemHostRegister during decode store setup, enabling async DMA.
 
-        Total pinned RAM cost: num_moe_layers * per_layer_bytes.
-        Acceptable on high-RAM systems.
+        Falls back to the old allocate-and-copy path if per-layer backings are
+        not available (e.g. GGUF path).
         """
         if self._prefill_pinned_built:
             return
@@ -1480,8 +1492,64 @@ class GpuPrefillManager:
         # Ensure DMA buffer sizes/shapes are computed
         self._init_dma_buffers()
 
-        # Estimate total pinned RAM needed and check if we have enough.
-        # Each layer needs w13p + w13s + w2p + w2s bytes, times num_moe_layers.
+        # Check if per-layer backings are available (Marlin path)
+        use_direct_ptrs = self._engine.has_layer_backings()
+
+        if not use_direct_ptrs:
+            # Fallback: old allocate-and-copy path for GGUF or legacy stores
+            self._build_prefill_pinned_bufs_legacy()
+            return
+
+        t0 = time.perf_counter()
+        total_bytes = 0
+
+        for moe_idx in range(self._num_moe_layers):
+            # Get raw pointers to per-layer contiguous buffers in Rust
+            (w13p_ptr, w13p_len, w13s_ptr, w13s_len,
+             w2p_ptr, w2p_len, w2s_ptr, w2s_len) = self._engine.get_layer_buffer_ptrs(moe_idx)
+
+            buf = {
+                "w13p": self._tensor_from_ptr(w13p_ptr, w13p_len),
+                "w13s": self._tensor_from_ptr(w13s_ptr, w13s_len),
+                "w2p": self._tensor_from_ptr(w2p_ptr, w2p_len),
+                "w2s": self._tensor_from_ptr(w2s_ptr, w2s_len),
+            }
+            self._prefill_pinned[moe_idx] = buf
+            total_bytes += w13p_len + w13s_len + w2p_len + w2s_len
+
+            if (moe_idx + 1) % 10 == 0 or moe_idx == self._num_moe_layers - 1:
+                logger.info(
+                    "  Prefill direct views: %d/%d layers (%.1f GB)",
+                    moe_idx + 1, self._num_moe_layers, total_bytes / 1e9,
+                )
+
+        # Shared expert views
+        if self.n_shared_experts > 0 and self._dma_shared_initialized:
+            for moe_idx in range(self._num_moe_layers):
+                (w13p_ptr, w13p_len, w13s_ptr, w13s_len,
+                 w2p_ptr, w2p_len, w2s_ptr, w2s_len) = self._engine.get_shared_expert_ptrs(moe_idx)
+                shared_buf = {
+                    "w13p": self._tensor_from_ptr(w13p_ptr, w13p_len),
+                    "w13s": self._tensor_from_ptr(w13s_ptr, w13s_len),
+                    "w2p": self._tensor_from_ptr(w2p_ptr, w2p_len),
+                    "w2s": self._tensor_from_ptr(w2s_ptr, w2s_len),
+                }
+                self._prefill_pinned_shared[moe_idx] = shared_buf
+                total_bytes += w13p_len + w13s_len + w2p_len + w2s_len
+
+        elapsed = time.perf_counter() - t0
+        self._prefill_pinned_built = True
+        logger.info(
+            "Prefill direct views built: %d layers, %.1f GB (zero-copy, no extra RAM), %.3fs",
+            self._num_moe_layers, total_bytes / 1e9, elapsed,
+        )
+
+    def _build_prefill_pinned_bufs_legacy(self):
+        """Legacy path: allocate pinned memory and copy expert data into it.
+
+        Used when per-layer backings are not available (GGUF path).
+        This duplicates all expert data in pinned RAM.
+        """
         per_layer_bytes = (self._dma_size_w13p + self._dma_size_w13s
                            + self._dma_size_w2p + self._dma_size_w2s)
         total_pinned_bytes = per_layer_bytes * self._num_moe_layers
@@ -1496,11 +1564,10 @@ class GpuPrefillManager:
                         break
                 else:
                     avail_ram = 0
-        # Require at least 10 GB headroom after pinning
         headroom = 10 * 1024 ** 3
         if avail_ram > 0 and total_pinned_bytes + headroom > avail_ram:
             logger.info(
-                "Skipping prefill pinned buffers: need %.1f GB but only %.1f GB available "
+                "Skipping prefill pinned buffers (legacy): need %.1f GB but only %.1f GB available "
                 "(keeping %.1f GB headroom). Using double-buffered DMA instead.",
                 total_pinned_bytes / 1e9, avail_ram / 1e9, headroom / 1e9,
             )
@@ -1528,13 +1595,6 @@ class GpuPrefillManager:
             self._prefill_pinned[moe_idx] = buf
             total_bytes += self._dma_size_w13p + self._dma_size_w13s + self._dma_size_w2p + self._dma_size_w2s
 
-            if (moe_idx + 1) % 10 == 0 or moe_idx == self._num_moe_layers - 1:
-                logger.info(
-                    "  Prefill pinned bufs: %d/%d layers (%.1f GB)",
-                    moe_idx + 1, self._num_moe_layers, total_bytes / 1e9,
-                )
-
-        # Also build shared expert pinned buffers
         if self.n_shared_experts > 0 and self._dma_shared_initialized:
             for moe_idx in range(self._num_moe_layers):
                 shared_buf = {
@@ -1557,9 +1617,8 @@ class GpuPrefillManager:
         elapsed = time.perf_counter() - t0
         self._prefill_pinned_built = True
         logger.info(
-            "Prefill pinned buffers built: %d layers, %.1f GB pinned RAM, %.1fs (%.1f GB/s)",
+            "Prefill pinned buffers built (legacy): %d layers, %.1f GB pinned RAM, %.1fs",
             self._num_moe_layers, total_bytes / 1e9, elapsed,
-            total_bytes / 1e9 / max(elapsed, 0.001),
         )
 
     def preload_layer_group(self, moe_layer_indices):

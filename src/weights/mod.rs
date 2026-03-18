@@ -344,13 +344,17 @@ pub struct UnifiedExpertWeights {
     /// [w13_packed | pad | w13_scales | pad | w2_packed | pad | w2_scales]
     /// with 256-byte alignment between components. Enables single-call DMA per expert.
     pub contiguous_backing: Option<Vec<u8>>,
+
+    /// When true, component Vecs (w13_packed etc.) are views into external memory
+    /// (e.g. LayerExpertBacking). Drop will forget them instead of freeing.
+    pub borrowed: bool,
 }
 
 impl Drop for UnifiedExpertWeights {
     fn drop(&mut self) {
-        if self.contiguous_backing.is_some() {
-            // w13_packed/scales/w2_packed/scales point into contiguous_backing.
-            // Forget them to prevent double-free (backing owns the memory).
+        if self.contiguous_backing.is_some() || self.borrowed {
+            // w13_packed/scales/w2_packed/scales point into external memory.
+            // Forget them to prevent double-free (the backing owner frees the memory).
             std::mem::forget(std::mem::take(&mut self.w13_packed));
             std::mem::forget(std::mem::take(&mut self.w13_scales));
             std::mem::forget(std::mem::take(&mut self.w2_packed));
@@ -432,6 +436,7 @@ impl UnifiedExpertWeights {
             down_bias: None,
             tiled: false,
             contiguous_backing: None,
+            borrowed: false,
         }
     }
 
@@ -528,6 +533,7 @@ impl UnifiedExpertWeights {
             down_bias: None,
             tiled: false,
             contiguous_backing: None,
+            borrowed: false,
         }
     }
 
@@ -610,6 +616,7 @@ impl UnifiedExpertWeights {
             down_bias: None,
             tiled: false,
             contiguous_backing: None,
+            borrowed: false,
         }
     }
 
@@ -679,6 +686,7 @@ impl UnifiedExpertWeights {
             down_bias: None,
             tiled: false,
             contiguous_backing: None,
+            borrowed: false,
         }
     }
 
@@ -731,6 +739,7 @@ impl UnifiedExpertWeights {
                 down_bias: None,
                 tiled: false,
                 contiguous_backing: None,
+                borrowed: false,
             }
         } else {
             // INT8 gate/up
@@ -785,6 +794,7 @@ impl UnifiedExpertWeights {
                 down_bias: None,
                 tiled: false,
                 contiguous_backing: None,
+                borrowed: false,
             }
         };
 
@@ -854,6 +864,29 @@ impl UnifiedExpertWeights {
     }
 }
 
+/// Per-layer contiguous storage for all routed experts' GPU (Marlin) weights.
+/// Each component buffer holds all experts' data concatenated end-to-end.
+/// Individual UnifiedExpertWeights reference slices within these buffers (borrowed=true).
+/// This layout enables:
+///   - Prefill: direct DMA from these buffers (no separate pinned copy)
+///   - Decode: per-layer pinning (4 cuMemHostRegister calls vs N*4 per-expert calls)
+pub struct LayerExpertBacking {
+    /// All experts' w13_packed data concatenated: [expert_0 | expert_1 | ... | expert_N]
+    pub w13_packed: Vec<u8>,
+    /// All experts' w13_scales data concatenated
+    pub w13_scales: Vec<u8>,
+    /// All experts' w2_packed data concatenated
+    pub w2_packed: Vec<u8>,
+    /// All experts' w2_scales data concatenated
+    pub w2_scales: Vec<u8>,
+    /// Per-expert byte sizes for each component
+    pub per_expert_w13p: usize,
+    pub per_expert_w13s: usize,
+    pub per_expert_w2p: usize,
+    pub per_expert_w2s: usize,
+    pub num_experts: usize,
+}
+
 /// Manages loaded expert weights for all MoE layers.
 #[pyclass]
 pub struct WeightStore {
@@ -872,9 +905,15 @@ pub struct WeightStore {
 
     /// GPU prefill weights — Marlin tile-permuted layout for fused_marlin_moe.
     /// Always INT4 Marlin format. Empty if GPU prefill not enabled.
+    /// With LayerExpertBacking, individual experts are borrowed views into the backing.
     pub experts_gpu: Vec<Vec<UnifiedExpertWeights>>,
     /// GPU shared expert weights (Marlin).
     pub shared_experts_gpu: Vec<UnifiedExpertWeights>,
+
+    /// Per-layer contiguous storage for GPU expert weights.
+    /// Each entry owns the memory that experts_gpu[layer_idx] elements borrow from.
+    /// Must be kept alive as long as experts_gpu references exist.
+    pub layer_backings_gpu: Vec<LayerExpertBacking>,
 
     /// Raw GGUF expert weights — loaded as-is from GGUF file, no conversion.
     /// When populated, used for CPU decode INSTEAD of experts_cpu.
@@ -1190,6 +1229,7 @@ impl WeightStore {
             shared_experts_cpu: Vec::new(),
             experts_gpu: Vec::new(),
             shared_experts_gpu: Vec::new(),
+            layer_backings_gpu: Vec::new(),
             experts_gguf: Vec::new(),
             shared_experts_gguf: Vec::new(),
             config: ModelConfig {
@@ -1283,6 +1323,7 @@ impl WeightStore {
         // ── Phase 1: Load/build GPU Marlin cache → experts_gpu ──
         let mut experts_gpu: Vec<Vec<UnifiedExpertWeights>> = Vec::new();
         let mut shared_experts_gpu: Vec<UnifiedExpertWeights> = Vec::new();
+        let mut layer_backings_gpu: Vec<LayerExpertBacking> = Vec::new();
         let mut effective_gs = cache_gs;
 
         // Try loading existing Marlin cache
@@ -1303,6 +1344,7 @@ impl WeightStore {
                         );
                         experts_gpu = store.experts_gpu;
                         shared_experts_gpu = store.shared_experts_gpu;
+                        layer_backings_gpu = store.layer_backings_gpu;
                         effective_gs = *try_gs;
                         gpu_loaded = true;
                     }
@@ -1351,6 +1393,7 @@ impl WeightStore {
                             );
                             experts_gpu = store.experts_gpu;
                             shared_experts_gpu = store.shared_experts_gpu;
+                            layer_backings_gpu = store.layer_backings_gpu;
                             effective_gs = *try_gs;
                             gpu_loaded = true;
                         }
@@ -1452,6 +1495,7 @@ impl WeightStore {
             shared_experts_cpu,
             experts_gpu,
             shared_experts_gpu,
+            layer_backings_gpu,
             experts_gguf: Vec::new(),
             shared_experts_gguf: Vec::new(),
             config: config.clone(),
@@ -1821,6 +1865,7 @@ impl WeightStore {
             shared_experts_cpu: Vec::new(),
             experts_gpu: Vec::new(),
             shared_experts_gpu: Vec::new(),
+            layer_backings_gpu: Vec::new(),
             experts_gguf: Vec::new(),
             shared_experts_gguf: Vec::new(),
             config: config.clone(),
@@ -2559,13 +2604,16 @@ impl WeightStore {
 
         let mut offset = CACHE_HEADER_SIZE + start_moe_layer * per_routed_layer;
 
-        // Load routed experts
+        // Load routed experts into per-layer contiguous backings.
+        // Each layer gets 4 contiguous buffers (w13p, w13s, w2p, w2s) with all experts
+        // packed end-to-end. Individual UnifiedExpertWeights are borrowed views.
         let mut experts_gpu = Vec::with_capacity(num_layers_to_load);
+        let mut layer_backings_gpu = Vec::with_capacity(num_layers_to_load);
         for layer_idx in 0..num_layers_to_load {
-            let mut layer_experts = Vec::with_capacity(config.n_routed_experts);
-            for _eidx in 0..config.n_routed_experts {
-                layer_experts.push(read_marlin_expert(&mmap, &mut offset, h, m, group_size, gpu_bits));
-            }
+            let (backing, layer_experts) = read_marlin_layer(
+                &mmap, &mut offset, h, m, group_size, gpu_bits, config.n_routed_experts,
+            );
+            layer_backings_gpu.push(backing);
             experts_gpu.push(layer_experts);
 
             if (layer_idx + 1) % 10 == 0 || layer_idx + 1 == num_layers_to_load {
@@ -2627,6 +2675,7 @@ impl WeightStore {
             shared_experts_cpu: Vec::new(),
             experts_gpu,
             shared_experts_gpu,
+            layer_backings_gpu,
             experts_gguf: Vec::new(),
             shared_experts_gguf: Vec::new(),
             config: config.clone(),
@@ -3699,6 +3748,7 @@ impl WeightStore {
             shared_experts_cpu,
             experts_gpu,
             shared_experts_gpu,
+            layer_backings_gpu: Vec::new(), // GGUF path doesn't use per-layer backing yet
             experts_gguf,
             shared_experts_gguf,
             config: config.clone(),
@@ -4356,6 +4406,135 @@ fn write_vec_u16<W: Write>(w: &mut W, data: &[u16]) -> Result<(), String> {
     w.write_all(bytes).map_err(|e| format!("Write u16 error: {e}"))
 }
 
+/// Read an entire MoE layer of experts from mmap'd Marlin cache data.
+///
+/// Allocates 4 per-layer contiguous buffers (w13_packed, w13_scales, w2_packed, w2_scales)
+/// and scatters each expert's components into them. Returns the backing and borrowed views.
+/// This layout enables:
+///   - Prefill: direct pointer access to per-layer buffers (no separate pinned copy)
+///   - Decode: 4 cuMemHostRegister calls per layer instead of N per-expert calls
+fn read_marlin_layer(
+    data: &[u8],
+    offset: &mut usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    group_size: usize,
+    gpu_bits: u8,
+    n_experts: usize,
+) -> (LayerExpertBacking, Vec<UnifiedExpertWeights>) {
+    let h = hidden_size;
+    let m = intermediate_size;
+    let div = if gpu_bits == 4 { 8 } else { 4 };
+    let packed_k = h / div;
+    let num_groups = h / group_size;
+    let two_n = 2 * m;
+    let h_w2 = marlin_w2_padded_n(h, m);
+    let down_packed_k = m / div;
+    let down_num_groups = m / group_size;
+
+    // Per-expert component byte sizes (raw, no alignment padding)
+    let w13pb = packed_k * two_n * 4;
+    let w13sb = num_groups * two_n * 2;
+    let w2pb = down_packed_k * h_w2 * 4;
+    let w2sb = down_num_groups * h_w2 * 2;
+    let per_expert_raw = w13pb + w13sb + w2pb + w2sb;
+
+    // Allocate per-layer backing buffers
+    let mut backing = LayerExpertBacking {
+        w13_packed: vec![0u8; w13pb * n_experts],
+        w13_scales: vec![0u8; w13sb * n_experts],
+        w2_packed: vec![0u8; w2pb * n_experts],
+        w2_scales: vec![0u8; w2sb * n_experts],
+        per_expert_w13p: w13pb,
+        per_expert_w13s: w13sb,
+        per_expert_w2p: w2pb,
+        per_expert_w2s: w2sb,
+        num_experts: n_experts,
+    };
+
+    // Read experts from mmap and scatter to per-component-per-layer buffers.
+    // Cache file layout per expert: [w13p | w13s | w2p | w2s] (sequential).
+    // Backing layout per component: [expert_0 | expert_1 | ... | expert_N] (concatenated).
+    for eidx in 0..n_experts {
+        let src = *offset;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr().add(src),
+                backing.w13_packed.as_mut_ptr().add(eidx * w13pb),
+                w13pb,
+            );
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr().add(src + w13pb),
+                backing.w13_scales.as_mut_ptr().add(eidx * w13sb),
+                w13sb,
+            );
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr().add(src + w13pb + w13sb),
+                backing.w2_packed.as_mut_ptr().add(eidx * w2pb),
+                w2pb,
+            );
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr().add(src + w13pb + w13sb + w2pb),
+                backing.w2_scales.as_mut_ptr().add(eidx * w2sb),
+                w2sb,
+            );
+        }
+        *offset += per_expert_raw;
+    }
+
+    // Create borrowed UnifiedExpertWeights views into the backing buffers.
+    // These Vecs do NOT own the memory — the LayerExpertBacking does.
+    // borrowed=true tells Drop to forget them instead of freeing.
+    let w13_packed_count = packed_k * two_n;
+    let w13_scales_count = num_groups * two_n;
+    let w2_packed_count = down_packed_k * h_w2;
+    let w2_scales_count = down_num_groups * h_w2;
+
+    let mut experts = Vec::with_capacity(n_experts);
+    for eidx in 0..n_experts {
+        let (w13_packed, w13_scales, w2_packed, w2_scales) = unsafe {
+            (
+                Vec::from_raw_parts(
+                    backing.w13_packed.as_ptr().add(eidx * w13pb) as *mut u32,
+                    w13_packed_count, w13_packed_count,
+                ),
+                Vec::from_raw_parts(
+                    backing.w13_scales.as_ptr().add(eidx * w13sb) as *mut u16,
+                    w13_scales_count, w13_scales_count,
+                ),
+                Vec::from_raw_parts(
+                    backing.w2_packed.as_ptr().add(eidx * w2pb) as *mut u32,
+                    w2_packed_count, w2_packed_count,
+                ),
+                Vec::from_raw_parts(
+                    backing.w2_scales.as_ptr().add(eidx * w2sb) as *mut u16,
+                    w2_scales_count, w2_scales_count,
+                ),
+            )
+        };
+
+        experts.push(UnifiedExpertWeights {
+            w13_packed,
+            w13_scales,
+            w2_packed,
+            w2_scales,
+            hidden_size,
+            intermediate_size,
+            group_size,
+            num_bits: gpu_bits,
+            w2_bits: gpu_bits,
+            gate_bias: None,
+            up_bias: None,
+            down_bias: None,
+            tiled: false,
+            contiguous_backing: None,
+            borrowed: true,
+        });
+    }
+
+    (backing, experts)
+}
+
 /// Read a UnifiedExpertWeights from mmap'd Marlin cache data at the given offset.
 /// `gpu_bits` determines pack factor: INT4=8 values/u32, INT8=4 values/u32.
 fn read_marlin_expert(
@@ -4458,6 +4637,7 @@ fn read_marlin_expert(
         down_bias: None,
         tiled: false,
         contiguous_backing: Some(backing),
+        borrowed: false,
     }
 }
 
@@ -4546,6 +4726,7 @@ fn read_unified_expert_cpu(
         down_bias: None,
         tiled: false,
         contiguous_backing: None,
+        borrowed: false,
     }
 }
 
@@ -4637,6 +4818,7 @@ fn read_unified_expert_cpu_mixed(
         down_bias: None,
         tiled: false,
         contiguous_backing: None,
+        borrowed: false,
     }
 }
 

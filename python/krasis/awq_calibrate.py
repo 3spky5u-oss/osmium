@@ -866,8 +866,9 @@ def main():
         kv_dtype=kv_dtype,
         layer_group_size=int(cfg.get("layer_group_size", 2)),
         kv_cache_mb=int(cfg.get("kv_cache_mb", 1000)),
+        stream_attention=True,  # Always stream — calibration is one-time, and large models may not fit BF16 attention in VRAM
     )
-    model.load()
+    model.load(gpu_only=True)
 
     # Load calibration dataset
     print(f"\n  Loading calibration dataset: {args.dataset}...")
