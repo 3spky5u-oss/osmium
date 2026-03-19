@@ -663,35 +663,21 @@ class KrasisModel:
                             attn_mb, free_mb)
                 print(f"  \033[0;32mAttention resident on GPU ({attn_mb} MB), {free_mb} MB free\033[0m", flush=True)
 
-        # Phase 2: Expert weights (Rust engine)
+        # Phase 2: Expert weights (Rust engine) — GPU Marlin cache only (CPU cache no longer used)
         cpu_start = time.perf_counter()
-        cpu_bits = self.quant_cfg.cpu_expert_bits
         gpu_bits = self.quant_cfg.gpu_expert_bits
         cache_dir = cache_dir_for_model(self.cfg.model_path)
         has_gpu_cache = os.path.isfile(os.path.join(cache_dir, f"experts_marlin_int{gpu_bits}_g128.bin"))
-        has_cpu_cache = os.path.isfile(os.path.join(cache_dir, f"experts_cpu_int{cpu_bits}_g128.bin"))
-        if gpu_only:
-            if has_gpu_cache:
-                print(f"\n\033[1m\033[36m▸ Loading GPU expert weights from cache (GPU-only mode, no CPU experts)\033[0m", flush=True)
-            else:
-                print(f"\n\033[1m\033[36m▸ Building GPU INT{gpu_bits} Marlin expert cache (one-time)\033[0m", flush=True)
-            logger.info("Phase 2: Loading GPU expert weights only (GPU INT%d, skipping CPU)...", gpu_bits)
+        if has_gpu_cache:
+            print(f"\n\033[1m\033[36m▸ Loading GPU expert weights from cache\033[0m", flush=True)
         else:
-            if has_gpu_cache and has_cpu_cache:
-                print(f"\n\033[1m\033[36m▸ Loading expert weights from cache (this loads the full model into RAM, may take a minute)\033[0m", flush=True)
-            else:
-                building = []
-                if not has_gpu_cache:
-                    building.append(f"GPU INT{gpu_bits} Marlin")
-                if not has_cpu_cache:
-                    building.append(f"CPU INT{cpu_bits}")
-                print(f"\n\033[1m\033[36m▸ Building {' + '.join(building)} expert cache (one-time, may take several minutes)\033[0m", flush=True)
-                print(f"  \033[2mCache will be saved to {cache_dir} for instant loading next time.\033[0m", flush=True)
-            logger.info("Phase 2: Loading expert weights (CPU INT%d + GPU INT%d)...", cpu_bits, gpu_bits)
+            print(f"\n\033[1m\033[36m▸ Building GPU INT{gpu_bits} Marlin expert cache (one-time)\033[0m", flush=True)
+            print(f"  \033[2mCache will be saved to {cache_dir} for instant loading next time.\033[0m", flush=True)
+        logger.info("Phase 2: Loading GPU expert weights (INT%d)...", gpu_bits)
         self._load_cpu_experts(gpu_only=gpu_only)
         cpu_elapsed = time.perf_counter() - cpu_start
         logger.info("Expert weights loaded in %.1fs", cpu_elapsed)
-        if has_gpu_cache and has_cpu_cache:
+        if has_gpu_cache:
             print(f"  \033[0;32mExpert weights loaded in {cpu_elapsed:.0f}s.\033[0m", flush=True)
         else:
             print(f"  \033[0;32mExpert cache built in {cpu_elapsed:.0f}s — next launch will be much faster.\033[0m", flush=True)

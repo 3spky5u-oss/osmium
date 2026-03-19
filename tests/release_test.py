@@ -47,6 +47,7 @@ SUPPORTED_MODELS = [
     "Qwen3.5-35B-A3B",
     "Qwen3.5-122B-A10B",
     "Qwen3-235B-A22B",
+    "Qwen3.5-397B-A17B",
 ]
 
 CONFIG_VARIANTS = [
@@ -213,16 +214,16 @@ def generate_config(model_name: str, variant: Dict, gpu_idx: int,
 # ═══════════════════════════════════════════════════════════════════
 
 def cache_exists(model_name: str, gpu_bits: int, cpu_bits: int) -> bool:
-    """Check if both GPU Marlin and CPU expert caches exist for given bit-widths.
+    """Check if GPU Marlin expert cache exists for given bit-width.
 
+    CPU expert caches are no longer used (GPU-only decode mode).
     Checks for any group size (g32, g64, g128) since the Rust engine tries
     multiple group sizes when building.
     """
     import glob as _glob
     model_cache = os.path.join(CACHE_DIR, model_name)
     has_gpu = bool(_glob.glob(os.path.join(model_cache, f"experts_marlin_int{gpu_bits}_g*.bin")))
-    has_cpu = bool(_glob.glob(os.path.join(model_cache, f"experts_cpu_int{cpu_bits}_g*.bin")))
-    return has_gpu and has_cpu
+    return has_gpu
 
 
 def build_caches(model_name: str, gpu_idx: int, num_layers: int,

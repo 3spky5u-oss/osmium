@@ -892,7 +892,7 @@ def main():
     if getattr(args, 'force_rebuild_cache', False):
         _cache_dir = cache_dir_for_model(args.model_path)
         _deleted = []
-        for pattern in ["experts_marlin_*.bin", "experts_cpu_*.bin"]:
+        for pattern in ["experts_marlin_*.bin"]:
             import glob as _glob
             for f in _glob.glob(os.path.join(_cache_dir, pattern)):
                 os.unlink(f)
@@ -929,18 +929,15 @@ def main():
 
     _status("Loading model weights")
     if getattr(args, 'build_cache', False):
-        # --build-cache: load full model (GPU+CPU caches) then exit
-        _detail("Build-cache mode: loading model to build/verify expert caches")
-        _model.load(gpu_only=False)
+        # --build-cache: build GPU Marlin expert cache then exit (CPU cache no longer used)
+        _detail("Build-cache mode: building/verifying GPU Marlin expert cache")
+        _model.load(gpu_only=True)
         import glob as _glob
         _cache_dir = cache_dir_for_model(args.model_path)
         gpu_bits = args.gpu_expert_bits
-        cpu_bits = args.cpu_expert_bits
         has_gpu = bool(_glob.glob(os.path.join(_cache_dir, f"experts_marlin_int{gpu_bits}_g*.bin")))
-        has_cpu = bool(_glob.glob(os.path.join(_cache_dir, f"experts_cpu_int{cpu_bits}_g*.bin")))
         _status("Cache build complete")
         _detail(f"GPU Marlin INT{gpu_bits}: {'exists' if has_gpu else 'MISSING'}")
-        _detail(f"CPU INT{cpu_bits}: {'exists' if has_cpu else 'MISSING'}")
         print("BUILD CACHE COMPLETE", flush=True)
         return
     _model.load(gpu_only=gpu_only)
