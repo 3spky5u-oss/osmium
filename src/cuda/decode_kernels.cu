@@ -4652,21 +4652,45 @@ extern "C" __global__ void simple_int4_gemv_f32(
     if (row >= rows) return;
 
     int half_cols = cols / 2;
-    int n_groups = cols / group_size;
     const unsigned char* w_row = packed_w + (long long)row * half_cols;
-    const float* s_row = scales + (long long)row * n_groups;
+    const float* s_row = scales + (long long)row * (cols / group_size);
 
     float acc = 0.0f;
 
-    for (int k = lane * 2; k < cols; k += 64) {
+    // Vectorized path: read 4 bytes (8 weights) per lane per iteration via uint32.
+    // 32 lanes × 8 weights = 256 weights per warp iteration (vs 64 in scalar path).
+    // Each uint32 read is 128 bytes/warp — fully utilizes a cache line.
+    // All 8 weights share one scale (group_size >= 8 guaranteed for INT4 AWQ).
+    const unsigned int* w_row_u32 = (const unsigned int*)w_row;
+    int packed_per_row = half_cols >> 2;  // number of uint32 per row
+
+    for (int ki = lane; ki < packed_per_row; ki += 32) {
+        unsigned int packed4 = __ldg(w_row_u32 + ki);
+        int base_k = ki << 3;  // ki * 8
+        float scale = s_row[base_k / group_size];
+
+        float local_sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int byte_val = (packed4 >> (i * 8)) & 0xFF;
+            int lo = (byte_val & 0xF) - 8;
+            int hi = (byte_val >> 4) - 8;
+            float x0 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[base_k + i*2]));
+            float x1 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[base_k + i*2 + 1]));
+            local_sum += (float)lo * x0 + (float)hi * x1;
+        }
+        acc += scale * local_sum;
+    }
+
+    // Handle remainder if cols not divisible by 8 (rare — all known models are aligned)
+    int vec_cols = packed_per_row << 3;
+    for (int k = vec_cols + lane * 2; k < cols; k += 64) {
         unsigned char packed = w_row[k / 2];
         int lo = (int)(packed & 0xF) - 8;
         int hi = (int)(packed >> 4) - 8;
-
         float scale = s_row[k / group_size];
         float x0 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
         float x1 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k + 1]));
-
         acc += scale * ((float)lo * x0 + (float)hi * x1);
     }
 
@@ -4703,21 +4727,40 @@ extern "C" __global__ void simple_int4_gemv_bf16(
     if (row >= rows) return;
 
     int half_cols = cols / 2;
-    int n_groups = cols / group_size;
     const unsigned char* w_row = packed_w + (long long)row * half_cols;
-    const float* s_row = scales + (long long)row * n_groups;
+    const float* s_row = scales + (long long)row * (cols / group_size);
 
     float acc = 0.0f;
 
-    for (int k = lane * 2; k < cols; k += 64) {
+    const unsigned int* w_row_u32 = (const unsigned int*)w_row;
+    int packed_per_row = half_cols >> 2;
+
+    for (int ki = lane; ki < packed_per_row; ki += 32) {
+        unsigned int packed4 = __ldg(w_row_u32 + ki);
+        int base_k = ki << 3;
+        float scale = s_row[base_k / group_size];
+
+        float local_sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int byte_val = (packed4 >> (i * 8)) & 0xFF;
+            int lo = (byte_val & 0xF) - 8;
+            int hi = (byte_val >> 4) - 8;
+            float x0 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[base_k + i*2]));
+            float x1 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[base_k + i*2 + 1]));
+            local_sum += (float)lo * x0 + (float)hi * x1;
+        }
+        acc += scale * local_sum;
+    }
+
+    int vec_cols = packed_per_row << 3;
+    for (int k = vec_cols + lane * 2; k < cols; k += 64) {
         unsigned char packed = w_row[k / 2];
         int lo = (int)(packed & 0xF) - 8;
         int hi = (int)(packed >> 4) - 8;
-
         float scale = s_row[k / group_size];
         float x0 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k]));
         float x1 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&s_input[k + 1]));
-
         acc += scale * ((float)lo * x0 + (float)hi * x1);
     }
 
