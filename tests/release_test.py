@@ -1292,6 +1292,19 @@ def main():
     info(f"Report: {report_path}")
     print()
 
+    # ── Initial GPU cleanup ─────────────────────────────────────
+    # Kill any stale krasis processes and wait for GPU memory to clear.
+    # This is critical: build_caches and build_awq_template skip their
+    # cleanup when caches/templates already exist, so without this,
+    # Config 1 would start with stale GPU memory from whatever ran before.
+    info("Cleaning GPU before starting...")
+    kill_stale_krasis_processes()
+    if not wait_for_gpu_clear(gpu_idx, timeout=30):
+        warn("GPU memory not fully cleared — stale processes may affect Config 1")
+    else:
+        ok("GPU clear.")
+    print()
+
     # ── Pre-flight: build expert caches ─────────────────────────
 
     print(f"{'=' * 64}")

@@ -3878,7 +3878,35 @@ impl GpuDecodeStore {
         }
 
         // Only allocate for the experts that actually need soft slots
-        let soft_num_slots = std::cmp::min(soft_num_slots, soft_experts_available);
+        let mut soft_num_slots = std::cmp::min(soft_num_slots, soft_experts_available);
+
+        // Query actual VRAM and cap allocation to what's really available.
+        // The Python-side budget was measured before reaching this point;
+        // VRAM may have drifted due to CUDA context growth, allocator overhead,
+        // or stale processes.  Always check reality before allocating.
+        let safety_bytes = safety_margin_mb * 1024 * 1024;
+        if let Ok((actual_free, _)) = cudarc::driver::result::mem_get_info() {
+            let usable = actual_free.saturating_sub(safety_bytes);
+            let max_slots = usable / slot_size;
+            if max_slots < soft_num_slots {
+                log::warn!(
+                    "HCS soft tier: capping from {} to {} slots ({:.0} MB free, {:.0} MB safety)",
+                    soft_num_slots, max_slots,
+                    actual_free as f64 / (1024.0 * 1024.0),
+                    safety_bytes as f64 / (1024.0 * 1024.0),
+                );
+                soft_num_slots = max_slots;
+            }
+        }
+
+        if soft_num_slots == 0 {
+            log::warn!("HCS soft tier: no VRAM available for soft experts after safety margin");
+            hcs.soft_loaded = true;
+            hcs.soft_num_slots = 0;
+            hcs.soft_num_cached = 0;
+            return Ok(format!("{} | soft: 0 experts (insufficient VRAM)", result));
+        }
+
         let soft_alloc_bytes = soft_num_slots * slot_size;
         log::info!("HCS soft tier: allocating {:.1} MB ({} slots for {} available experts)",
             soft_alloc_bytes as f64 / (1024.0 * 1024.0), soft_num_slots, soft_experts_available);
