@@ -4636,6 +4636,13 @@ class KrasisModel:
                 attn = layer.attention
                 qkvz_out = attn.num_k_heads * (2 * attn.k_head_dim + 2 * attn.head_ratio * attn.v_head_dim)
                 max_qkv = max(max_qkv, qkvz_out)
+            elif hasattr(layer.attention, 'kv_a_proj'):
+                # MLA: same calculation as primary store
+                ma = layer.attention
+                q_out = ma.num_heads * (ma.qk_nope_dim + ma.qk_rope_dim)
+                q_absorbed = ma.num_heads * ma.ckv_dim
+                kv_out = ma.ckv_dim + ma.qk_rope_dim
+                max_qkv = max(max_qkv, q_out, q_absorbed, kv_out)
             elif hasattr(layer.attention, 'num_heads'):
                 ga = layer.attention
                 q_sz = ga.num_heads * ga.head_dim * (2 if ga.gated_attention else 1)
