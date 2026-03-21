@@ -12,7 +12,12 @@
 #   ./dev network <port> --large    Include large-prompt tests
 #   ./dev benchmark <config>        Run standard benchmark (prefill/decode/round trip) and exit
 #   ./dev perplexity <config>       Run perplexity eval (WikiText-2 by default) and exit
-#   ./dev release-test <model>      Run full release test (4 configs, produces report)
+#   ./dev release-test <model>      Run full release test (5 configs, produces report)
+#   ./dev release-test-all [target]  Run release test on all supported models sequentially
+#                                     If a target name is given (e.g. "rc8"), progress is saved
+#                                     to a state file. Re-running with the same target resumes
+#                                     from the first non-passed model. Without a target, runs
+#                                     all models with no resume capability.
 #   ./dev awq-calibrate <config>    Run AWQ calibration, produce attention template
 #   ./dev chat [args]               Run krasis chat from source
 #   ./dev sanity                    Run sanity test prompts against running server
@@ -341,6 +346,151 @@ do_release_test() {
     KRASIS_DEV_SCRIPT=1 "$PYTHON" "$SCRIPT_DIR/tests/release_test.py" "$model" "$@"
 }
 
+do_release_test_all() {
+    local SESSION_WS="Release Test"
+    local release_target="${1:-}"
+    local MODELS=(
+        "Qwen3-Coder-Next"
+        "Qwen3.5-35B-A3B"
+        "Qwen3.5-122B-A10B"
+        "Qwen3-235B-A22B"
+        "Qwen3.5-397B-A17B"
+    )
+
+    local total=${#MODELS[@]}
+    local completed=0
+    local skipped=0
+    local failed_model=""
+    local resuming=false
+    local state_file=""
+    local start_time
+    start_time=$(date +%s)
+
+    # State file for resume support (only when release target is given)
+    if [[ -n "$release_target" ]]; then
+        local state_dir="$SCRIPT_DIR/logs/release-tests"
+        mkdir -p "$state_dir"
+        state_file="$state_dir/release-all-${release_target}.state"
+
+        if [[ -f "$state_file" ]]; then
+            resuming=true
+            # Count previously passed models
+            for model in "${MODELS[@]}"; do
+                local status
+                status=$(grep "^${model}:" "$state_file" 2>/dev/null | cut -d: -f2) || true
+                if [[ "$status" == "PASSED" ]]; then
+                    skipped=$((skipped + 1))
+                    completed=$((completed + 1))
+                fi
+            done
+
+            if [[ $skipped -eq $total ]]; then
+                ok "All models already passed for release target '$release_target'. Nothing to do."
+                session-send "$SESSION_WS" "release-test-all '$release_target': all $total models already passed. Nothing to do." 2>/dev/null || true
+                return 0
+            fi
+
+            info "=== Resuming Release Test All: $release_target ==="
+            info "Previously passed: $skipped/$total"
+        else
+            info "=== Release Test All: $release_target ==="
+            # Create initial state file
+            for model in "${MODELS[@]}"; do
+                echo "${model}:PENDING" >> "$state_file"
+            done
+        fi
+    else
+        info "=== Release Test All ==="
+    fi
+
+    info "Models: ${MODELS[*]}"
+    info "Total: $total"
+
+    # Verify all models exist before starting
+    for model in "${MODELS[@]}"; do
+        local model_dir="$HOME/.krasis/models/$model"
+        if [[ ! -d "$model_dir" ]]; then
+            local msg="FAILED: Model $model not found at $model_dir. Cannot run release-test-all."
+            err "$msg"
+        fi
+    done
+
+    # Session start message
+    if $resuming; then
+        session-send "$SESSION_WS" "Resuming release-test-all '$release_target': $skipped/$total already passed, $(( total - skipped )) remaining.
+Models: $(printf '%s, ' "${MODELS[@]}" | sed 's/, $//')" 2>/dev/null || warn "Could not send Session message"
+    else
+        local target_info=""
+        [[ -n "$release_target" ]] && target_info=" ($release_target)"
+        session-send "$SESSION_WS" "Starting release-test-all${target_info}: $total models to test.
+Models: $(printf '%s, ' "${MODELS[@]}" | sed 's/, $//')" 2>/dev/null || warn "Could not send Session message"
+    fi
+
+    for model in "${MODELS[@]}"; do
+        # Skip already-passed models on resume
+        if [[ -n "$state_file" && -f "$state_file" ]]; then
+            local prev_status
+            prev_status=$(grep "^${model}:" "$state_file" 2>/dev/null | cut -d: -f2) || true
+            if [[ "$prev_status" == "PASSED" ]]; then
+                info "=== Skipping $model (already passed) ==="
+                continue
+            fi
+        fi
+
+        local idx=$((completed + 1))
+        info "=== [$idx/$total] Starting: $model ==="
+        session-send "$SESSION_WS" "[$idx/$total] Starting release test: $model" 2>/dev/null || true
+
+        local model_start
+        model_start=$(date +%s)
+
+        # Run release test — cleanup_gpu is called inside do_release_test
+        if do_release_test "$model"; then
+            completed=$((completed + 1))
+            local model_elapsed=$(( $(date +%s) - model_start ))
+            local model_mins=$((model_elapsed / 60))
+            local model_secs=$((model_elapsed % 60))
+            ok "[$completed/$total] PASSED: $model (${model_mins}m ${model_secs}s)"
+            session-send "$SESSION_WS" "[$completed/$total] PASSED: $model (${model_mins}m ${model_secs}s)" 2>/dev/null || true
+
+            # Update state file
+            if [[ -n "$state_file" ]]; then
+                sed -i "s/^${model}:.*/${model}:PASSED/" "$state_file"
+            fi
+        else
+            failed_model="$model"
+            local model_elapsed=$(( $(date +%s) - model_start ))
+            local model_mins=$((model_elapsed / 60))
+            local model_secs=$((model_elapsed % 60))
+            local msg="FAILED: $model (${model_mins}m ${model_secs}s). Stopping. $completed/$total models completed."
+            warn "$msg"
+            session-send "$SESSION_WS" "$msg" 2>/dev/null || true
+
+            # Update state file
+            if [[ -n "$state_file" ]]; then
+                sed -i "s/^${model}:.*/${model}:FAILED/" "$state_file"
+            fi
+
+            err "Release test failed on $model. Aborting."
+        fi
+    done
+
+    local total_elapsed=$(( $(date +%s) - start_time ))
+    local total_mins=$((total_elapsed / 60))
+    local total_secs=$((total_elapsed % 60))
+    local target_suffix=""
+    [[ -n "$release_target" ]] && target_suffix=" ($release_target)"
+    local final_msg="ALL PASSED: $completed/$total models tested in ${total_mins}m ${total_secs}s.${target_suffix}"
+    ok "$final_msg"
+    session-send "$SESSION_WS" "$final_msg" 2>/dev/null || true
+
+    # Clean up state file on full success
+    if [[ -n "$state_file" ]]; then
+        rm -f "$state_file"
+        info "State file removed (all passed)."
+    fi
+}
+
 do_benchmark() {
     [[ $# -lt 1 ]] && err "Usage: ./dev benchmark <config> [extra server args...]"
     local conf
@@ -493,6 +643,7 @@ case "$cmd" in
     test)           do_test "$@" ;;
     benchmark)      do_benchmark "$@" ;;
     release-test)   do_release_test "$@" ;;
+    release-test-all) do_release_test_all "$@" ;;
     perplexity)     do_perplexity "$@" ;;
     awq-calibrate)  do_awq_calibrate "$@" ;;
     network)        do_network "$@" ;;
@@ -507,7 +658,13 @@ case "$cmd" in
         echo "  build                     Rebuild Rust extension"
         echo "  run <config> [flags]      Launch server (add --benchmark for benchmarks)"
         echo "  benchmark <config>        Run standard benchmark and exit"
-        echo "  release-test <model>      Run full release test (4 configs, report)"
+        echo "  release-test <model>      Run full release test (5 configs, report)"
+        echo "  release-test-all [target] Run release test on all supported models sequentially"
+        echo "                            Without a target: runs all, no state saved."
+        echo "                            With a target (e.g. 'rc8'): saves progress to state file."
+        echo "                            Re-run with same target to resume from failed model."
+        echo "                            State file auto-deleted when all models pass."
+        echo "                            Sends Session messages on start/pass/fail per model."
         echo "  perplexity <config>       Run perplexity eval (WikiText-2) and exit"
         echo "  awq-calibrate <config>    Run AWQ attention calibration (produces template)"
         echo "  test <config>             Short model test (benchmark + network tests)"
@@ -535,6 +692,8 @@ case "$cmd" in
         echo "  ./dev benchmark qcn --timing    Profile decode components"
         echo "  ./dev benchmark qcn             Normal speed benchmark"
         echo "  ./dev release-test Qwen3-Coder-Next    Full release test"
+        echo "  ./dev release-test-all                 Test all models (no resume)"
+        echo "  ./dev release-test-all rc8             Test all models (resume on re-run with same target)"
         echo "  ./dev awq-calibrate qcn    Build AWQ attention template"
         echo "  ./dev perplexity qcn"
         echo "  ./dev test qcn"
