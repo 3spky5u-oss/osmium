@@ -448,6 +448,7 @@ def stream_chat(
     temperature: float = 0.6,
     max_tokens: int = 16384,
     top_p: float = 0.95,
+    enable_thinking: Optional[bool] = None,
 ) -> tuple:
     """Send streaming chat request. Prints tokens as they arrive.
 
@@ -457,14 +458,17 @@ def stream_chat(
     """
     host, port, ssl = _parse_host_port(url)
 
-    body = json.dumps({
+    body_dict = {
         "model": "krasis",
         "messages": messages,
         "stream": True,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "top_p": top_p,
-    }).encode("utf-8")
+    }
+    if enable_thinking is not None:
+        body_dict["enable_thinking"] = enable_thinking
+    body = json.dumps(body_dict).encode("utf-8")
 
     if ssl:
         conn = http.client.HTTPSConnection(host, port, timeout=600)
@@ -899,6 +903,7 @@ def run_sanity_test(
     server: Dict[str, Any],
     temperature: float = 0.6,
     max_tokens: int = 16384,
+    enable_thinking: Optional[bool] = None,
 ) -> List[Dict[str, Any]]:
     """Submit each prompt from sanity_test_prompts.txt, print and save results.
 
@@ -992,6 +997,7 @@ def run_sanity_test(
                 t0 = time.perf_counter()
                 display_text, raw_text, timing = stream_chat(
                     url, messages, temperature, max_tokens,
+                    enable_thinking=enable_thinking,
                 )
                 elapsed = time.perf_counter() - t0
 

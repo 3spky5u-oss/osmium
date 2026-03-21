@@ -2907,7 +2907,11 @@ class KrasisModel:
         M = token_ids.shape[0]
         num_gpus = len(self.all_devices)
         first_k = self.cfg.first_k_dense_replace
-        use_ep = num_gpus > 1 and self.cpu_hub is not None
+        # EP disabled: prefill runs entirely on primary GPU (GPU0).
+        # Aux GPUs are decode-only (HCS layer split).  The decomposed EP path
+        # (separate attn/routing/expert dispatch + cross-GPU transfers) adds
+        # overhead with no benefit on PCIe — single layer.forward() is faster.
+        use_ep = False
 
         # ── Embedding (GPU0) ──
         first_dev = self.all_devices[0]
@@ -3801,21 +3805,19 @@ class KrasisModel:
                 if tok_id < next_logits.shape[-1]:
                     next_logits[..., tok_id] = float('-inf')
 
-        # Multi-turn thinking fix: also suppress newline (198) and stop tokens
-        # for the first generated token. Without this, the model generates \n → EOS
-        # on multi-turn conversations, producing empty responses.
-        # Only apply when thinking is enabled AND there are multiple user turns.
-        if enable_thinking:
-            user_count = sum(1 for m in parsed if m.get("role") == "user")
-            if user_count > 1:
-                # Suppress newline — forces model to start with content word
-                newline_id = 198  # \n in Qwen tokenizer
-                if newline_id < next_logits.shape[-1]:
-                    next_logits[..., newline_id] = float('-inf')
-                # Suppress stop tokens — prevents immediate EOS bail-out
-                for tok_id in stop_ids:
-                    if tok_id < next_logits.shape[-1]:
-                        next_logits[..., tok_id] = float('-inf')
+        # First-token suppression: suppress newline and stop tokens for the first
+        # generated token. Without this, quantized models (AWQ INT4) can generate
+        # \n → EOS on short prompts, producing empty responses. This is standard
+        # practice — vLLM applies the same first-token degenerate suppression.
+        # Safe for all modes: when thinking is ON the model's top prediction is
+        # <think>/<\/think>, not newline, so this doesn't interfere.
+        newline_ids = self.tokenizer.encode("\n", add_special_tokens=False)
+        for nid in newline_ids:
+            if nid < next_logits.shape[-1]:
+                next_logits[..., nid] = float('-inf')
+        for tok_id in stop_ids:
+            if tok_id < next_logits.shape[-1]:
+                next_logits[..., tok_id] = float('-inf')
 
         # Sample first token
         first_token = sample(

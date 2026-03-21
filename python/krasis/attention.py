@@ -78,6 +78,40 @@ def _linear(x: torch.Tensor, weight_data) -> torch.Tensor:
     return torch.nn.functional.linear(x, weight_data)
 
 
+def compute_flashinfer_workspace_bytes(
+    num_sm: int,
+    num_qo_heads: int = 0,
+    num_kv_heads: int = 0,
+    gqa_head_dim: int = 0,
+) -> int:
+    """Compute FlashInfer workspace size from model dimensions and GPU SM count.
+
+    The dominant consumer is the GQA prefill split-KV path which allocates:
+      batch_prefill_tmp_v = num_qo_heads * padded_batch_size * cta_tile_q * head_dim_vo * 4
+      batch_prefill_tmp_s = num_qo_heads * padded_batch_size * cta_tile_q * 4
+    where padded_batch_size can be up to 2 * num_sm / num_kv_heads.
+
+    For MLA-only models (gqa_head_dim=0), workspace needs are much smaller (~20 MB).
+    """
+    min_workspace = 128 * 1024 * 1024  # 128 MB floor (FlashInfer recommended minimum)
+
+    # GQA prefill split-KV workspace (the biggest consumer)
+    if gqa_head_dim > 0 and num_qo_heads > 0:
+        # FlashInfer scheduler: max_grid_size = 2 * num_sm, max_batch_size_if_split = max_grid / num_kv_heads
+        max_padded_batch = (2 * num_sm) // max(num_kv_heads, 1)
+        cta_tile_q = 64  # FA2DetermineCtaTileQ returns 64 for long sequences
+        # tmp_v + tmp_s
+        gqa_workspace = num_qo_heads * max_padded_batch * cta_tile_q * (gqa_head_dim + 1) * 4
+        workspace = max(gqa_workspace, min_workspace)
+    else:
+        # MLA-only: workspace for BatchMLAPagedAttentionWrapper is ~20 MB
+        workspace = min_workspace
+
+    # Round up to 16 MB boundary for alignment
+    workspace = ((workspace + 16 * 1024 * 1024 - 1) // (16 * 1024 * 1024)) * (16 * 1024 * 1024)
+    return workspace
+
+
 class MLAAttention:
     """Multi-head Latent Attention for one transformer layer."""
 
@@ -85,13 +119,24 @@ class MLAAttention:
     _workspace_bufs: dict = {}
 
     @classmethod
-    def _get_workspace(cls, device: torch.device) -> torch.Tensor:
-        """Get or create a shared 256MB FlashInfer workspace for this device."""
+    def _get_workspace(cls, cfg: "ModelConfig", device: torch.device) -> torch.Tensor:
+        """Get or create a shared FlashInfer workspace for this device, sized from model config."""
         key = str(device)
-        if key not in cls._workspace_bufs:
-            cls._workspace_bufs[key] = torch.empty(
-                256 * 1024 * 1024, dtype=torch.uint8, device=device
-            )
+        num_sm = torch.cuda.get_device_properties(device).multi_processor_count
+        needed = compute_flashinfer_workspace_bytes(
+            num_sm=num_sm,
+            num_qo_heads=cfg.num_attention_heads,
+            num_kv_heads=cfg.num_key_value_heads,
+            gqa_head_dim=cfg.gqa_head_dim or 0,
+        )
+        existing = cls._workspace_bufs.get(key)
+        if existing is not None and existing.numel() >= needed:
+            return existing
+        # Allocate (or reallocate if existing is too small)
+        cls._workspace_bufs[key] = torch.empty(
+            needed, dtype=torch.uint8, device=device
+        )
+        logger.info("FlashInfer workspace: %d MB on %s", needed // (1024 * 1024), device)
         return cls._workspace_bufs[key]
 
     def __init__(
@@ -167,7 +212,7 @@ class MLAAttention:
         self._rope_cos_sin = None
 
         # FlashInfer attention wrapper (shared workspace across layers on same device)
-        workspace_buf = MLAAttention._get_workspace(device)
+        workspace_buf = MLAAttention._get_workspace(cfg, device)
         self._attn_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
             workspace_buf,
         )
@@ -485,7 +530,7 @@ class GQAAttention:
         self._rope_cos_sin = None
 
         # FlashInfer attention wrapper (shared workspace across layers on same device)
-        workspace_buf = MLAAttention._get_workspace(device)
+        workspace_buf = MLAAttention._get_workspace(cfg, device)
         self._prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             workspace_buf,
         )

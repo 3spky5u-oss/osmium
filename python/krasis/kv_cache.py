@@ -78,8 +78,8 @@ class PagedKVCache:
             bytes_per_page = self._bytes_per_page()
 
             # Cap to actual free VRAM minus computed safety margin.
-            # Safety = FlashInfer workspace (256 MB) + max prefill intermediate
-            # (MoE or dense MLP, whichever is larger at 5K token chunk) + 200 MB base.
+            # Safety = FlashInfer workspace (computed from model dims + GPU SMs)
+            # + max prefill intermediate (MoE or dense MLP) + 200 MB base.
             free_bytes, _ = torch.cuda.mem_get_info(device)
             chunk_est = 5000
             # MoE intermediates: [M*topk, 2*moe_inter] + [M*topk, hidden], bf16
@@ -92,7 +92,14 @@ class PagedKVCache:
             dense_inter = cfg.intermediate_size
             dense_ws = chunk_est * dense_inter * 8 if dense_inter > 0 else 0
             prefill_ws = max(moe_ws, dense_ws)
-            flashinfer_ws = 256 * 1024 * 1024  # matches attention.py _get_workspace
+            from krasis.attention import compute_flashinfer_workspace_bytes
+            num_sm = torch.cuda.get_device_properties(device).multi_processor_count
+            flashinfer_ws = compute_flashinfer_workspace_bytes(
+                num_sm=num_sm,
+                num_qo_heads=cfg.num_attention_heads,
+                num_kv_heads=cfg.num_key_value_heads,
+                gqa_head_dim=cfg.gqa_head_dim or 0,
+            )
             base_headroom = 200 * 1024 * 1024
             safety_bytes = flashinfer_ws + prefill_ws + base_headroom
             safety_mb = safety_bytes / (1024 * 1024)

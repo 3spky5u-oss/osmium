@@ -79,6 +79,18 @@ def _detect_gpu_vram_bytes() -> int:
     return 16 * 1024**3
 
 
+def _detect_gpu_sm_count() -> int:
+    """Detect GPU SM count via torch.cuda. Falls back to 170 (safe overestimate)."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_properties(0).multi_processor_count
+    except (ImportError, RuntimeError):
+        pass
+    logger.warning("Could not detect GPU SM count, assuming 170")
+    return 170  # 5090 SM count — overestimates workspace for smaller GPUs (safe direction)
+
+
 def _is_mla(cfg: Dict[str, Any]) -> bool:
     return "kv_lora_rank" in cfg and cfg["kv_lora_rank"] > 0
 
@@ -398,8 +410,16 @@ def compute_launcher_budget(
     gate_f32_bytes_all_layers = hidden * n_experts * 4 * total_moe_layers_all  # F32 routing copy
     norm_bytes_all_layers = 2 * hidden * 2 * total_layers  # BF16
 
-    # FlashInfer workspace allocation (matches attention.py _get_workspace: 256 MB)
-    flashinfer_workspace_bytes = 256 * 1024 * 1024
+    # FlashInfer workspace allocation (computed from model dims + GPU SMs)
+    from krasis.attention import compute_flashinfer_workspace_bytes
+    num_sm = _detect_gpu_sm_count()
+    gqa_head_dim = cfg.get("head_dim", hidden // cfg["num_attention_heads"]) if not is_mla else 0
+    flashinfer_workspace_bytes = compute_flashinfer_workspace_bytes(
+        num_sm=num_sm,
+        num_qo_heads=cfg["num_attention_heads"],
+        num_kv_heads=cfg["num_key_value_heads"],
+        gqa_head_dim=gqa_head_dim,
+    )
 
     # Prefill workspace: intermediate tensors during MoE forward.
     # fused_marlin_moe allocates intermediate_cache1/3 and intermediate_cache2.
