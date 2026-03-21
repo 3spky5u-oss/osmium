@@ -633,7 +633,7 @@ def main():
         gpu_prefill=not args.cpu_only,
         kv_cache_mb=args.kv_cache_mb,
     )
-    model.load()
+    model.load(gpu_only=True)  # Perplexity only needs GPU prefill, skip CPU expert cache
 
     config = {
         "model_path": args.model_path,
