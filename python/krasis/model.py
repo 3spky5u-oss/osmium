@@ -585,7 +585,7 @@ class KrasisModel:
         except (OSError, KeyError):
             return False
 
-    def load(self, gpu_only: bool = False):
+    def load(self, gpu_only: bool = True):
         """Load all weights: GPU (streaming INT8) + CPU (Krasis INT4 experts).
 
         Args:

@@ -210,7 +210,7 @@ cleanup_gpu() {
     local gpu_waited=0
     while [[ $gpu_waited -lt $gpu_timeout ]]; do
         local all_clear=true
-        while IFS=', ' read -r idx used total; do
+        while IFS=', ' read -r idx used gpu_mem_total; do
             # Baseline is ~200-300 MiB (desktop compositor). 500 MiB threshold.
             if [[ "$used" -gt 500 ]]; then
                 all_clear=false
