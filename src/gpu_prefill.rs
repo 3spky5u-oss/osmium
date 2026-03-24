@@ -804,6 +804,9 @@ impl PrefillEngine {
             if diag && chunk_idx == 0 {
                 eprintln!("[DIAG] === Prefill diagnostic: m={} positions={:?} layers=0..{} ===",
                     m, diag_positions, diag_layer_limit);
+                // Log input token IDs for verification against reference
+                let id_str: Vec<String> = chunk_tokens.iter().map(|t| t.to_string()).collect();
+                eprintln!("[DIAG] input_token_ids [{}]: {}", chunk_tokens.len(), id_str.join(", "));
                 self.diag_print_norms("embedding",
                     *self.scratch.d_hidden.device_ptr(), &diag_positions, h);
             }
@@ -933,6 +936,18 @@ impl PrefillEngine {
                     self.diag_print_norms(
                         &format!("layer{:02}_mlp", layer_idx),
                         *self.scratch.d_hidden.device_ptr(), &diag_positions, h);
+                }
+
+                // DIAG: per-layer residual norm at last position
+                if diag && chunk_idx == 0 {
+                    let last_pos_norm = self.diag_l2_norm(
+                        *self.scratch.d_residual.device_ptr(), m - 1, h, h);
+                    let lt_name = match layer_type {
+                        0 => "GQA", 1 => "Mamba2", 2 => "Pass", 3 => "LA", _ => "?",
+                    };
+                    let has_moe = self.layer_weights[layer_idx].moe_gate_ptr != 0;
+                    eprintln!("[DIAG] L{:02} {} moe={} residual_lastpos={:.4}",
+                        layer_idx, lt_name, has_moe, last_pos_norm);
                 }
 
             }
@@ -1073,6 +1088,23 @@ impl PrefillEngine {
                 }
             } else if self.layer_weights[layer_idx].shared_w1.is_some() {
                 self.forward_dense_mlp(layer_idx, m)?;
+            }
+
+            // DIAG: per-layer hidden state norm at last position
+            if std::env::var("KRASIS_PREFILL_DIAG").is_ok() {
+                let last_pos_norm = self.diag_l2_norm(
+                    *self.scratch.d_residual.device_ptr(), m - 1, h, h);
+                let lt_name = match layer_type {
+                    0 => "GQA",
+                    1 => "Mamba2",
+                    2 => "Pass",
+                    3 => "LA",
+                    _ => "?",
+                };
+                let has_moe = self.layer_weights[layer_idx].moe_gate_ptr != 0;
+                let has_mlp = self.layer_weights[layer_idx].shared_w1.is_some();
+                eprintln!("[DIAG] L{:02} {} moe={} mlp={} residual_lastpos_norm={:.4}",
+                    layer_idx, lt_name, has_moe, has_mlp, last_pos_norm);
             }
         }
 
@@ -2140,6 +2172,21 @@ impl PrefillEngine {
                 }
             }
 
+            // DIAG: after transposition + cumsum, before attn matrix
+            if la_diag {
+                self.stream_sync()?;
+                // Layout is now [nv, total_len, dim]. Head 0, pos 0 is at offset 0.
+                // v_beta [nv, total_len, dv]: head 0 pos 0 = offset 0
+                let vb_h0 = self.diag_l2_norm_f32(la_v_beta, 0, dv, dv);
+                // k_beta [nv, total_len, dk]: head 0 pos 0 = offset 0
+                let kb_h0 = self.diag_l2_norm_f32(la_k_beta, 0, dk, dk);
+                // beta [M, nv] was not transposed, but gate [nv, total_len] was
+                // g_cum [nv, total_len]: head 0, first 4 values
+                let gcum_vals = self.diag_download_f32(la_g_cum, 4);
+                eprintln!("[DIAG L{:02}] pre_attn: v_beta_h0p0={:.6} k_beta_h0p0={:.6} g_cum[0..4]=[{:.4},{:.4},{:.4},{:.4}]",
+                    layer_idx, vb_h0, kb_h0, gcum_vals[0], gcum_vals[1], gcum_vals[2], gcum_vals[3]);
+            }
+
             // 13. Build attn matrix (nilpotent A): attn[i,j] = -(k_beta @ k^T) * decay
             // k_beta: [nv, num_chunks, CS, dk], k: [nv, num_chunks, CS, dk]
             // attn: [nv, num_chunks, CS, CS]
@@ -2241,6 +2288,17 @@ impl PrefillEngine {
                 }
             }
 
+            // DIAG: after both triangular solves
+            if la_diag {
+                self.stream_sync()?;
+                // v_corr (la_v_beta) [nv, total_len, dv]: head 0 pos 0
+                let vc_h0 = self.diag_l2_norm_f32(la_v_beta, 0, dv, dv);
+                // k_cumdecay (la_k_beta) [nv, total_len, dk]: head 0 pos 0
+                let kc_h0 = self.diag_l2_norm_f32(la_k_beta, 0, dk, dk);
+                eprintln!("[DIAG L{:02}] post_trisolve: v_corr_h0p0={:.6} k_cumd_h0p0={:.6}",
+                    layer_idx, vc_h0, kc_h0);
+            }
+
             // 16. Initialize recurrent state (zero)
             unsafe {
                 let _ = cuda_sys::lib().cuMemsetD8Async(
@@ -2296,6 +2354,17 @@ impl PrefillEngine {
                     }
                 }
 
+                // DIAG: after v_new for chunk 0
+                if la_diag && c == 0 {
+                    self.stream_sync()?;
+                    // v_new [nv, CS, dv]: head 0 pos 0 = offset 0
+                    let vn_h0 = self.diag_l2_norm_f32(la_v_new, 0, dv, dv);
+                    // Also check a few raw values from head 0, pos 0
+                    let vn_raw = self.diag_download_f32(la_v_new, 4);
+                    eprintln!("[DIAG L{:02}] chunk0_v_new: h0p0_norm={:.6} raw[0..4]=[{:.6},{:.6},{:.6},{:.6}]",
+                        layer_idx, vn_h0, vn_raw[0], vn_raw[1], vn_raw[2], vn_raw[3]);
+                }
+
                 // 2. output(strided) = (q*exp(g))@state + tril(q@k^T*decay)@v_new
                 {
                     let mut co0 = output_buf;  // [nv, total_len, dv] strided output
@@ -2327,6 +2396,29 @@ impl PrefillEngine {
                             ],
                         )?;
                     }
+                }
+
+                // DIAG: after chunk output for chunk 0
+                if la_diag && c == 0 {
+                    self.stream_sync()?;
+                    // output [nv, total_len, dv]: head 0 pos 0 = offset 0
+                    let out_h0 = self.diag_l2_norm_f32(output_buf, 0, dv, dv);
+                    // Check a few raw values
+                    let out_raw = self.diag_download_f32(output_buf, 4);
+                    eprintln!("[DIAG L{:02}] chunk0_output: h0p0_norm={:.6} raw[0..4]=[{:.6},{:.6},{:.6},{:.6}]",
+                        layer_idx, out_h0, out_raw[0], out_raw[1], out_raw[2], out_raw[3]);
+                    // Total output norm at pos 0 across ALL heads
+                    // output_buf layout: [nv, total_len, dv]. pos 0 of head h = h * total_len * dv
+                    let mut total_sq = 0.0f64;
+                    for h in 0..nv {
+                        let offset = (h * total_len * dv) * 4;
+                        let head_vals = self.diag_download_f32(output_buf + offset as u64, dv);
+                        for &v in &head_vals {
+                            total_sq += (v as f64) * (v as f64);
+                        }
+                    }
+                    eprintln!("[DIAG L{:02}] chunk0_output_total_pos0: norm={:.6} (across all {} heads)",
+                        layer_idx, (total_sq.sqrt()) as f32, nv);
                 }
 
                 // 3. state update: reads strided k, g_cum; reads contiguous v_new
@@ -3558,6 +3650,34 @@ impl PrefillEngine {
                 if let Some(Some(moe_data)) = self.moe_layers.get(moe_idx) {
                     let mut cur_buf = 0usize;
 
+                    // Diagnostic: log first cold expert DMA parameters + buffer sizes
+                    if diag && layer_idx < diag_layer_limit {
+                        let fe = &moe_data.experts[cold_work[0].eid];
+                        let buf_w13p_bytes = h * w13_n * bits as usize / 8;
+                        let buf_w13s_bytes = (h / gs) * w13_n * 2;
+                        let buf_w2p_bytes = inter * h * bits as usize / 8;
+                        let buf_w2s_bytes = (inter / gs) * h * 2;
+                        eprintln!("[DIAG] layer{:02}_moe COLD DMA eid={}: w13p_src={:#x} w13p_bytes={} (buf={}) w13s_src={:#x} w13s_bytes={} (buf={}) w2p_src={:#x} w2p_bytes={} (buf={}) w2s_src={:#x} w2s_bytes={} (buf={})",
+                            layer_idx, cold_work[0].eid,
+                            fe.w13_packed_ptr, fe.w13_packed_bytes, buf_w13p_bytes,
+                            fe.w13_scales_ptr, fe.w13_scales_bytes, buf_w13s_bytes,
+                            fe.w2_packed_ptr, fe.w2_packed_bytes, buf_w2p_bytes,
+                            fe.w2_scales_ptr, fe.w2_scales_bytes, buf_w2s_bytes);
+                        // Size validation
+                        if fe.w13_packed_bytes > buf_w13p_bytes {
+                            eprintln!("[DIAG] ERROR: w13_packed_bytes {} > buffer {}", fe.w13_packed_bytes, buf_w13p_bytes);
+                        }
+                        if fe.w13_scales_bytes > buf_w13s_bytes {
+                            eprintln!("[DIAG] ERROR: w13_scales_bytes {} > buffer {}", fe.w13_scales_bytes, buf_w13s_bytes);
+                        }
+                        if fe.w2_packed_bytes > buf_w2p_bytes {
+                            eprintln!("[DIAG] ERROR: w2_packed_bytes {} > buffer {}", fe.w2_packed_bytes, buf_w2p_bytes);
+                        }
+                        if fe.w2_scales_bytes > buf_w2s_bytes {
+                            eprintln!("[DIAG] ERROR: w2_scales_bytes {} > buffer {}", fe.w2_scales_bytes, buf_w2s_bytes);
+                        }
+                    }
+
                     let first_eid = cold_work[0].eid;
                     if first_eid < moe_data.experts.len() {
                         self.dma_expert_to_buf(&moe_data.experts[first_eid], &bufs[0][0])?;
@@ -4269,25 +4389,42 @@ impl PrefillEngine {
 
     /// DMA expert weights from CPU RAM into a GPU buffer set.
     /// Records dma_event when complete so compute stream can wait on it.
+    /// Uses synchronous cuMemcpyHtoD because the expert weight host memory is
+    /// not pinned (comes from Python numpy/torch allocations). Async H2D requires
+    /// page-locked host memory and fails with CUDA_ERROR_INVALID_VALUE otherwise.
     fn dma_expert_to_buf(
         &self, e: &ExpertWeightPtrs, buf: &(u64, u64, u64, u64),
     ) -> Result<(), String> {
         let (w13p_dst, w13s_dst, w2p_dst, w2s_dst) = *buf;
         unsafe {
-            // Always use 4 separate DMAs. The contiguous single-DMA path is broken
-            // for prefill because the destination buffers (w13p, w13s, w2p, w2s) are
-            // separate GPU allocations that are NOT contiguous in memory. The single
-            // DMA would write all data starting at w13p_dst, leaving the other
-            // destination buffers with stale data.
+            // Synchronous H2D: blocks CPU but works with any host memory.
+            // The double-buffer pipeline still functions (DMA fills one buffer
+            // while compute uses the other) but without CPU-side overlap.
             {
-                let _ = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                    w13p_dst, e.w13_packed_ptr as *const _, e.w13_packed_bytes, self.copy_stream);
-                let _ = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                    w13s_dst, e.w13_scales_ptr as *const _, e.w13_scales_bytes, self.copy_stream);
-                let _ = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                    w2p_dst, e.w2_packed_ptr as *const _, e.w2_packed_bytes, self.copy_stream);
-                let _ = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                    w2s_dst, e.w2_scales_ptr as *const _, e.w2_scales_bytes, self.copy_stream);
+                let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                    w13p_dst, e.w13_packed_ptr as *const _, e.w13_packed_bytes);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("DMA w13_packed (src={:#x} dst={:#x} bytes={}): {:?}",
+                        e.w13_packed_ptr, w13p_dst, e.w13_packed_bytes, err));
+                }
+                let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                    w13s_dst, e.w13_scales_ptr as *const _, e.w13_scales_bytes);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("DMA w13_scales (src={:#x} dst={:#x} bytes={}): {:?}",
+                        e.w13_scales_ptr, w13s_dst, e.w13_scales_bytes, err));
+                }
+                let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                    w2p_dst, e.w2_packed_ptr as *const _, e.w2_packed_bytes);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("DMA w2_packed (src={:#x} dst={:#x} bytes={}): {:?}",
+                        e.w2_packed_ptr, w2p_dst, e.w2_packed_bytes, err));
+                }
+                let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                    w2s_dst, e.w2_scales_ptr as *const _, e.w2_scales_bytes);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("DMA w2_scales (src={:#x} dst={:#x} bytes={}): {:?}",
+                        e.w2_scales_ptr, w2s_dst, e.w2_scales_bytes, err));
+                }
             }
             // Record event so compute stream can wait
             let err = cuda_sys::lib().cuEventRecord(self.dma_event, self.copy_stream);
@@ -4780,7 +4917,7 @@ pub fn allocate_scratch(
         d_expert_w13_packed_a: {
             let w13_size = if config.n_routed_experts > 0 {
                 let w13_n = if config.moe_gated { 2 * moe_inter } else { moe_inter };
-                (h / 16) * w13_n * (config.expert_bits as usize / 2)
+                h * w13_n * config.expert_bits as usize / 8
             } else { 1 };
             device.alloc_zeros::<u8>(w13_size).map_err(|e| format!("alloc expert_w13_packed_a: {e}"))?
         },
@@ -4793,7 +4930,7 @@ pub fn allocate_scratch(
         },
         d_expert_w2_packed_a: {
             let w2_size = if config.n_routed_experts > 0 {
-                (moe_inter / 16) * h * (config.expert_bits as usize / 2)
+                moe_inter * h * config.expert_bits as usize / 8
             } else { 1 };
             device.alloc_zeros::<u8>(w2_size).map_err(|e| format!("alloc expert_w2_packed_a: {e}"))?
         },
@@ -4806,7 +4943,7 @@ pub fn allocate_scratch(
         d_expert_w13_packed_b: {
             let w13_size = if config.n_routed_experts > 0 {
                 let w13_n = if config.moe_gated { 2 * moe_inter } else { moe_inter };
-                (h / 16) * w13_n * (config.expert_bits as usize / 2)
+                h * w13_n * config.expert_bits as usize / 8
             } else { 1 };
             device.alloc_zeros::<u8>(w13_size).map_err(|e| format!("alloc expert_w13_packed_b: {e}"))?
         },
@@ -4819,7 +4956,7 @@ pub fn allocate_scratch(
         },
         d_expert_w2_packed_b: {
             let w2_size = if config.n_routed_experts > 0 {
-                (moe_inter / 16) * h * (config.expert_bits as usize / 2)
+                moe_inter * h * config.expert_bits as usize / 8
             } else { 1 };
             device.alloc_zeros::<u8>(w2_size).map_err(|e| format!("alloc expert_w2_packed_b: {e}"))?
         },

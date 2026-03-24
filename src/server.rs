@@ -674,6 +674,14 @@ fn handle_chat_completion(
         let kv_max_seq = engine.kv_max_seq;
         let kv_overflow = token_ids.len() > kv_max_seq;
 
+        // Swap AWQ weights from simple INT4 (decode) back to Marlin format (prefill)
+        {
+            let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
+            if let Err(e) = store.swap_to_marlin_rust() {
+                log::error!("Failed to swap to Marlin for prefill: {}", e);
+            }
+        }
+
         let result = engine.run_prefill(
             &token_ids,
             temperature,
@@ -690,6 +698,10 @@ fn handle_chat_completion(
                 // Set KV cache position on decode store so decode knows where to continue
                 let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
                 store.set_kv_position_rust(r.prompt_len);
+                // Swap AWQ weights from Marlin format (prefill) to simple INT4 (decode)
+                if let Err(e) = store.swap_to_simple_int4_rust() {
+                    log::error!("Failed to swap to simple INT4 for decode: {}", e);
+                }
                 Ok((r.first_token as usize, r.prompt_len, stop_ids, kv_overflow))
             }
             Err(e) => Err(e),
@@ -910,6 +922,14 @@ fn handle_prefill_logits(
         let store = unsafe { &*(state.gpu_store_addr as *const GpuDecodeStore) };
         let (cache_fast, ne) = store.export_hcs_snapshot();
         engine.update_hcs_snapshot(cache_fast, ne);
+    }
+
+    // Swap AWQ weights to Marlin for prefill
+    {
+        let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
+        if let Err(e) = store.swap_to_marlin_rust() {
+            log::error!("Failed to swap to Marlin for prefill_logits: {}", e);
+        }
     }
 
     let positions = match engine.run_prefill_logits(&token_ids, top_k, sample_every) {
@@ -1776,6 +1796,11 @@ impl RustServer {
 
         let kv_overflow = token_ids.len() > engine.kv_max_seq;
 
+        // Swap AWQ weights to Marlin for prefill
+        if let Err(e) = store.swap_to_marlin_rust() {
+            log::error!("Failed to swap to Marlin for prefill: {}", e);
+        }
+
         let prefill_result = engine.run_prefill(
             &token_ids,
             temperature,
@@ -1789,6 +1814,10 @@ impl RustServer {
 
         // Set KV cache position on decode store
         store.set_kv_position_rust(prompt_len);
+        // Swap AWQ weights to simple INT4 for decode
+        if let Err(e) = store.swap_to_simple_int4_rust() {
+            log::error!("Failed to swap to simple INT4 for decode: {}", e);
+        }
 
         let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
         crate::vram_monitor::report_event("prefill_end");

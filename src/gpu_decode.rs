@@ -5242,6 +5242,68 @@ impl GpuDecodeStore {
         (&[], 0)
     }
 
+    /// Swap GPU weight slots from Marlin format to simple INT4 format for decode.
+    /// Must be called after prefill and before decode when using AWQ single-slot weights.
+    pub fn swap_to_simple_int4_rust(&mut self) -> Result<(), String> {
+        if self.single_slot_swaps.is_empty() {
+            return Ok(());
+        }
+        let mut total_bytes: usize = 0;
+        for entry in &self.single_slot_swaps {
+            unsafe {
+                let r = cuda_sys::lib().cuMemcpyHtoD_v2(
+                    entry.packed_slot_ptr,
+                    entry.simple_packed_host.as_ptr() as *const std::ffi::c_void,
+                    entry.simple_packed_host.len());
+                if r != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("swap_to_simple_int4 packed: {:?}", r));
+                }
+                let r = cuda_sys::lib().cuMemcpyHtoD_v2(
+                    entry.scales_slot_ptr,
+                    entry.simple_scales_host.as_ptr() as *const std::ffi::c_void,
+                    entry.simple_scales_host.len());
+                if r != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("swap_to_simple_int4 scales: {:?}", r));
+                }
+            }
+            total_bytes += entry.simple_packed_host.len() + entry.simple_scales_host.len();
+        }
+        eprintln!("[krasis] Swapped to simple INT4 for decode ({:.1} MB DMA, {} weights)",
+            total_bytes as f64 / 1024.0 / 1024.0, self.single_slot_swaps.len());
+        Ok(())
+    }
+
+    /// Swap GPU weight slots from simple INT4 format back to Marlin format for prefill.
+    /// Must be called before prefill when using AWQ single-slot weights.
+    pub fn swap_to_marlin_rust(&mut self) -> Result<(), String> {
+        if self.single_slot_swaps.is_empty() {
+            return Ok(());
+        }
+        let mut total_bytes: usize = 0;
+        for entry in &self.single_slot_swaps {
+            unsafe {
+                let r = cuda_sys::lib().cuMemcpyHtoD_v2(
+                    entry.packed_slot_ptr,
+                    entry.marlin_packed_host.as_ptr() as *const std::ffi::c_void,
+                    entry.marlin_packed_host.len());
+                if r != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("swap_to_marlin packed: {:?}", r));
+                }
+                let r = cuda_sys::lib().cuMemcpyHtoD_v2(
+                    entry.scales_slot_ptr,
+                    entry.marlin_scales_host.as_ptr() as *const std::ffi::c_void,
+                    entry.marlin_scales_host.len());
+                if r != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(format!("swap_to_marlin scales: {:?}", r));
+                }
+            }
+            total_bytes += entry.marlin_packed_host.len() + entry.marlin_scales_host.len();
+        }
+        eprintln!("[krasis] Swapped to Marlin for prefill ({:.1} MB DMA, {} weights)",
+            total_bytes as f64 / 1024.0 / 1024.0, self.single_slot_swaps.len());
+        Ok(())
+    }
+
     /// Set min_new_tokens and stop_ids for suppression (called from Rust server code).
     pub fn set_min_new_tokens_ext(&mut self, n: usize, stop_ids: Vec<usize>) {
         self.min_new_tokens = n;
@@ -8661,6 +8723,45 @@ impl GpuDecodeStore {
             log::info!("DBG {} [{:.4}, {:.4}, {:.4}, {:.4}]", label, buf[0], buf[1], buf[2], buf[3]);
         };
 
+        // Decode NaN diagnostic: check d_hidden for NaN after each component
+        let decode_nan_diag = std::env::var("KRASIS_DECODE_DIAG").map(|v| v == "1").unwrap_or(false);
+        let check_nan_bf16 = |label: &str, ptr: u64, n: usize, device: &std::sync::Arc<cudarc::driver::CudaDevice>| {
+            if !decode_nan_diag { return; }
+            let _ = device.synchronize();
+            let mut buf = vec![0u16; n.min(64)];
+            let dl = buf.len();
+            unsafe {
+                let _ = cuda_sys::lib().cuMemcpyDtoH_v2(
+                    buf.as_mut_ptr() as *mut std::ffi::c_void,
+                    ptr, dl * 2);
+            }
+            let has_nan = buf.iter().any(|&b| {
+                let bits = (b as u32) << 16;
+                f32::from_bits(bits).is_nan()
+            });
+            if has_nan {
+                let vals: Vec<f32> = buf[..4.min(dl)].iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
+                eprintln!("[DECODE-NaN] {} NaN detected! first4=[{:.4},{:.4},{:.4},{:.4}]",
+                    label, vals[0], vals[1], vals[2], vals[3]);
+            }
+        };
+        let check_nan_f32 = |label: &str, ptr: u64, n: usize, device: &std::sync::Arc<cudarc::driver::CudaDevice>| {
+            if !decode_nan_diag { return; }
+            let _ = device.synchronize();
+            let mut buf = vec![0.0f32; n.min(64)];
+            let dl = buf.len();
+            unsafe {
+                let _ = cuda_sys::lib().cuMemcpyDtoH_v2(
+                    buf.as_mut_ptr() as *mut std::ffi::c_void,
+                    ptr, dl * 4);
+            }
+            let has_nan = buf.iter().any(|f| f.is_nan());
+            if has_nan {
+                eprintln!("[DECODE-NaN] {} NaN detected! first4=[{:.4},{:.4},{:.4},{:.4}]",
+                    label, buf[0], buf[1], buf[2], buf[3]);
+            }
+        };
+
         // ── Multi-GPU segment config ──
         let seg_skip_emb = graph.segment_skip_embedding;
         let seg_skip_final = graph.segment_skip_final;
@@ -8695,6 +8796,7 @@ impl GpuDecodeStore {
                 self.device.synchronize().map_err(|e| format!("sync after emb: {:?}", e))?;
                 debug_peek_bf16("after_embedding d_hidden", *graph.d_hidden.device_ptr(), 4);
             }
+            check_nan_bf16("after_embedding", *graph.d_hidden.device_ptr(), hs, &self.device);
         }
 
         // first_residual: true only when embedding was done (layer 0 initializes residual stream)
@@ -8734,6 +8836,7 @@ impl GpuDecodeStore {
                 }
             }
             first_residual = false;
+            check_nan_bf16(&format!("L{} post_pre_attn_norm", layer_idx), *graph.d_hidden.device_ptr(), hs, &self.device);
 
             // Timing: after pre-attn norm
             let t_attn_start = if timing {
@@ -8763,6 +8866,10 @@ impl GpuDecodeStore {
                     self.gemv_bf16_to_f32(
                         ba_w, *graph.d_hidden.device_ptr(),
                         *graph.d_la_ba.device_ptr())?;
+                    if layer_idx < 2 {
+                        check_nan_f32(&format!("L{} la_qkvz_proj", layer_idx), *graph.d_la_qkvz.device_ptr(), 64, &self.device);
+                        check_nan_f32(&format!("L{} la_ba_proj", layer_idx), *graph.d_la_ba.device_ptr(), 64, &self.device);
+                    }
 
                     if timing {
                         self.device.synchronize().map_err(|e| format!("la proj sync: {:?}", e))?;
@@ -8827,6 +8934,9 @@ impl GpuDecodeStore {
                         }
                     }
                     // Now d_la_qkvz has conv output [q(key_dim), k(key_dim), v(nv*dv)] with SiLU
+                    if layer_idx < 2 {
+                        check_nan_f32(&format!("L{} la_conv1d_out", layer_idx), *graph.d_la_qkvz.device_ptr(), 64, &self.device);
+                    }
 
                     // ── LA Step 4: Compute gate and beta from BA ──
                     // BA is interleaved: [h0_b(ratio), h0_a(ratio), h1_b(ratio), h1_a(ratio), ...]
@@ -8853,6 +8963,10 @@ impl GpuDecodeStore {
                                 ),
                             ).map_err(|e| format!("compute_gate_beta[{}]: {:?}", layer_idx, e))?;
                         }
+                    }
+
+                    if layer_idx < 2 {
+                        check_nan_f32(&format!("L{} la_gate_beta", layer_idx), gate_ptr_local, 32, &self.device);
                     }
 
                     if timing {
@@ -8894,6 +9008,10 @@ impl GpuDecodeStore {
                         }
                     }
 
+                    if layer_idx < 2 {
+                        check_nan_bf16(&format!("L{} la_fused_post_proj (BF16 out)", layer_idx), *graph.d_scratch.device_ptr(), 64, &self.device);
+                    }
+
                     if timing {
                         self.device.synchronize().map_err(|e| format!("la recur sync: {:?}", e))?;
                         graph.t_la_recur += (Instant::now() - t_la_s5).as_secs_f64();
@@ -8902,11 +9020,31 @@ impl GpuDecodeStore {
 
                     // ── LA Step 9: Output projection ──
                     let out_w = &graph.weights[*out_proj];
+                    if layer_idx < 2 && decode_nan_diag {
+                        let _ = self.device.synchronize();
+                        eprintln!("[DECODE-DIAG] L{} out_proj: dtype={} rows={} cols={} marlin_int4={} simple_int4={} ptr=0x{:x}",
+                            layer_idx, out_w.dtype, out_w.rows, out_w.cols,
+                            out_w.is_marlin_int4(), out_w.has_simple_int4(), out_w.ptr);
+                        // Check d_scratch input
+                        let mut ibuf = vec![0u16; 32];
+                        unsafe {
+                            let _ = cuda_sys::lib().cuMemcpyDtoH_v2(
+                                ibuf.as_mut_ptr() as *mut std::ffi::c_void,
+                                *graph.d_scratch.device_ptr(), 64);
+                        }
+                        let ivals: Vec<f32> = ibuf[..4].iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
+                        let i_any_nan = ibuf.iter().any(|&b| f32::from_bits((b as u32) << 16).is_nan());
+                        eprintln!("[DECODE-DIAG] L{} out_proj input (d_scratch BF16): [{:.4},{:.4},{:.4},{:.4}] any_nan={}",
+                            layer_idx, ivals[0], ivals[1], ivals[2], ivals[3], i_any_nan);
+                    }
                     self.gemv_bf16_internal(
                         out_w,
                         *graph.d_scratch.device_ptr(),
                         *graph.d_hidden.device_ptr(),
                     )?;
+                    if layer_idx < 2 {
+                        check_nan_bf16(&format!("L{} la_out_proj_output", layer_idx), *graph.d_hidden.device_ptr(), hs, &self.device);
+                    }
                     if timing {
                         self.device.synchronize().map_err(|e| format!("la out sync: {:?}", e))?;
                         graph.t_la_out += (Instant::now() - t_la_s8).as_secs_f64();
@@ -9675,6 +9813,8 @@ impl GpuDecodeStore {
                 }
             }
 
+            check_nan_bf16(&format!("L{} post_attn", layer_idx), *graph.d_hidden.device_ptr(), hs, &self.device);
+
             // ── Post-attention norm (fused residual add + RMSNorm) ──
             // Nemotron layers: post_attn_norm_size==0 means skip (single-sublayer blocks).
             // The mixer output in d_hidden will be added to d_residual by the NEXT layer's pre-norm.
@@ -9697,6 +9837,8 @@ impl GpuDecodeStore {
                     )).map_err(|e| format!("post_attn_norm[{}]: {:?}", layer_idx, e))?;
                 }
             }
+
+            check_nan_bf16(&format!("L{} post_post_attn_norm", layer_idx), *graph.d_hidden.device_ptr(), hs, &self.device);
 
             // Timing: after post-attn norm, before MLP/MoE
             let t_mlp_start = if timing {
@@ -9775,6 +9917,7 @@ impl GpuDecodeStore {
                     }
                     if timing { graph.t_moe_d2d_copy += (Instant::now() - t_d2d).as_secs_f64(); }
                 }
+                check_nan_bf16(&format!("L{} post_moe", layer_idx), *graph.d_hidden.device_ptr(), hs, &self.device);
                 #[cfg(feature = "gpu-debug")]
                 {
                     self.device.synchronize().map_err(|e| format!("sync moe dbg: {:?}", e))?;
@@ -12678,6 +12821,8 @@ impl GpuDecodeStore {
 
         eprintln!("[krasis] gpu_generate_stream called: first_token={}, start_pos={}, max_tokens={}", first_token, start_position, max_tokens);
 
+        let decode_diag = std::env::var("KRASIS_DECODE_DIAG").map(|v| v == "1").unwrap_or(false);
+
         // Bind CUDA context to this thread. Required when called from
         // the server thread (which differs from the setup thread).
         if let Err(e) = self.device.bind_to_thread() {
@@ -12689,6 +12834,45 @@ impl GpuDecodeStore {
             Some(g) => g.vocab_size,
             None => { log::error!("gpu_generate_stream: graph not configured"); return 0; }
         };
+
+        // Decode diagnostic: check LA recur state and conv state at decode start
+        if decode_diag {
+            if let Some(ref graph) = self.graph {
+                for (li, layer) in graph.layers.iter().enumerate() {
+                    if li >= 3 { break; } // Only check first 3 layers
+                    if let GpuAttnConfig::LinearAttention { recur_state_ptr, conv_state_ptr, nv, dk, dv, conv_dim, kernel_dim, .. } = &layer.attn {
+                        // Download recur state and compute L2 norm of first head
+                        let head_size = dk * dv; // 128*128=16384 for QCN
+                        let mut state_buf = vec![0.0f32; head_size];
+                        unsafe {
+                            let _ = cuda_sys::lib().cuMemcpyDtoH_v2(
+                                state_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                                *recur_state_ptr, head_size * 4);
+                        }
+                        let head0_norm: f32 = state_buf.iter()
+                            .map(|x| x * x).sum::<f32>().sqrt();
+                        let any_nonzero = state_buf.iter().any(|&x| x != 0.0);
+                        eprintln!("[DECODE-DIAG] L{:02} recur_state: head0_norm={:.6} any_nonzero={} vals[0..4]=[{:.6},{:.6},{:.6},{:.6}]",
+                            li, head0_norm, any_nonzero,
+                            state_buf[0], state_buf[1], state_buf[2], state_buf[3]);
+
+                        // Check conv state
+                        let conv_size = conv_dim * kernel_dim;
+                        let mut conv_buf = vec![0.0f32; conv_size.min(256)];
+                        let cdl = conv_buf.len();
+                        unsafe {
+                            let _ = cuda_sys::lib().cuMemcpyDtoH_v2(
+                                conv_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                                *conv_state_ptr, cdl * 4);
+                        }
+                        let conv_any_nonzero = conv_buf.iter().any(|&x| x != 0.0);
+                        let conv_norm: f32 = conv_buf.iter().map(|x| x * x).sum::<f32>().sqrt();
+                        eprintln!("[DECODE-DIAG] L{:02} conv_state: norm={:.6} any_nonzero={}",
+                            li, conv_norm, conv_any_nonzero);
+                    }
+                }
+            }
+        }
 
         let stop_set: std::collections::HashSet<usize> = stop_ids.iter().copied().collect();
 
@@ -13206,6 +13390,20 @@ impl GpuDecodeStore {
                 }
 
                 let logits = &mut self.graph.as_mut().unwrap().h_logits;
+
+                // Decode diagnostic: top-5 logits for first 3 steps
+                if decode_diag && step < 3 {
+                    let mut indexed: Vec<(usize, f32)> = logits.iter().copied()
+                        .enumerate().take(vocab_size).collect();
+                    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    let top5: Vec<String> = indexed[..5.min(indexed.len())].iter()
+                        .map(|(idx, val)| {
+                            let tok_str = tokenizer.decode(&[*idx as u32], true).unwrap_or_default();
+                            format!("{}({:.3})\"{}\"", idx, val, tok_str.replace('\n', "\\n"))
+                        }).collect();
+                    eprintln!("[DECODE-DIAG] step={} pos={} input_tok={} top5=[{}]",
+                        step, pos, next_token, top5.join(", "));
+                }
 
                 #[cfg(feature = "gpu-debug")]
                 if debug_logits > 0 && step < debug_logits {
