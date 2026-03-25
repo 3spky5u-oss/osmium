@@ -893,33 +893,32 @@ fn handle_prefill_logits(
         }
     };
 
-    let messages_json = match req.get("messages") {
-        Some(m) => m.to_string(),
-        None => {
-            let _ = send_json(stream, 400, r#"{"error":"Missing messages"}"#);
-            return;
-        }
-    };
     let top_k = req.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
     let sample_every = req.get("sample_every").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
-    let enable_thinking = req.get("enable_thinking").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    // Apply chat template
-    let rendered = match state.chat_template.apply(&messages_json, enable_thinking) {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = send_json(stream, 500, &format!(r#"{{"error":"Chat template: {}"}}"#, e));
-            return;
+    // Accept either raw input_token_ids or messages (with chat template + tokenization)
+    let token_ids: Vec<u32> = if let Some(serde_json::Value::Array(arr)) = req.get("input_token_ids") {
+        arr.iter().filter_map(|v| v.as_u64().map(|x| x as u32)).collect()
+    } else if let Some(messages) = req.get("messages") {
+        let messages_json = messages.to_string();
+        let enable_thinking = req.get("enable_thinking").and_then(|v| v.as_bool()).unwrap_or(false);
+        let rendered = match state.chat_template.apply(&messages_json, enable_thinking) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = send_json(stream, 500, &format!(r#"{{"error":"Chat template: {}"}}"#, e));
+                return;
+            }
+        };
+        match state.tokenizer.encode(rendered.as_str(), true) {
+            Ok(e) => e.get_ids().to_vec(),
+            Err(e) => {
+                let _ = send_json(stream, 500, &format!(r#"{{"error":"Tokenize: {}"}}"#, e));
+                return;
+            }
         }
-    };
-
-    // Tokenize
-    let token_ids: Vec<u32> = match state.tokenizer.encode(rendered.as_str(), true) {
-        Ok(e) => e.get_ids().to_vec(),
-        Err(e) => {
-            let _ = send_json(stream, 500, &format!(r#"{{"error":"Tokenize: {}"}}"#, e));
-            return;
-        }
+    } else {
+        let _ = send_json(stream, 400, r#"{"error":"Missing input_token_ids or messages"}"#);
+        return;
     };
 
     log::info!("prefill_logits: {} tokens, top_k={}, sample_every={}", token_ids.len(), top_k, sample_every);

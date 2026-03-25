@@ -1007,6 +1007,38 @@ impl PrefillEngine {
             return Err(format!("Prompt {} tokens > scratch {}", m, self.scratch.max_tokens));
         }
 
+        // Zero LA recurrent + conv state for fresh prefill
+        if let Some(ref la_state_buf) = self.scratch.d_la_state {
+            let nv = self.config.la_num_v_heads;
+            let dk = self.config.la_k_head_dim;
+            let dv = self.config.la_v_head_dim;
+            let state_elems = nv * dk * dv;
+            unsafe {
+                cuda_sys::lib().cuMemsetD32Async(
+                    *la_state_buf.device_ptr(), 0, state_elems, self.stream);
+            }
+        }
+        for layer_idx in 0..num_hidden_layers {
+            let lw = &self.layer_weights[layer_idx];
+            if lw.la_conv_state_ptr != 0 {
+                let conv_dim = self.config.la_conv_dim;
+                let kernel_dim = self.config.la_conv_kernel_dim;
+                unsafe {
+                    cuda_sys::lib().cuMemsetD32Async(
+                        lw.la_conv_state_ptr, 0, conv_dim * kernel_dim, self.stream);
+                }
+            }
+            if lw.la_recur_state_ptr != 0 {
+                let nv = self.config.la_num_v_heads;
+                let dk = self.config.la_k_head_dim;
+                let dv = self.config.la_v_head_dim;
+                unsafe {
+                    cuda_sys::lib().cuMemsetD32Async(
+                        lw.la_recur_state_ptr, 0, nv * dk * dv, self.stream);
+                }
+            }
+        }
+
         // 1. Upload token IDs and positions
         self.upload_tokens_with_offset(token_ids, 0)?;
 
@@ -1129,8 +1161,36 @@ impl PrefillEngine {
 
             if let Some(ref lm) = self.lm_head {
                 self.marlin_gemm(pos_hidden, lm, *self.scratch.d_logits.device_ptr(), 1)?;
+            } else if self.lm_head_bf16_ptr != 0 {
+                // BF16 LM head via cuBLAS GEMM
+                use cudarc::cublas::sys as cublas_sys;
+                use cudarc::cublas::result as cublas_result;
+                let alpha: f32 = 1.0;
+                let beta: f32 = 0.0;
+                unsafe {
+                    cublas_result::set_stream(
+                        self.cublas_handle,
+                        self.stream as cublas_sys::cudaStream_t,
+                    ).map_err(|e| format!("cuBLAS set stream: {:?}", e))?;
+                    cublas_result::gemm_ex(
+                        self.cublas_handle,
+                        cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                        cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                        self.lm_head_bf16_rows as i32, 1, self.lm_head_bf16_cols as i32,
+                        &alpha as *const f32 as *const std::ffi::c_void,
+                        self.lm_head_bf16_ptr as *const std::ffi::c_void,
+                        cublas_sys::cudaDataType::CUDA_R_16BF, self.lm_head_bf16_cols as i32,
+                        pos_hidden as *const std::ffi::c_void,
+                        cublas_sys::cudaDataType::CUDA_R_16BF, h as i32,
+                        &beta as *const f32 as *const std::ffi::c_void,
+                        *self.scratch.d_logits.device_ptr() as *mut std::ffi::c_void,
+                        cublas_sys::cudaDataType::CUDA_R_32F, self.lm_head_bf16_rows as i32,
+                        cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                        cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                    ).map_err(|e| format!("LM head BF16 GEMM: {:?}", e))?;
+                }
             } else {
-                return Err("No LM head".to_string());
+                return Err("No LM head (neither Marlin nor BF16)".to_string());
             }
 
             // Download logits
@@ -3620,7 +3680,8 @@ impl PrefillEngine {
         if shared_async {
             unsafe {
                 cuda_sys::lib().cuEventRecord(self.compute_event, self.stream);
-                cuda_sys::lib().cuStreamWaitEvent(self.copy_stream, self.compute_event, 0);
+                // shared_stream must wait for main stream's d_hidden to be ready
+                cuda_sys::lib().cuStreamWaitEvent(self.shared_stream, self.compute_event, 0);
             }
             self.launch_shared_expert_async(layer_idx, m)?;
         }
