@@ -673,6 +673,23 @@ impl PrefillEngine {
         buf
     }
 
+    /// Download BF16 values from GPU as f32.
+    fn diag_download_bf16(&self, ptr: u64, count: usize) -> Vec<f32> {
+        let mut buf = vec![0u16; count];
+        unsafe {
+            cuda_sys::lib().cuStreamSynchronize(self.stream);
+            cuda_sys::lib().cuMemcpyDtoH_v2(
+                buf.as_mut_ptr() as *mut std::ffi::c_void,
+                ptr,
+                (count * 2) as usize,
+            );
+        }
+        buf.iter().map(|&bits| {
+            let f32_bits = (bits as u32) << 16;
+            f32::from_bits(f32_bits)
+        }).collect()
+    }
+
     /// Print L2 norms at multiple positions for a given buffer, in a format
     /// that can be compared against the BF16 sublayer reference data.
     fn diag_print_norms(&self, label: &str, ptr: u64, positions: &[usize], h: usize) {
@@ -2524,12 +2541,42 @@ impl PrefillEngine {
             // la_v now has [total_len, nv, dv] FP32 — first m positions are valid
 
             if la_diag {
+                self.stream_sync()?;
                 // Recurrence output norm at pos 0 (before gated RMSNorm)
                 let recur_norm = self.diag_l2_norm_f32(la_v, 0, nv * dv, nv * dv);
                 // Z gate norm at pos 0 (BF16)
                 let z_norm = self.diag_l2_norm(la_z, 0, value_dim, value_dim);
                 eprintln!("[DIAG L{:02}] recurrence pos0 norm={:.6} (before gated_rmsnorm)", layer_idx, recur_norm);
                 eprintln!("[DIAG L{:02}] z_gate pos0 norm={:.6}", layer_idx, z_norm);
+
+                // Element-level diagnostics for gated_rmsnorm inputs
+                // x: la_v [total_len, nv, dv] FP32, head 0 pos 0 = offset 0
+                let x_vals = self.diag_download_f32(la_v, 4);
+                eprintln!("[DIAG L{:02}] grmsnorm x[h0p0][0:4]=[{:.8},{:.8},{:.8},{:.8}]",
+                    layer_idx, x_vals[0], x_vals[1], x_vals[2], x_vals[3]);
+
+                // gate: la_z [M, nv, dv] BF16, head 0 pos 0 = offset 0
+                let z_vals = self.diag_download_bf16(la_z, 4);
+                eprintln!("[DIAG L{:02}] grmsnorm z[h0p0][0:4]=[{:.8},{:.8},{:.8},{:.8}]",
+                    layer_idx, z_vals[0], z_vals[1], z_vals[2], z_vals[3]);
+
+                // norm weight: la_norm_weight_ptr [dv] FP32
+                let w_vals = self.diag_download_f32(lw.la_norm_weight_ptr, 4);
+                eprintln!("[DIAG L{:02}] grmsnorm weight[0:4]=[{:.8},{:.8},{:.8},{:.8}]",
+                    layer_idx, w_vals[0], w_vals[1], w_vals[2], w_vals[3]);
+
+                // Compute what the kernel would produce for element 0
+                let sum_sq: f64 = {
+                    let all_x = self.diag_download_f32(la_v, dv);
+                    all_x.iter().map(|&v| (v as f64) * (v as f64)).sum()
+                };
+                let rms_inv = 1.0 / ((sum_sq / dv as f64) + cfg.rms_norm_eps as f64).sqrt();
+                let normed_0 = x_vals[0] as f64 * rms_inv * w_vals[0] as f64;
+                let g_0 = z_vals[0] as f64;
+                let silu_g_0 = g_0 / (1.0 + (-g_0).exp());
+                let out_0 = normed_0 * silu_g_0;
+                eprintln!("[DIAG L{:02}] grmsnorm manual: rms_inv={:.8} normed[0]={:.8} silu_g[0]={:.8} out[0]={:.8}",
+                    layer_idx, rms_inv, normed_0, silu_g_0, out_0);
             }
 
             // 20. Gated RMSNorm: out = rmsnorm(x) * weight * silu(z)
@@ -2562,8 +2609,14 @@ impl PrefillEngine {
             // 21. Output projection: [M, nv*dv] BF16 -> [M, hidden] BF16
             // Use scratch1 as temp to avoid Marlin GEMM input/output aliasing.
             if la_diag {
+                self.stream_sync()?;
                 let pre_oproj_norm = self.diag_l2_norm(attn_out, 0, value_dim, value_dim);
                 eprintln!("[DIAG L{:02}] pre_out_proj pos0 norm={:.6} (after gated_rmsnorm, dim={})", layer_idx, pre_oproj_norm, value_dim);
+
+                // Element-level: actual kernel output [M, nv*dv] BF16, head 0 pos 0
+                let out_vals = self.diag_download_bf16(attn_out, 4);
+                eprintln!("[DIAG L{:02}] grmsnorm out[h0p0][0:4]=[{:.8},{:.8},{:.8},{:.8}]",
+                    layer_idx, out_vals[0], out_vals[1], out_vals[2], out_vals[3]);
             }
             let o_temp = *self.scratch.d_scratch1.device_ptr();
             self.la_gemm(attn_out, &lw.la_out_proj, &lw.la_out_proj_bf16, o_temp, m)?;

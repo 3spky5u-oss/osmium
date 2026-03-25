@@ -1629,7 +1629,7 @@ extern "C" __global__ void la_gated_rmsnorm_kernel(
     __nv_bfloat16* __restrict__ out,      /* [M, nv*dv] BF16 */
     const float* __restrict__ x,          /* [M, nv, dv] FP32 */
     const __nv_bfloat16* __restrict__ gate, /* [M, nv, dv] BF16 */
-    const __nv_bfloat16* __restrict__ weight, /* [dv] BF16 */
+    const float* __restrict__ weight,     /* [dv] FP32 */
     int nv, int dv, float eps)
 {
     int token = blockIdx.x;
@@ -1658,10 +1658,9 @@ extern "C" __global__ void la_gated_rmsnorm_kernel(
 
     /* Normalize, scale by weight, multiply by silu(gate) */
     for (int i = threadIdx.x; i < dv; i += blockDim.x) {
-        float normed = x_head[i] * rms_inv * bf16_to_float(weight[i]);
+        float normed = x_head[i] * rms_inv * weight[i];
         float g = bf16_to_float(g_head[i]);
-        float g_fp32 = g;
-        float silu_g = g_fp32 / (1.0f + expf(-g_fp32));
+        float silu_g = g / (1.0f + expf(-g));
         o_head[i] = float_to_bf16(normed * silu_g);
     }
 }
