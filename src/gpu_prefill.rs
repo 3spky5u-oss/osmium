@@ -725,12 +725,12 @@ impl PrefillEngine {
     }
 
     /// Get the diagnostic layer limit from KRASIS_PREFILL_DIAG_LAYERS env var.
-    /// Default: 1 (only layer 0). Set to e.g. 5 for layers 0-4, or 999 for all.
+    /// Default: 9999 (all layers). Set to e.g. 5 for layers 0-4.
     fn diag_layer_limit() -> usize {
         std::env::var("KRASIS_PREFILL_DIAG_LAYERS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(1)
+            .unwrap_or(9999)
     }
 
     pub fn run_prefill(
@@ -752,11 +752,13 @@ impl PrefillEngine {
 
         // Diagnostic mode: compare per-layer norms against BF16 reference
         // Set KRASIS_PREFILL_DIAG=1 to enable.
-        // KRASIS_PREFILL_DIAG_LAYERS=N to check N layers (default 1 = layer 0 only)
+        // KRASIS_PREFILL_DIAG_LAYERS=N to check N layers (default all)
         // KRASIS_PREFILL_DIAG_POSITIONS=0,1,2,3,4,28,29,30,31,32 to set positions
+        // KRASIS_PREFILL_DIAG_MOE_DETAIL=1 to enable heavy per-row MoE diagnostics
         let diag = std::env::var("KRASIS_PREFILL_DIAG").is_ok();
         let diag_positions = if diag { Self::diag_positions(total_m) } else { vec![] };
         let diag_layer_limit = if diag { Self::diag_layer_limit() } else { 0 };
+        let diag_moe_detail = std::env::var("KRASIS_PREFILL_DIAG_MOE_DETAIL").is_ok();
 
         // Determine chunk size: use config value, fall back to max_tokens
         let chunk_size = if self.config.prefill_chunk_size > 0 {
@@ -925,6 +927,13 @@ impl PrefillEngine {
                         *self.scratch.d_attn_out.device_ptr(),
                         (m * h * 2) as u64,
                     )?;
+                }
+
+                // DIAG: d_hidden before MLP (after post-attn-norm = MoE input)
+                if diag && chunk_idx == 0 && layer_idx < diag_layer_limit {
+                    self.diag_print_norms(
+                        &format!("layer{:02}_pre_mlp", layer_idx),
+                        *self.scratch.d_hidden.device_ptr(), &diag_positions, h);
                 }
 
                 // MLP (dense or MoE)
@@ -3572,7 +3581,8 @@ impl PrefillEngine {
         // Diagnostic: dump routing weights, expert ids, and active counts for layer 0
         let diag = std::env::var("KRASIS_PREFILL_DIAG").is_ok();
         let diag_layer_limit = Self::diag_layer_limit();
-        if diag && layer_idx < diag_layer_limit {
+        let diag_moe_detail = std::env::var("KRASIS_PREFILL_DIAG_MOE_DETAIL").is_ok();
+        if diag && diag_moe_detail && layer_idx < diag_layer_limit {
             // Download top-k weights and ids for token 0
             let mut h_weights = vec![0.0f32; m * topk];
             let mut h_ids = vec![0i32; m * topk];
@@ -3642,7 +3652,7 @@ impl PrefillEngine {
         }
 
         // Diagnostic: check gathered input norms before expert GEMMs
-        if diag && layer_idx < diag_layer_limit && total_active > 0 {
+        if diag && diag_moe_detail && layer_idx < diag_layer_limit && total_active > 0 {
             let diag_positions = Self::diag_positions(m);
             let mut parts = Vec::new();
             for &pos in &diag_positions {
@@ -3765,7 +3775,7 @@ impl PrefillEngine {
                     let mut cur_buf = 0usize;
 
                     // Diagnostic: log first cold expert DMA parameters + buffer sizes
-                    if diag && layer_idx < diag_layer_limit {
+                    if diag && diag_moe_detail && layer_idx < diag_layer_limit {
                         let fe = &moe_data.experts[cold_work[0].eid];
                         let buf_w13p_bytes = h * w13_n * bits as usize / 8;
                         let buf_w13s_bytes = (h / gs) * w13_n * 2;
@@ -3838,7 +3848,7 @@ impl PrefillEngine {
         }
 
         // Diagnostic: dump per-row expert_out norms before scatter to find outliers
-        if diag && layer_idx < diag_layer_limit && total_active > 0 {
+        if diag && diag_moe_detail && layer_idx < diag_layer_limit && total_active > 0 {
             self.stream_sync()?;
             // Download expert_out [total_active, h] BF16 and gather_src_map [total_active] i32
             let mut h_expert_out = vec![0u16; total_active * h];
@@ -3972,7 +3982,7 @@ impl PrefillEngine {
                 let s2_buf = *self.scratch.d_scratch2.device_ptr();
                 let shared_inter = sw1.n / (if gated { 2 } else { 1 });
 
-                if diag && layer_idx < diag_layer_limit {
+                if diag && diag_moe_detail && layer_idx < diag_layer_limit {
                     eprintln!("[DIAG] layer{:02}_moe shared_expert sw1: n={} k={} bits={} gs={} groups={}",
                         layer_idx, sw1.n, sw1.k, sw1.num_bits, sw1.group_size, sw1.num_groups);
                     eprintln!("[DIAG] layer{:02}_moe shared_expert sw2: n={} k={} bits={} gs={} groups={}",
@@ -3984,7 +3994,7 @@ impl PrefillEngine {
                 self.marlin_gemm(hidden, sw1, s1_buf, m)?;
 
                 if gated {
-                    if diag && layer_idx < diag_layer_limit {
+                    if diag && diag_moe_detail && layer_idx < diag_layer_limit {
                         // s1_buf has w1 output: [m, w13_n] BF16
                         let w1_norm = self.diag_l2_norm(s1_buf, 0, sw1.n, sw1.n);
                         eprintln!("[DIAG] layer{:02}_moe shared_w1_out_norm pos0={:.6} (dim={})", layer_idx, w1_norm, sw1.n);
@@ -4004,7 +4014,7 @@ impl PrefillEngine {
                         )?;
                     }
 
-                    if diag && layer_idx < diag_layer_limit {
+                    if diag && diag_moe_detail && layer_idx < diag_layer_limit {
                         // s2_buf has activation output: [m, shared_inter] BF16
                         let act_norm = self.diag_l2_norm(s2_buf, 0, shared_inter, shared_inter);
                         eprintln!("[DIAG] layer{:02}_moe shared_act_out_norm pos0={:.6} (dim={})", layer_idx, act_norm, shared_inter);
