@@ -290,6 +290,12 @@ fn detect_l3_cache() -> (usize, usize) {
 /// Calculate expert size in bytes from model dimensions and quantization.
 /// expert_size = w13_packed + w13_scales + w2_packed + w2_scales
 fn compute_expert_size_bytes(hidden: usize, intermediate: usize, group_size: usize, num_bits: u8) -> usize {
+    if num_bits == 16 {
+        // BF16 validation mode: raw BF16 data, no scales
+        let w13 = hidden * 2 * intermediate * 2; // [hidden, 2*intermediate] * 2 bytes
+        let w2 = intermediate * hidden * 2;       // [intermediate, hidden] * 2 bytes
+        return w13 + w2;
+    }
     let two_m = 2 * intermediate;
     // w13: K=hidden, N=2*intermediate
     let w13_packed = if num_bits == 4 { (hidden / 8) * two_m * 4 } else { hidden * two_m * 4 };
@@ -2672,7 +2678,7 @@ impl CpuDecodeStore {
                 if let Some(ws) = Arc::get_mut(arc) {
                     for layer in ws.experts_cpu.iter_mut() {
                         for expert in layer.iter_mut() {
-                            if expert.tiled { continue; }
+                            if expert.tiled || expert.num_bits == 16 { continue; }
                             let h = expert.hidden_size;
                             let m = expert.intermediate_size;
                             let gs = expert.group_size;
@@ -2996,7 +3002,7 @@ impl CpuDecodeStore {
         g.mlp_gate_up = vec![0.0; (max_intermediate * 2).max(1)];
         g.mlp_hidden_buf = vec![0.0; max_intermediate.max(1)];
         g.act_int16 = vec![0i16; max_k];
-        g.act_scales = vec![0.0f32; max_k / gs];
+        g.act_scales = vec![0.0f32; if gs > 0 { max_k / gs } else { max_k / 128 }];
 
         // MoE routing scratch (sized by max expert count)
         let mut max_ne = 0usize;
@@ -5908,9 +5914,10 @@ pub fn bench_decode_synthetic(
             w.tiled = true;
         }
 
-        // Repack expert weights
+        // Repack expert weights (skip BF16 — raw BF16 data doesn't need tiling)
         for layer in moe_store.experts_cpu.iter_mut() {
             for expert in layer.iter_mut() {
+                if expert.num_bits == 16 { continue; }
                 let h = expert.hidden_size;
                 let m = expert.intermediate_size;
                 let gs = expert.group_size;

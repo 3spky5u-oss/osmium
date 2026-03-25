@@ -706,17 +706,24 @@ class KrasisModel:
         cpu_start = time.perf_counter()
         gpu_bits = self.quant_cfg.gpu_expert_bits
         cache_dir = cache_dir_for_model(self.cfg.model_path)
-        has_gpu_cache = os.path.isfile(os.path.join(cache_dir, f"experts_marlin_int{gpu_bits}_g128.bin"))
-        if has_gpu_cache:
-            print(f"\n\033[1m\033[36m▸ Loading GPU expert weights from cache\033[0m", flush=True)
+        has_gpu_cache = False
+        if gpu_bits == 16:
+            print(f"\n\033[1m\033[36m▸ Loading BF16 expert weights from safetensors (validation mode)\033[0m", flush=True)
+            logger.info("Phase 2: Loading GPU expert weights (BF16 validation)...")
         else:
-            print(f"\n\033[1m\033[36m▸ Building GPU INT{gpu_bits} Marlin expert cache (one-time)\033[0m", flush=True)
-            print(f"  \033[2mCache will be saved to {cache_dir} for instant loading next time.\033[0m", flush=True)
-        logger.info("Phase 2: Loading GPU expert weights (INT%d)...", gpu_bits)
+            has_gpu_cache = os.path.isfile(os.path.join(cache_dir, f"experts_marlin_int{gpu_bits}_g128.bin"))
+            if has_gpu_cache:
+                print(f"\n\033[1m\033[36m▸ Loading GPU expert weights from cache\033[0m", flush=True)
+            else:
+                print(f"\n\033[1m\033[36m▸ Building GPU INT{gpu_bits} Marlin expert cache (one-time)\033[0m", flush=True)
+                print(f"  \033[2mCache will be saved to {cache_dir} for instant loading next time.\033[0m", flush=True)
+            logger.info("Phase 2: Loading GPU expert weights (INT%d)...", gpu_bits)
         self._load_cpu_experts(gpu_only=gpu_only)
         cpu_elapsed = time.perf_counter() - cpu_start
         logger.info("Expert weights loaded in %.1fs", cpu_elapsed)
-        if has_gpu_cache:
+        if gpu_bits == 16:
+            print(f"  \033[0;32mBF16 expert weights loaded in {cpu_elapsed:.0f}s.\033[0m", flush=True)
+        elif has_gpu_cache:
             print(f"  \033[0;32mExpert weights loaded in {cpu_elapsed:.0f}s.\033[0m", flush=True)
         else:
             print(f"  \033[0;32mExpert cache built in {cpu_elapsed:.0f}s — next launch will be much faster.\033[0m", flush=True)

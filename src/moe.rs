@@ -76,17 +76,21 @@ pub struct ExpertScratch {
 
 impl ExpertScratch {
     pub fn new(hidden_size: usize, intermediate_size: usize, group_size: usize) -> Self {
+        // BF16 validation mode has group_size=0 (no quantization grouping).
+        // The integer matmul scratch buffers won't be used (BF16 panics in CPU matmul),
+        // but we still need valid allocations to avoid div-by-zero.
+        let gs = if group_size == 0 { 128 } else { group_size };
         ExpertScratch {
             hidden_bf16: vec![0u16; intermediate_size],
             gate_out: vec![0.0f32; intermediate_size],
             up_out: vec![0.0f32; intermediate_size],
             expert_out: vec![0.0f32; hidden_size],
             input_act_int16: vec![0i16; hidden_size],
-            input_act_scales: vec![0.0f32; hidden_size / group_size],
+            input_act_scales: vec![0.0f32; hidden_size / gs],
             hidden_int16: vec![0i16; intermediate_size],
-            hidden_scales: vec![0.0f32; intermediate_size / group_size],
+            hidden_scales: vec![0.0f32; intermediate_size / gs],
             w13_out: vec![0.0f32; 2 * intermediate_size],
-            group_size,
+            group_size: gs,
         }
     }
 }
@@ -97,6 +101,7 @@ fn matmul_integer(weight: &QuantWeight, act_int16: &[i16], act_scales: &[f32], o
     match weight {
         QuantWeight::Int4(q) => matmul_int4_integer(q, act_int16, act_scales, output),
         QuantWeight::Int8(q) => matmul_int8_integer(q, act_int16, act_scales, output),
+        QuantWeight::Bf16(_) => panic!("BF16 experts are GPU-only (validation mode), not supported in CPU decode"),
     }
 }
 
@@ -106,6 +111,7 @@ fn matmul_integer_parallel(weight: &QuantWeight, act_int16: &[i16], act_scales: 
     match weight {
         QuantWeight::Int4(q) => matmul_int4_integer_parallel(q, act_int16, act_scales, output),
         QuantWeight::Int8(q) => matmul_int8_integer_parallel(q, act_int16, act_scales, output),
+        QuantWeight::Bf16(_) => panic!("BF16 experts are GPU-only (validation mode), not supported in CPU decode"),
     }
 }
 
@@ -1324,6 +1330,7 @@ fn prefetch_expert_nta(expert: &ExpertWeights) {
                 q.scales.as_ptr() as *const i8,
                 q.scales.len() * 2,
             ),
+            QuantWeight::Bf16(_) => panic!("BF16 experts are GPU-only (validation mode), not supported in CPU decode"),
         };
         let mut off = 0;
         while off < data_bytes {
@@ -1712,9 +1719,9 @@ impl KrasisEngine {
                 format!("cpu_num_bits must be 4 or 8, got {cpu_bits}")
             ));
         }
-        if gpu_bits != 4 && gpu_bits != 8 {
+        if gpu_bits != 4 && gpu_bits != 8 && gpu_bits != 16 {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("gpu_num_bits must be 4 or 8 (Marlin), got {gpu_bits}")
+                format!("gpu_num_bits must be 4, 8, or 16 (BF16 validation), got {gpu_bits}")
             ));
         }
         let bits = cpu_bits; // For backward-compat logging and memory estimation
@@ -1740,7 +1747,11 @@ impl KrasisEngine {
                     let num_layers = max_layers.map_or(remaining, |n| n.min(remaining));
 
                     // Estimate per-expert bytes based on quantization bit width
-                    let per_expert_bytes = if bits == 4 {
+                    let per_expert_bytes = if gpu_bits == 16 {
+                        // BF16: rows * cols * 2 bytes per projection
+                        // gate+up: 2 * m * h * 2, down: h * m * 2
+                        (m * h * 2.0) * 2.0 + h * m * 2.0
+                    } else if bits == 4 {
                         // INT4 packed: (h/8)*m*4 + (h/gs)*m*2 per gate/up, similar for down
                         (m * (h / 8.0) * 4.0 + m * (h / gs as f64) * 2.0) * 2.0
                             + h * (m / 8.0) * 4.0 + h * (m / gs as f64) * 2.0

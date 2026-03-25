@@ -5593,6 +5593,7 @@ impl GpuDecodeStore {
                 moe_routed_scaling_factor: 1.0,
                 moe_gated: true, moe_activation: 0,
                 shared_w1: None, shared_w2: None,
+                shared_w1_bf16: None, shared_w2_bf16: None,
                 shared_gate_ptr: 0, shared_gate_rows: 0, shared_gate_cols: 0,
                 layer_type: config.layer_types[i],
                 moe_layer_idx: None,
@@ -5720,24 +5721,43 @@ impl GpuDecodeStore {
                         // Shared expert weights: look for pinned VRAM copies first
                         if let Some(Some(se_vram)) = graph.shared_expert_vram.get(i) {
                             let bits = graph.shared_expert_bits;
-                            lw.shared_w1 = Some(MarlinWeight {
-                                packed: se_vram.w13_packed_ptr(),
-                                scales: se_vram.w13_scales_ptr(),
-                                n: graph.moe_intermediate_size * 2,
-                                k: graph.hidden_size,
-                                num_groups: graph.hidden_size / graph.group_size.max(1),
-                                group_size: graph.group_size,
-                                num_bits: bits,
-                            });
-                            lw.shared_w2 = Some(MarlinWeight {
-                                packed: se_vram.w2_packed_ptr(),
-                                scales: se_vram.w2_scales_ptr(),
-                                n: graph.hidden_size,
-                                k: graph.moe_intermediate_size,
-                                num_groups: graph.moe_intermediate_size / graph.group_size.max(1),
-                                group_size: graph.group_size,
-                                num_bits: bits,
-                            });
+                            if bits == 16 {
+                                // BF16 validation mode: raw BF16 data, use cuBLAS
+                                // For BF16: w13_packed is [w13_n, hidden] raw BF16, total bytes = w13_n * hidden * 2
+                                // So w13_n = w13_packed_bytes / (hidden * 2)
+                                let shared_inter_w13_n = se_vram.w13_packed_size / (graph.hidden_size * 2);
+                                let w13_n = shared_inter_w13_n;
+                                let shared_inter = if moe_data.gated_experts { w13_n / 2 } else { w13_n };
+                                lw.shared_w1_bf16 = Some(Bf16Weight {
+                                    ptr: se_vram.w13_packed_ptr(),
+                                    n: w13_n,
+                                    k: graph.hidden_size,
+                                });
+                                lw.shared_w2_bf16 = Some(Bf16Weight {
+                                    ptr: se_vram.w2_packed_ptr(),
+                                    n: graph.hidden_size,
+                                    k: shared_inter,
+                                });
+                            } else {
+                                lw.shared_w1 = Some(MarlinWeight {
+                                    packed: se_vram.w13_packed_ptr(),
+                                    scales: se_vram.w13_scales_ptr(),
+                                    n: graph.moe_intermediate_size * 2,
+                                    k: graph.hidden_size,
+                                    num_groups: graph.hidden_size / graph.group_size.max(1),
+                                    group_size: graph.group_size,
+                                    num_bits: bits,
+                                });
+                                lw.shared_w2 = Some(MarlinWeight {
+                                    packed: se_vram.w2_packed_ptr(),
+                                    scales: se_vram.w2_scales_ptr(),
+                                    n: graph.hidden_size,
+                                    k: graph.moe_intermediate_size,
+                                    num_groups: graph.moe_intermediate_size / graph.group_size.max(1),
+                                    group_size: graph.group_size,
+                                    num_bits: bits,
+                                });
+                            }
                         }
                     }
                 }
@@ -5870,10 +5890,10 @@ impl GpuDecodeStore {
         let w1_n = if config.moe_gated { 2 * moe_inter } else { moe_inter };
         // Marlin packed layout: [K/16, N, 16*bits/8] bytes per expert
         // Total = K * N * bits / 8 bytes
-        let w1_packed_per_expert = h * w1_n * bits / 8;
-        let w1_scales_per_expert = (h / gs) * w1_n * 2;
-        let w2_packed_per_expert = moe_inter * h * bits / 8;
-        let w2_scales_per_expert = (moe_inter / gs) * h * 2;
+        let w1_packed_per_expert = if bits == 16 { h * w1_n * 2 } else { h * w1_n * bits / 8 };
+        let w1_scales_per_expert = if gs == 0 { 0 } else { (h / gs) * w1_n * 2 };
+        let w2_packed_per_expert = if bits == 16 { moe_inter * h * 2 } else { moe_inter * h * bits / 8 };
+        let w2_scales_per_expert = if gs == 0 { 0 } else { (moe_inter / gs) * h * 2 };
 
         // Fused MoE contiguous buffers: [E, per_expert_bytes] for all experts
         // Only allocate if we have MoE layers and the fused kernel is available
@@ -6591,9 +6611,20 @@ impl GpuDecodeStore {
                 let hs = graph.hidden_size;
                 let intermediate = graph.moe_intermediate_size;
                 let gs = graph.group_size;
-                let w13_packed_bytes = (2 * intermediate * hs / 8) as u64;
-                let w13_scales_bytes = (2 * intermediate * hs / gs * 2 / 8) as u64;
-                let w2_packed_bytes = (hs * intermediate / 8) as u64;
+                let expert_bits = graph.expert_bits;
+                let w13_packed_bytes = if expert_bits == 16 {
+                    (2 * intermediate * hs * 2) as u64
+                } else {
+                    (2 * intermediate * hs * expert_bits as usize / 8) as u64
+                };
+                let w13_scales_bytes = if gs == 0 { 0u64 } else {
+                    (2 * intermediate * hs / gs * 2 / 8) as u64
+                };
+                let w2_packed_bytes = if expert_bits == 16 {
+                    (hs * intermediate * 2) as u64
+                } else {
+                    (hs * intermediate * expert_bits as usize / 8) as u64
+                };
                 let dummy_vals: [u64; 4] = [
                     dummy_base,
                     dummy_base + w13_packed_bytes,
@@ -13843,13 +13874,17 @@ impl GpuDecodeStore {
         }
         if let Some(ref se) = graph.moe_layers[layer_idx].as_ref().unwrap().shared {
             // Infer shared expert quantization bits from packed weight size.
-            // INT4: packed_bytes = k * n / 2, INT8: packed_bytes = k * n
+            // BF16: packed_bytes = k * n * 2, INT8: packed_bytes = k * n, INT4: packed_bytes = k * n / 2
             let se_n_w13 = graph.moe_intermediate_size * 2; // gated: gate+up
             let se_k_w13 = graph.hidden_size;
+            let expected_bf16 = se_k_w13 * se_n_w13 * 2;
             let expected_int8 = se_k_w13 * se_n_w13;
-            eprintln!("[SHARED_EXPERT_BITS] layer={} packed={} expected_int8={} moe_inter={} hidden={}",
-                layer_idx, se.w13_packed_bytes, expected_int8, graph.moe_intermediate_size, graph.hidden_size);
-            if se.w13_packed_bytes >= expected_int8 {
+            eprintln!("[SHARED_EXPERT_BITS] layer={} packed={} expected_bf16={} expected_int8={} moe_inter={} hidden={}",
+                layer_idx, se.w13_packed_bytes, expected_bf16, expected_int8, graph.moe_intermediate_size, graph.hidden_size);
+            if se.w13_packed_bytes >= expected_bf16 {
+                graph.shared_expert_bits = 16;
+                eprintln!("[SHARED_EXPERT_BITS] => BF16 (bits=16)");
+            } else if se.w13_packed_bytes >= expected_int8 {
                 graph.shared_expert_bits = 8;
                 eprintln!("[SHARED_EXPERT_BITS] => INT8 (bits=8)");
             } else {
@@ -16261,6 +16296,13 @@ impl GpuDecodeStore {
                         "Expert[0][0]: w13p={} bytes, w13s={} bytes, w2p={} bytes, w2s={} bytes, total={:.1} KB",
                         w13p_bytes, w13s_bytes, w2p_bytes, w2s_bytes, total as f64 / 1024.0,
                     );
+                    // BF16 diagnostic: verify CPU data at the pointer
+                    if expert.num_bits == 16 {
+                        let cpu_data = unsafe { std::slice::from_raw_parts(w13p_ptr as *const u16, 8) };
+                        let vals: Vec<f32> = cpu_data.iter().map(|&v| half::bf16::from_bits(v).to_f32()).collect();
+                        eprintln!("[BF16-DMA] Expert[0][0] CPU w13p first8={:.4?} (ptr=0x{:x}, bytes={})",
+                            vals, w13p_ptr, w13p_bytes);
+                    }
                 }
             }
 
@@ -17093,6 +17135,23 @@ impl GpuDecodeStore {
                     slot_to_expert[slot] = None;
                     continue;
                 }
+            }
+
+            // BF16 diagnostic: verify GPU data matches CPU for first expert
+            if loaded == 0 && expert.w13_packed_bytes > 16 {
+                let mut gpu_check = vec![0u16; 8];
+                unsafe {
+                    cuda_sys::lib().cuMemcpyDtoH_v2(
+                        gpu_check.as_mut_ptr() as *mut _, dst + w13p_off, 16,
+                    );
+                }
+                let gpu_vals: Vec<f32> = gpu_check.iter().map(|&v| half::bf16::from_bits(v).to_f32()).collect();
+                let cpu_data = unsafe { std::slice::from_raw_parts(expert.w13_packed_ptr as *const u16, 8) };
+                let cpu_vals: Vec<f32> = cpu_data.iter().map(|&v| half::bf16::from_bits(v).to_f32()).collect();
+                eprintln!("[HCS-VERIFY] L{}E{} GPU first8={:.4?}", layer_idx, expert_idx, gpu_vals);
+                eprintln!("[HCS-VERIFY] L{}E{} CPU first8={:.4?}", layer_idx, expert_idx, cpu_vals);
+                let match_ok = gpu_vals == cpu_vals;
+                eprintln!("[HCS-VERIFY] Match: {}", match_ok);
             }
 
             let entry = HcsCacheEntry {

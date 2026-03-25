@@ -52,6 +52,14 @@ pub struct QuantizedInt8 {
     pub group_size: usize,
 }
 
+/// Raw BF16 weight matrix — no quantization, used for validation mode.
+pub struct QuantizedBf16 {
+    /// Raw BF16 weights as u16, row-major. Shape: [rows, cols]
+    pub data: Vec<u16>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
 /// Quantize a BF16 weight matrix to symmetric INT8 with per-group scales.
 ///
 /// Symmetric INT8: values in [-128, 127], scale chosen so that

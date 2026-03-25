@@ -225,7 +225,7 @@ class QuantConfig:
     attention: str = "bf16" # "bf16" or "awq" (calibrated per-tensor)
     shared_expert: str = "int8"    # "bf16" or "int8"
     dense_mlp: str = "int8"        # "bf16" or "int8"
-    gpu_expert_bits: int = 4       # 4 or 8 for Marlin kernel
+    gpu_expert_bits: int = 4       # 4, 8 (Marlin), or 16 (BF16 validation)
     cpu_expert_bits: int = 4       # 4 or 8 for CPU expert quantization
 
     def __post_init__(self):

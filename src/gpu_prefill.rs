@@ -336,6 +336,8 @@ pub struct PrefillLayerWeights {
     pub moe_activation: u8,         // 0=silu, 1=relu2
     pub shared_w1: Option<MarlinWeight>,
     pub shared_w2: Option<MarlinWeight>,
+    pub shared_w1_bf16: Option<Bf16Weight>,
+    pub shared_w2_bf16: Option<Bf16Weight>,
     /// Shared expert gate weight ptr (BF16, [hidden, 1]). 0 = no gate (weight=1.0).
     pub shared_gate_ptr: u64,
     pub shared_gate_rows: usize,
@@ -3671,7 +3673,8 @@ impl PrefillEngine {
         }
 
         // 7-8. Shared expert + routed experts
-        let has_shared = lw.shared_w1.is_some() && lw.shared_w2.is_some();
+        let has_shared = (lw.shared_w1.is_some() && lw.shared_w2.is_some())
+            || (lw.shared_w1_bf16.is_some() && lw.shared_w2_bf16.is_some());
 
         // Per-expert Marlin GEMM with HCS-aware dispatch and double-buffered DMA
         let moe_layer_idx = lw.moe_layer_idx;
@@ -3693,8 +3696,8 @@ impl PrefillEngine {
         let w13_n = if gated { 2 * inter } else { inter };
         let bits = self.config.expert_bits;
         let gs = self.config.group_size;
-        let num_groups_w13 = h / gs;
-        let num_groups_w2 = inter / gs;
+        let num_groups_w13 = if gs > 0 { h / gs } else { 0 };
+        let num_groups_w2 = if gs > 0 { inter / gs } else { 0 };
 
         // Collect active experts, check HCS residency
         struct ExpertWork {
@@ -3974,8 +3977,49 @@ impl PrefillEngine {
                     cuda_sys::lib().cuEventRecord(self.shared_event, self.shared_stream);
                     cuda_sys::lib().cuStreamWaitEvent(self.stream, self.shared_event, 0);
                 }
+            } else if let (Some(sw1_bf16), Some(sw2_bf16)) = (&lw.shared_w1_bf16, &lw.shared_w2_bf16) {
+                // BF16 shared expert synchronously on main stream via cuBLAS
+                let s1_buf = *self.scratch.d_scratch1.device_ptr();
+                let s2_buf = *self.scratch.d_scratch2.device_ptr();
+                let shared_inter = sw1_bf16.n / (if gated { 2 } else { 1 });
+
+                // w1 GEMM
+                self.cublas_bf16_gemm(hidden, sw1_bf16, s1_buf, m)?;
+
+                if gated {
+                    let act_t = std::cmp::max(32, ((std::cmp::min(1024, shared_inter) + 31) / 32) * 32);
+                    let mut ac0 = s2_buf; let mut ac1 = s1_buf; let mut ac2 = shared_inter as i32;
+                    let kernel = if activation == 1 { self.kernels.relu2 } else { self.kernels.silu_mul };
+                    unsafe {
+                        launch(kernel,
+                            (m as u32, 1, 1), (act_t as u32, 1, 1), 0, self.stream,
+                            &mut [
+                                &mut ac0 as *mut _ as *mut std::ffi::c_void,
+                                &mut ac1 as *mut _ as *mut std::ffi::c_void,
+                                &mut ac2 as *mut _ as *mut std::ffi::c_void,
+                            ],
+                        )?;
+                    }
+                    // w2 GEMM
+                    self.cublas_bf16_gemm(s2_buf, sw2_bf16, s1_buf, m)?;
+                } else {
+                    let act_t = std::cmp::max(32, ((std::cmp::min(1024, shared_inter) + 31) / 32) * 32);
+                    let mut ac0 = s1_buf; let mut ac1 = s1_buf; let mut ac2 = shared_inter as i32;
+                    unsafe {
+                        launch(self.kernels.relu2,
+                            (m as u32, 1, 1), (act_t as u32, 1, 1), 0, self.stream,
+                            &mut [
+                                &mut ac0 as *mut _ as *mut std::ffi::c_void,
+                                &mut ac1 as *mut _ as *mut std::ffi::c_void,
+                                &mut ac2 as *mut _ as *mut std::ffi::c_void,
+                            ],
+                        )?;
+                    }
+                    self.cublas_bf16_gemm(s1_buf, sw2_bf16, s2_buf, m)?;
+                    self.memcpy_d2d(s1_buf, s2_buf, (m * h * 2) as u64)?;
+                }
             } else {
-                // Run shared expert synchronously on main stream
+                // Run shared expert synchronously on main stream (Marlin)
                 let sw1 = lw.shared_w1.as_ref().ok_or("missing shared w1")?;
                 let sw2 = lw.shared_w2.as_ref().ok_or("missing shared w2")?;
                 let s1_buf = *self.scratch.d_scratch1.device_ptr();
@@ -3995,7 +4039,6 @@ impl PrefillEngine {
 
                 if gated {
                     if diag && diag_moe_detail && layer_idx < diag_layer_limit {
-                        // s1_buf has w1 output: [m, w13_n] BF16
                         let w1_norm = self.diag_l2_norm(s1_buf, 0, sw1.n, sw1.n);
                         eprintln!("[DIAG] layer{:02}_moe shared_w1_out_norm pos0={:.6} (dim={})", layer_idx, w1_norm, sw1.n);
                     }
@@ -4015,7 +4058,6 @@ impl PrefillEngine {
                     }
 
                     if diag && diag_moe_detail && layer_idx < diag_layer_limit {
-                        // s2_buf has activation output: [m, shared_inter] BF16
                         let act_norm = self.diag_l2_norm(s2_buf, 0, shared_inter, shared_inter);
                         eprintln!("[DIAG] layer{:02}_moe shared_act_out_norm pos0={:.6} (dim={})", layer_idx, act_norm, shared_inter);
                     }
@@ -4176,6 +4218,11 @@ impl PrefillEngine {
         let s1_buf = *self.scratch.d_scratch1.device_ptr();
         let s2_buf = *self.scratch.d_scratch2.device_ptr();
 
+        // BF16 validation mode: use cuBLAS on shared_stream
+        if let (Some(sw1_bf16), Some(sw2_bf16)) = (&lw.shared_w1_bf16, &lw.shared_w2_bf16) {
+            return self.launch_shared_expert_async_bf16(layer_idx, m, sw1_bf16, sw2_bf16);
+        }
+
         let sw1 = lw.shared_w1.as_ref().ok_or("missing shared w1")?;
         let sw2 = lw.shared_w2.as_ref().ok_or("missing shared w2")?;
         let shared_inter = sw1.n / (if gated { 2 } else { 1 });
@@ -4292,6 +4339,152 @@ impl PrefillEngine {
         Ok(())
     }
 
+    /// BF16 shared expert via cuBLAS on shared_stream.
+    fn launch_shared_expert_async_bf16(
+        &self, layer_idx: usize, m: usize,
+        sw1: &Bf16Weight, sw2: &Bf16Weight,
+    ) -> Result<(), String> {
+        let lw = &self.layer_weights[layer_idx];
+        let h = self.config.hidden_size;
+        let gated = lw.moe_gated;
+        let activation = lw.moe_activation;
+        let hidden = *self.scratch.d_hidden.device_ptr();
+        let s1_buf = *self.scratch.d_scratch1.device_ptr();
+        let s2_buf = *self.scratch.d_scratch2.device_ptr();
+        let shared_inter = sw1.n / (if gated { 2 } else { 1 });
+
+        // w1 GEMM on shared_stream: [m, h] @ [w13_n, h]^T -> [m, w13_n]
+        {
+            let alpha: f32 = 1.0;
+            let beta: f32 = 0.0;
+            unsafe {
+                use cudarc::cublas::sys as cublas_sys;
+                use cudarc::cublas::result as cublas_result;
+                cublas_result::set_stream(
+                    self.cublas_handle,
+                    self.shared_stream as cublas_sys::cudaStream_t,
+                ).map_err(|e| format!("cublas set_stream shared: {:?}", e))?;
+                cublas_result::gemm_ex(
+                    self.cublas_handle,
+                    cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                    cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                    sw1.n as i32, m as i32, sw1.k as i32,
+                    &alpha as *const f32 as *const std::ffi::c_void,
+                    sw1.ptr as *const std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_16BF, sw1.k as i32,
+                    hidden as *const std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_16BF, sw1.k as i32,
+                    &beta as *const f32 as *const std::ffi::c_void,
+                    s1_buf as *mut std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_16BF, sw1.n as i32,
+                    cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                ).map_err(|e| format!("shared w1 BF16 GEMM: {:?}", e))?;
+            }
+        }
+
+        // Activation on shared_stream
+        if gated {
+            let act_t = std::cmp::max(32, ((std::cmp::min(1024, shared_inter) + 31) / 32) * 32);
+            let mut ac0 = s2_buf; let mut ac1 = s1_buf; let mut ac2 = shared_inter as i32;
+            let kernel = if activation == 1 { self.kernels.relu2 } else { self.kernels.silu_mul };
+            unsafe {
+                launch(kernel,
+                    (m as u32, 1, 1), (act_t as u32, 1, 1), 0, self.shared_stream,
+                    &mut [
+                        &mut ac0 as *mut _ as *mut std::ffi::c_void,
+                        &mut ac1 as *mut _ as *mut std::ffi::c_void,
+                        &mut ac2 as *mut _ as *mut std::ffi::c_void,
+                    ],
+                )?;
+            }
+            // w2 GEMM on shared_stream
+            let alpha: f32 = 1.0;
+            let beta: f32 = 0.0;
+            unsafe {
+                use cudarc::cublas::sys as cublas_sys;
+                use cudarc::cublas::result as cublas_result;
+                cublas_result::set_stream(
+                    self.cublas_handle,
+                    self.shared_stream as cublas_sys::cudaStream_t,
+                ).map_err(|e| format!("cublas set_stream shared: {:?}", e))?;
+                cublas_result::gemm_ex(
+                    self.cublas_handle,
+                    cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                    cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                    sw2.n as i32, m as i32, sw2.k as i32,
+                    &alpha as *const f32 as *const std::ffi::c_void,
+                    sw2.ptr as *const std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_16BF, sw2.k as i32,
+                    s2_buf as *const std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_16BF, sw2.k as i32,
+                    &beta as *const f32 as *const std::ffi::c_void,
+                    s1_buf as *mut std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_16BF, sw2.n as i32,
+                    cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                ).map_err(|e| format!("shared w2 BF16 GEMM: {:?}", e))?;
+            }
+        } else {
+            let act_t = std::cmp::max(32, ((std::cmp::min(1024, shared_inter) + 31) / 32) * 32);
+            let mut ac0 = s1_buf; let mut ac1 = s1_buf; let mut ac2 = shared_inter as i32;
+            unsafe {
+                launch(self.kernels.relu2,
+                    (m as u32, 1, 1), (act_t as u32, 1, 1), 0, self.shared_stream,
+                    &mut [
+                        &mut ac0 as *mut _ as *mut std::ffi::c_void,
+                        &mut ac1 as *mut _ as *mut std::ffi::c_void,
+                        &mut ac2 as *mut _ as *mut std::ffi::c_void,
+                    ],
+                )?;
+            }
+            // w2 GEMM
+            let alpha: f32 = 1.0;
+            let beta: f32 = 0.0;
+            unsafe {
+                use cudarc::cublas::sys as cublas_sys;
+                use cudarc::cublas::result as cublas_result;
+                cublas_result::set_stream(
+                    self.cublas_handle,
+                    self.shared_stream as cublas_sys::cudaStream_t,
+                ).map_err(|e| format!("cublas set_stream shared: {:?}", e))?;
+                cublas_result::gemm_ex(
+                    self.cublas_handle,
+                    cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                    cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                    sw2.n as i32, m as i32, sw2.k as i32,
+                    &alpha as *const f32 as *const std::ffi::c_void,
+                    sw2.ptr as *const std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_16BF, sw2.k as i32,
+                    s1_buf as *const std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_16BF, sw2.k as i32,
+                    &beta as *const f32 as *const std::ffi::c_void,
+                    s2_buf as *mut std::ffi::c_void,
+                    cublas_sys::cudaDataType::CUDA_R_16BF, sw2.n as i32,
+                    cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                ).map_err(|e| format!("shared w2 BF16 GEMM: {:?}", e))?;
+            }
+            // Copy result from s2 to s1 on shared_stream
+            unsafe {
+                cuda_sys::lib().cuMemcpyDtoDAsync_v2(
+                    s1_buf, s2_buf, (m * h * 2) as usize, self.shared_stream);
+            }
+        }
+
+        // Restore cuBLAS to main stream
+        unsafe {
+            use cudarc::cublas::sys as cublas_sys;
+            use cudarc::cublas::result as cublas_result;
+            let _ = cublas_result::set_stream(
+                self.cublas_handle,
+                self.stream as cublas_sys::cudaStream_t,
+            );
+        }
+
+        Ok(())
+    }
+
     /// Preload next MoE layer's expert weights into the other buffer (gap 2).
     /// Called after forward_moe completes for the current layer.
     fn preload_next_moe_layer(&mut self, current_layer: usize, num_layers: usize) -> Result<(), String> {
@@ -4402,6 +4595,11 @@ impl PrefillEngine {
         let s1_buf = *self.scratch.d_scratch1.device_ptr();
         let s2_buf = *self.scratch.d_scratch2.device_ptr();
         let shared_ws_len = self.config.sms * 4;
+
+        // BF16 validation mode: reuse the async BF16 method
+        if let (Some(sw1_bf16), Some(sw2_bf16)) = (&lw.shared_w1_bf16, &lw.shared_w2_bf16) {
+            return self.launch_shared_expert_async_bf16(layer_idx, m, sw1_bf16, sw2_bf16);
+        }
 
         let sw1 = lw.shared_w1.as_ref().ok_or("missing shared w1")?;
         let sw2 = lw.shared_w2.as_ref().ok_or("missing shared w2")?;
@@ -4570,6 +4768,17 @@ impl PrefillEngine {
         num_groups_w13: usize, num_groups_w2: usize,
         gated: bool, activation: u8,
     ) -> Result<(), String> {
+        if bits == 16 {
+            // BF16 validation mode: use cuBLAS GEMM instead of Marlin
+            return self.run_expert_gemm_bf16(
+                gathered_slice, expert_out, gate_up_buf, inter_buf,
+                w13_packed, w2_packed,
+                count, offset,
+                w13_n, h, inter,
+                gated, activation,
+            );
+        }
+
         // w1 GEMM: [count, hidden] @ w13 -> [count, w13_n]
         let w13 = MarlinWeight {
             packed: w13_packed, scales: w13_scales,
@@ -4630,6 +4839,96 @@ impl PrefillEngine {
                 group_size: gs, num_bits: bits,
             };
             self.marlin_gemm(w1_out, &w2, expert_out + (offset * h * 2) as u64, count)?;
+        }
+        Ok(())
+    }
+
+    /// BF16 expert GEMM via cuBLAS (validation mode).
+    /// w13_data and w2_data are raw BF16 weights on GPU (row-major [rows, cols]).
+    fn run_expert_gemm_bf16(
+        &self,
+        gathered_slice: u64, expert_out: u64, gate_up_buf: u64, inter_buf: u64,
+        w13_data: u64, w2_data: u64,
+        count: usize, offset: usize,
+        w13_n: usize, h: usize, inter: usize,
+        gated: bool, activation: u8,
+    ) -> Result<(), String> {
+        // Diagnostic: check first expert's weight data on GPU (layer 0 only)
+        static BF16_DIAG_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !BF16_DIAG_DONE.load(std::sync::atomic::Ordering::Relaxed) {
+            BF16_DIAG_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.stream_sync()?;
+            // Read first 64 BF16 values from w13 weight on GPU
+            let n_vals = 64.min(w13_n * h);
+            let mut h_w13 = vec![0u16; n_vals];
+            unsafe {
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    h_w13.as_mut_ptr() as *mut _, w13_data, n_vals * 2,
+                );
+            }
+            let vals: Vec<f32> = h_w13.iter().map(|&v| half::bf16::from_bits(v).to_f32()).collect();
+            let norm: f32 = vals.iter().map(|v| v*v).sum::<f32>().sqrt();
+            let non_zero = vals.iter().filter(|&&v| v != 0.0).count();
+            eprintln!("[BF16-DIAG] First expert w13 GPU data: norm={:.6}, non_zero={}/{}, first8={:.4?}",
+                norm, non_zero, n_vals, &vals[..8.min(vals.len())]);
+            // Also check input data (gathered_slice)
+            let n_in = 8.min(h);
+            let mut h_in = vec![0u16; n_in];
+            unsafe {
+                cuda_sys::lib().cuMemcpyDtoH_v2(
+                    h_in.as_mut_ptr() as *mut _, gathered_slice, n_in * 2,
+                );
+            }
+            let in_vals: Vec<f32> = h_in.iter().map(|&v| half::bf16::from_bits(v).to_f32()).collect();
+            eprintln!("[BF16-DIAG] First expert gathered input first8={:.4?}", in_vals);
+        }
+
+        // w1 GEMM: [count, h] @ [w13_n, h]^T -> [count, w13_n]
+        // BF16 weight is row-major [w13_n, h], need to transpose
+        let w13 = Bf16Weight { ptr: w13_data, n: w13_n, k: h };
+        self.cublas_bf16_gemm(gathered_slice, &w13, gate_up_buf + (offset * w13_n * 2) as u64, count)?;
+
+        if gated {
+            let act_t = std::cmp::max(32, ((std::cmp::min(1024, inter) + 31) / 32) * 32);
+            let inter_slice = inter_buf + (offset * inter * 2) as u64;
+            let gate_up_slice = gate_up_buf + (offset * w13_n * 2) as u64;
+            let mut ac0 = inter_slice;
+            let mut ac1 = gate_up_slice;
+            let mut ac2 = inter as i32;
+            let kernel = if activation == 1 { self.kernels.relu2 } else { self.kernels.silu_mul };
+            unsafe {
+                launch(kernel,
+                    (count as u32, 1, 1), (act_t as u32, 1, 1), 0, self.stream,
+                    &mut [
+                        &mut ac0 as *mut _ as *mut std::ffi::c_void,
+                        &mut ac1 as *mut _ as *mut std::ffi::c_void,
+                        &mut ac2 as *mut _ as *mut std::ffi::c_void,
+                    ],
+                )?;
+            }
+
+            // w2 GEMM: [count, inter] @ [h, inter]^T -> [count, h]
+            let w2 = Bf16Weight { ptr: w2_data, n: h, k: inter };
+            self.cublas_bf16_gemm(inter_slice, &w2, expert_out + (offset * h * 2) as u64, count)?;
+        } else {
+            // Ungated: relu2 directly on w1 output, then w2
+            let act_t = std::cmp::max(32, ((std::cmp::min(1024, inter) + 31) / 32) * 32);
+            let w1_out = gate_up_buf + (offset * w13_n * 2) as u64;
+            let mut ac0 = w1_out;
+            let mut ac1 = w1_out;
+            let mut ac2 = inter as i32;
+            unsafe {
+                launch(self.kernels.relu2,
+                    (count as u32, 1, 1), (act_t as u32, 1, 1), 0, self.stream,
+                    &mut [
+                        &mut ac0 as *mut _ as *mut std::ffi::c_void,
+                        &mut ac1 as *mut _ as *mut std::ffi::c_void,
+                        &mut ac2 as *mut _ as *mut std::ffi::c_void,
+                    ],
+                )?;
+            }
+            let w2 = Bf16Weight { ptr: w2_data, n: h, k: inter };
+            self.cublas_bf16_gemm(w1_out, &w2, expert_out + (offset * h * 2) as u64, count)?;
         }
         Ok(())
     }
@@ -5046,7 +5345,7 @@ pub fn allocate_scratch(
             device.alloc_zeros::<u8>(w13_size).map_err(|e| format!("alloc expert_w13_packed_a: {e}"))?
         },
         d_expert_w13_scales_a: {
-            let scale_size = if config.n_routed_experts > 0 {
+            let scale_size = if config.n_routed_experts > 0 && config.group_size > 0 {
                 let w13_n = if config.moe_gated { 2 * moe_inter } else { moe_inter };
                 (h / config.group_size) * w13_n * 2
             } else { 1 };
@@ -5059,7 +5358,7 @@ pub fn allocate_scratch(
             device.alloc_zeros::<u8>(w2_size).map_err(|e| format!("alloc expert_w2_packed_a: {e}"))?
         },
         d_expert_w2_scales_a: {
-            let scale_size = if config.n_routed_experts > 0 {
+            let scale_size = if config.n_routed_experts > 0 && config.group_size > 0 {
                 (moe_inter / config.group_size) * h * 2
             } else { 1 };
             device.alloc_zeros::<u8>(scale_size).map_err(|e| format!("alloc expert_w2_scales_a: {e}"))?
@@ -5072,7 +5371,7 @@ pub fn allocate_scratch(
             device.alloc_zeros::<u8>(w13_size).map_err(|e| format!("alloc expert_w13_packed_b: {e}"))?
         },
         d_expert_w13_scales_b: {
-            let scale_size = if config.n_routed_experts > 0 {
+            let scale_size = if config.n_routed_experts > 0 && config.group_size > 0 {
                 let w13_n = if config.moe_gated { 2 * moe_inter } else { moe_inter };
                 (h / config.group_size) * w13_n * 2
             } else { 1 };
@@ -5085,7 +5384,7 @@ pub fn allocate_scratch(
             device.alloc_zeros::<u8>(w2_size).map_err(|e| format!("alloc expert_w2_packed_b: {e}"))?
         },
         d_expert_w2_scales_b: {
-            let scale_size = if config.n_routed_experts > 0 {
+            let scale_size = if config.n_routed_experts > 0 && config.group_size > 0 {
                 (moe_inter / config.group_size) * h * 2
             } else { 1 };
             device.alloc_zeros::<u8>(scale_size).map_err(|e| format!("alloc expert_w2_scales_b: {e}"))?

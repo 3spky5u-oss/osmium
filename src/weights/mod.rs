@@ -9,7 +9,7 @@
 pub mod marlin;
 pub mod safetensors_io;
 
-use crate::weights::marlin::{quantize_int4, quantize_int8, QuantizedInt4, QuantizedInt8, DEFAULT_GROUP_SIZE};
+use crate::weights::marlin::{quantize_int4, quantize_int8, QuantizedInt4, QuantizedInt8, QuantizedBf16, DEFAULT_GROUP_SIZE};
 use crate::weights::safetensors_io::{MmapSafetensors, Dtype};
 use memmap2::Mmap;
 use pyo3::prelude::*;
@@ -255,10 +255,11 @@ impl ModelConfig {
     }
 }
 
-/// Quantized weight matrix — either INT4 or INT8.
+/// Weight matrix — INT4, INT8, or raw BF16 (validation mode).
 pub enum QuantWeight {
     Int4(QuantizedInt4),
     Int8(QuantizedInt8),
+    Bf16(QuantizedBf16),
 }
 
 impl QuantWeight {
@@ -266,6 +267,7 @@ impl QuantWeight {
         match self {
             QuantWeight::Int4(q) => q.rows,
             QuantWeight::Int8(q) => q.rows,
+            QuantWeight::Bf16(q) => q.rows,
         }
     }
 
@@ -273,6 +275,7 @@ impl QuantWeight {
         match self {
             QuantWeight::Int4(q) => q.cols,
             QuantWeight::Int8(q) => q.cols,
+            QuantWeight::Bf16(q) => q.cols,
         }
     }
 
@@ -280,6 +283,7 @@ impl QuantWeight {
         match self {
             QuantWeight::Int4(q) => q.group_size,
             QuantWeight::Int8(q) => q.group_size,
+            QuantWeight::Bf16(_) => 0, // no groups for BF16
         }
     }
 
@@ -288,14 +292,23 @@ impl QuantWeight {
         match self {
             QuantWeight::Int4(q) => q.packed.len() * 4 + q.scales.len() * 2,
             QuantWeight::Int8(q) => q.data.len() + q.scales.len() * 2,
+            QuantWeight::Bf16(q) => q.data.len() * 2,
         }
     }
 
-    /// Return as INT4 ref (panics if INT8).
+    /// Return as INT4 ref (panics if not INT4).
     pub fn as_int4(&self) -> &QuantizedInt4 {
         match self {
             QuantWeight::Int4(q) => q,
-            QuantWeight::Int8(_) => panic!("Expected INT4 weight, got INT8"),
+            _ => panic!("Expected INT4 weight, got {:?}-bit", self.num_bits()),
+        }
+    }
+
+    /// Return as BF16 ref (panics if not BF16).
+    pub fn as_bf16(&self) -> &QuantizedBf16 {
+        match self {
+            QuantWeight::Bf16(q) => q,
+            _ => panic!("Expected BF16 weight, got {:?}-bit", self.num_bits()),
         }
     }
 
@@ -304,13 +317,20 @@ impl QuantWeight {
         match self {
             QuantWeight::Int4(_) => 4,
             QuantWeight::Int8(_) => 8,
+            QuantWeight::Bf16(_) => 16,
         }
     }
 
     /// Create an empty (zero-size) QuantWeight for ungated experts.
     /// Used as a dummy gate_proj when the model has no gate projection.
     pub fn empty(num_bits: u8) -> Self {
-        if num_bits == 8 {
+        if num_bits == 16 {
+            QuantWeight::Bf16(QuantizedBf16 {
+                data: Vec::new(),
+                rows: 0,
+                cols: 0,
+            })
+        } else if num_bits == 8 {
             QuantWeight::Int8(QuantizedInt8 {
                 data: Vec::new(),
                 scales: Vec::new(),
@@ -669,15 +689,79 @@ impl UnifiedExpertWeights {
         }
     }
 
-    /// Convert from separate gate/up/down ExpertWeights to GPU-native Marlin format.
+    /// Convert from separate gate/up/down ExpertWeights to GPU-native format.
     ///
-    /// Combines gate+up into w13 [2*N, K], then Marlin-repacks both w13 and w2.
-    /// Supports both INT4 (gpu_bits=4) and INT8 (gpu_bits=8) Marlin format.
+    /// Combines gate+up into w13 [2*N, K], then Marlin-repacks (INT4/INT8) or
+    /// stores raw BF16 data (gpu_bits=16, validation mode).
     pub fn from_expert_weights_marlin(ew: &ExpertWeights, gpu_bits: u8) -> Self {
-        if gpu_bits == 4 {
+        if gpu_bits == 16 {
+            Self::from_expert_weights_bf16(ew)
+        } else if gpu_bits == 4 {
             Self::from_expert_weights_marlin_int4(ew)
         } else {
             Self::from_expert_weights_marlin_int8(ew)
+        }
+    }
+
+    /// Convert from separate gate/up/down ExpertWeights to raw BF16 format for cuBLAS.
+    /// No quantization, no Marlin repacking. Used for validation mode (gpu_bits=16).
+    fn from_expert_weights_bf16(ew: &ExpertWeights) -> Self {
+        let up = ew.up.as_bf16();
+        let ungated = ew.gate.rows() == 0;
+
+        let hidden = up.cols;       // K for w13
+        let intermediate = up.rows; // N per gate/up
+
+        // Combine gate+up into w13 as contiguous BF16 data.
+        // Layout: [gate_rows + up_rows, cols] row-major → gate data then up data.
+        // We store u16 data packed as u32 for Vec<u32> compatibility.
+        let w13_u16 = if ungated {
+            up.data.clone()
+        } else {
+            let gate = ew.gate.as_bf16();
+            // One-time diagnostic: print first 8 values of gate_proj
+            static BF16_LOAD_DIAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !BF16_LOAD_DIAG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let gate_first8: Vec<f32> = gate.data[..8.min(gate.data.len())]
+                    .iter().map(|&v| half::bf16::from_bits(v).to_f32()).collect();
+                let up_first8: Vec<f32> = up.data[..8.min(up.data.len())]
+                    .iter().map(|&v| half::bf16::from_bits(v).to_f32()).collect();
+                eprintln!("[BF16-LOAD] Expert 0 gate_proj [{},{}] first8={:.4?}", gate.rows, gate.cols, gate_first8);
+                eprintln!("[BF16-LOAD] Expert 0 up_proj [{},{}] first8={:.4?}", up.rows, up.cols, up_first8);
+            }
+            let mut combined = Vec::with_capacity(gate.data.len() + up.data.len());
+            combined.extend_from_slice(&gate.data);
+            combined.extend_from_slice(&up.data);
+            combined
+        };
+
+        let down = ew.down.as_bf16();
+        let w2_u16 = down.data.clone();
+
+        // Reinterpret Vec<u16> as Vec<u32> (2 bf16 per u32)
+        let w13_packed = reinterpret_u16_as_u32(w13_u16);
+        let w2_packed = reinterpret_u16_as_u32(w2_u16);
+
+        let w13_n = if ungated { intermediate } else { 2 * intermediate };
+
+        UnifiedExpertWeights {
+            w13_packed,
+            w13_scales: Vec::new(), // no scales for BF16
+            w2_packed,
+            w2_scales: Vec::new(),
+            hidden_size: hidden,
+            intermediate_size: intermediate,
+            group_size: 0, // unused for BF16
+            num_bits: 16,
+            w2_bits: 16,
+            gate_bias: None,
+            up_bias: None,
+            down_bias: None,
+            tiled: false,
+            gated: !ungated,
+            activation_type: if ungated { 1 } else { 0 },
+            contiguous_backing: None,
+            borrowed: false,
         }
     }
 
@@ -1490,11 +1574,45 @@ impl WeightStore {
         let effective_gs_hint = Self::detect_group_size_hint(model_dir, &config);
         let cache_gs = effective_gs_hint.unwrap_or(group_size);
 
-        // ── Phase 1: Load/build GPU Marlin cache → experts_gpu ──
+        // ── Phase 1: Load/build GPU expert weights → experts_gpu ──
         let mut experts_gpu: Vec<Vec<UnifiedExpertWeights>> = Vec::new();
         let mut shared_experts_gpu: Vec<UnifiedExpertWeights> = Vec::new();
         let mut layer_backings_gpu: Vec<LayerExpertBacking> = Vec::new();
         let mut effective_gs = cache_gs;
+
+        // BF16 validation mode: load directly from safetensors, no cache
+        if gpu_num_bits == 16 {
+            log::info!("BF16 validation mode: loading experts directly from safetensors (no cache)");
+            let (gpu_exp, gpu_shared) = Self::load_experts_bf16_direct(
+                model_dir, &config, total_moe_layers, moe_start, num_moe_layers,
+            )?;
+            log::info!(
+                "Loaded BF16 experts in {:.1}s: {} layers, {} experts (+ {} shared)",
+                start.elapsed().as_secs_f64(),
+                num_moe_layers, config.n_routed_experts, gpu_shared.len(),
+            );
+            experts_gpu = gpu_exp;
+            shared_experts_gpu = gpu_shared;
+            // No layer backings for BF16 (no contiguous cache)
+            effective_gs = 0;
+
+            // Skip CPU experts and return
+            return Ok(WeightStore {
+                experts: Vec::new(),
+                shared_experts: Vec::new(),
+                experts_gpu,
+                shared_experts_gpu,
+                experts_cpu: Vec::new(),
+                shared_experts_cpu: Vec::new(),
+                experts_gguf: Vec::new(),
+                shared_experts_gguf: Vec::new(),
+                config: config.clone(),
+                group_size: 0,
+                layer_backings_gpu,
+                cpu_num_bits: cpu_num_bits,
+                gpu_num_bits: 16,
+            });
+        }
 
         // Try loading existing Marlin cache
         let mut gpu_loaded = false;
@@ -2096,6 +2214,9 @@ impl WeightStore {
                     migrate_vec_to_node(&mut q.data, node)
                         && migrate_vec_to_node(&mut q.scales, node)
                 }
+                QuantWeight::Bf16(q) => {
+                    migrate_vec_to_node(&mut q.data, node)
+                }
             }
         }
 
@@ -2201,6 +2322,125 @@ impl WeightStore {
             shared.len(), start.elapsed().as_secs_f64(),
         );
         Ok(shared)
+    }
+
+    /// Load expert weights directly as BF16 from safetensors (no cache, no quantization).
+    /// Used for validation mode (gpu_bits=16) to verify Rust prefill correctness.
+    fn load_experts_bf16_direct(
+        model_dir: &Path,
+        config: &ModelConfig,
+        total_moe_layers: usize,
+        moe_start: usize,
+        num_moe_layers: usize,
+    ) -> Result<(Vec<Vec<UnifiedExpertWeights>>, Vec<UnifiedExpertWeights>), String> {
+        eprintln!("  \x1b[1;33m▸ Loading BF16 experts directly from safetensors (validation mode)\x1b[0m");
+
+        // Parse safetensors index
+        let index_path = model_dir.join("model.safetensors.index.json");
+        let index_str = std::fs::read_to_string(&index_path)
+            .map_err(|e| format!("Failed to read safetensors index: {e}"))?;
+        let index: SafetensorsIndex = serde_json::from_str(&index_str)
+            .map_err(|e| format!("Failed to parse safetensors index: {e}"))?;
+
+        // Determine which shard files we need
+        let moe_abs_layers: std::collections::HashSet<usize> = (moe_start..(moe_start + num_moe_layers))
+            .map(|mi| config.moe_abs_layer(mi))
+            .collect();
+        let mut needed_shards: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (tensor_name, shard_name) in &index.weight_map {
+            if let Some(layer_num) = parse_layer_number(tensor_name) {
+                if moe_abs_layers.contains(&layer_num) {
+                    needed_shards.insert(shard_name.clone());
+                }
+            }
+        }
+        let mut shard_names: Vec<String> = needed_shards.into_iter().collect();
+        shard_names.sort();
+
+        log::info!("BF16 direct load: opening {}/{} safetensors shards",
+            shard_names.len(),
+            index.weight_map.values().collect::<std::collections::HashSet<_>>().len(),
+        );
+
+        // Open shards via mmap
+        let mut shards: HashMap<String, MmapSafetensors> = HashMap::new();
+        for name in &shard_names {
+            let path = model_dir.join(name);
+            let st = MmapSafetensors::open(&path)
+                .map_err(|e| format!("Failed to open {name}: {e}"))?;
+            shards.insert(name.clone(), st);
+        }
+
+        let layers_prefix = detect_expert_prefix(&index.weight_map)?;
+        let experts_gated = has_gate_proj_experts(&index.weight_map);
+        let expert_sublayer = detect_expert_sublayer(&index.weight_map);
+        let shared_name = detect_shared_expert_name(&index.weight_map);
+
+        let overall_start = std::time::Instant::now();
+        let mut experts_gpu: Vec<Vec<UnifiedExpertWeights>> = Vec::new();
+
+        // Load routed experts layer by layer
+        for moe_idx in moe_start..(moe_start + num_moe_layers) {
+            let layer_idx = config.moe_abs_layer(moe_idx);
+            let layer_start = std::time::Instant::now();
+
+            let mut layer_experts = Vec::with_capacity(config.n_routed_experts);
+            for eidx in 0..config.n_routed_experts {
+                let prefix = format!("{layers_prefix}.layers.{layer_idx}.{expert_sublayer}.experts.{eidx}");
+                let (gate, up, down) = if !experts_gated {
+                    load_and_quantize_expert_ungated(
+                        &prefix, &index.weight_map, &shards, 0, 16,
+                    )?
+                } else {
+                    load_and_quantize_expert(
+                        &prefix, &index.weight_map, &shards, 0, 16,
+                    )?
+                };
+                let ew = ExpertWeights { gate, up, down };
+                layer_experts.push(UnifiedExpertWeights::from_expert_weights_marlin(&ew, 16));
+            }
+
+            let elapsed = layer_start.elapsed();
+            let expert_mb: f64 = layer_experts.iter()
+                .map(|e| (e.w13_packed.len() * 4 + e.w2_packed.len() * 4) as f64)
+                .sum::<f64>() / (1024.0 * 1024.0);
+            eprintln!(
+                "    Layer {}/{}: {} experts, {:.0} MB BF16, {:.1}s",
+                moe_idx - moe_start + 1, num_moe_layers,
+                layer_experts.len(), expert_mb, elapsed.as_secs_f64(),
+            );
+            experts_gpu.push(layer_experts);
+        }
+
+        // Load shared experts
+        let mut shared_experts_gpu: Vec<UnifiedExpertWeights> = Vec::new();
+        if config.n_shared_experts > 0 {
+            log::info!("Loading BF16 shared experts ({} layers)...", num_moe_layers);
+            for moe_idx in moe_start..(moe_start + num_moe_layers) {
+                let layer_idx = config.moe_abs_layer(moe_idx);
+                let prefix = format!("{layers_prefix}.layers.{layer_idx}.{expert_sublayer}.{shared_name}");
+                let (gate, up, down) = if experts_gated {
+                    load_and_quantize_expert(
+                        &prefix, &index.weight_map, &shards, 0, 16,
+                    )?
+                } else {
+                    load_and_quantize_expert_ungated(
+                        &prefix, &index.weight_map, &shards, 0, 16,
+                    )?
+                };
+                let ew = ExpertWeights { gate, up, down };
+                shared_experts_gpu.push(UnifiedExpertWeights::from_expert_weights_marlin(&ew, 16));
+            }
+        }
+
+        let total_elapsed = overall_start.elapsed();
+        let total_experts = experts_gpu.iter().map(|l| l.len()).sum::<usize>();
+        eprintln!(
+            "  \x1b[0;32mLoaded {} experts + {} shared in {:.1}s (BF16 direct)\x1b[0m",
+            total_experts, shared_experts_gpu.len(), total_elapsed.as_secs_f64(),
+        );
+
+        Ok((experts_gpu, shared_experts_gpu))
     }
 
     fn streaming_build_marlin_cache(
@@ -5196,6 +5436,16 @@ fn write_quantized<W: Write>(w: &mut W, q: &QuantWeight) -> Result<(), String> {
             w.write_all(scales_bytes)
                 .map_err(|e| format!("Write scales error: {e}"))?;
         }
+        QuantWeight::Bf16(q16) => {
+            let data_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    q16.data.as_ptr() as *const u8,
+                    q16.data.len() * 2,
+                )
+            };
+            w.write_all(data_bytes)
+                .map_err(|e| format!("Write BF16 data error: {e}"))?;
+        }
     }
     Ok(())
 }
@@ -5808,7 +6058,7 @@ fn load_and_quantize_weight(
     }
 }
 
-/// Load a BF16 expert's gate/up/down projections and quantize to INT4 or INT8.
+/// Load a BF16 expert's gate/up/down projections and quantize to INT4, INT8, or keep as BF16.
 fn load_and_quantize_expert(
     prefix: &str,
     weight_map: &HashMap<String, String>,
@@ -5816,7 +6066,36 @@ fn load_and_quantize_expert(
     group_size: usize,
     num_bits: u8,
 ) -> Result<(QuantWeight, QuantWeight, QuantWeight), String> {
-    if num_bits == 4 {
+    if num_bits == 16 {
+        // BF16 validation mode: load raw BF16 data, no quantization
+        let load_bf16 = |proj_name: &str| -> Result<QuantWeight, String> {
+            let tensor_name = format!("{prefix}.{proj_name}.weight");
+            let shard_name = weight_map.get(&tensor_name)
+                .ok_or_else(|| format!("Tensor not found in index: {tensor_name}"))?;
+            let shard = shards.get(shard_name)
+                .ok_or_else(|| format!("Shard not loaded: {shard_name}"))?;
+            let info = shard.tensor_info(&tensor_name)
+                .ok_or_else(|| format!("Tensor not in shard: {tensor_name}"))?;
+            let rows = info.shape[0];
+            let cols = info.shape[1];
+            if info.dtype.is_fp8() {
+                let fp8_data: &[u8] = shard.tensor_as_slice(&tensor_name)
+                    .map_err(|e| format!("Failed to read {tensor_name}: {e}"))?;
+                let scale_name = format!("{tensor_name}_scale_inv");
+                let scale = load_fp8_scale(&scale_name, weight_map, shards)?;
+                let bf16_data = dequant_fp8_to_bf16(fp8_data, scale);
+                Ok(QuantWeight::Bf16(QuantizedBf16 { data: bf16_data, rows, cols }))
+            } else {
+                let bf16_data: &[u16] = shard.tensor_as_slice(&tensor_name)
+                    .map_err(|e| format!("Failed to read {tensor_name}: {e}"))?;
+                Ok(QuantWeight::Bf16(QuantizedBf16 { data: bf16_data.to_vec(), rows, cols }))
+            }
+        };
+        let g = load_bf16("gate_proj")?;
+        let u = load_bf16("up_proj")?;
+        let d = load_bf16("down_proj")?;
+        Ok((g, u, d))
+    } else if num_bits == 4 {
         let g = QuantWeight::Int4(load_and_quantize_weight(
             prefix, "gate_proj", weight_map, shards, group_size,
         )?);
@@ -5869,7 +6148,35 @@ fn load_and_quantize_expert_ungated(
     group_size: usize,
     num_bits: u8,
 ) -> Result<(QuantWeight, QuantWeight, QuantWeight), String> {
-    if num_bits == 4 {
+    if num_bits == 16 {
+        // BF16 validation mode
+        let load_bf16 = |proj_name: &str| -> Result<QuantWeight, String> {
+            let tensor_name = format!("{prefix}.{proj_name}.weight");
+            let shard_name = weight_map.get(&tensor_name)
+                .ok_or_else(|| format!("Tensor not found in index: {tensor_name}"))?;
+            let shard = shards.get(shard_name)
+                .ok_or_else(|| format!("Shard not loaded: {shard_name}"))?;
+            let info = shard.tensor_info(&tensor_name)
+                .ok_or_else(|| format!("Tensor not in shard: {tensor_name}"))?;
+            let rows = info.shape[0];
+            let cols = info.shape[1];
+            if info.dtype.is_fp8() {
+                let fp8_data: &[u8] = shard.tensor_as_slice(&tensor_name)
+                    .map_err(|e| format!("Failed to read {tensor_name}: {e}"))?;
+                let scale_name = format!("{tensor_name}_scale_inv");
+                let scale = load_fp8_scale(&scale_name, weight_map, shards)?;
+                let bf16_data = dequant_fp8_to_bf16(fp8_data, scale);
+                Ok(QuantWeight::Bf16(QuantizedBf16 { data: bf16_data, rows, cols }))
+            } else {
+                let bf16_data: &[u16] = shard.tensor_as_slice(&tensor_name)
+                    .map_err(|e| format!("Failed to read {tensor_name}: {e}"))?;
+                Ok(QuantWeight::Bf16(QuantizedBf16 { data: bf16_data.to_vec(), rows, cols }))
+            }
+        };
+        let u = load_bf16("up_proj")?;
+        let d = load_bf16("down_proj")?;
+        Ok((QuantWeight::empty(16), u, d))
+    } else if num_bits == 4 {
         let u = QuantWeight::Int4(load_and_quantize_weight(
             prefix, "up_proj", weight_map, shards, group_size,
         )?);
@@ -5906,6 +6213,19 @@ fn load_and_quantize_expert_ungated(
         let d = load_int8("down_proj")?;
         Ok((QuantWeight::empty(8), u, d))
     }
+}
+
+/// Reinterpret Vec<u16> as Vec<u32> by packing pairs of u16 values.
+/// If the input has an odd length, pads with a zero u16.
+fn reinterpret_u16_as_u32(mut data: Vec<u16>) -> Vec<u32> {
+    if data.len() % 2 != 0 {
+        data.push(0);
+    }
+    let len = data.len() / 2;
+    let ptr = data.as_ptr() as *const u32;
+    let result = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+    std::mem::forget(data); // don't double-free
+    result
 }
 
 /// Load a per-tensor FP8 scale_inv value. Handles both BF16 scalar and FP32 scalar formats.
