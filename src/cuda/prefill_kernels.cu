@@ -1700,6 +1700,275 @@ extern "C" __global__ void la_gated_rmsnorm_kernel(
     }
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+ * Optimized BF16 LA pipeline — fused kernels for FLA path
+ * ═══════════════════════════════════════════════════════════════════════
+ *
+ * These replace the old 4-kernel conv pipeline (concat + conv + transpose + split)
+ * and the FP32 intermediate stages with an all-BF16 path.
+ * Used only when FLA is available. Non-FLA fallback uses the old FP32 path.
+ */
+
+/* ── Fused Conv1d+SiLU (BF16 in, BF16 out) ──────────────────────────── */
+/*
+ * Replaces: concat_3_bf16 + la_depthwise_conv1d_silu + transpose + la_split_conv_output
+ *
+ * Reads q,k,v as separate BF16 inputs (no concat step).
+ * Applies depthwise conv1d + SiLU per channel.
+ * Writes q,k,v as separate BF16 outputs (no transpose/split step).
+ *
+ * Each thread processes channels in a coalesced pattern (adjacent threads
+ * read adjacent channels within same token = adjacent memory addresses).
+ *
+ * Grid: (M, 1, 1), Block: (min(1024, conv_dim_pad32), 1, 1)
+ */
+extern "C" __global__ void la_fused_conv1d_silu_bf16_kernel(
+    __nv_bfloat16* __restrict__ q_out,       /* [M, key_dim] BF16 */
+    __nv_bfloat16* __restrict__ k_out,       /* [M, key_dim] BF16 */
+    __nv_bfloat16* __restrict__ v_out,       /* [M, value_dim] BF16 */
+    const float* __restrict__ conv_state,    /* [conv_dim, kernel_dim] FP32 */
+    const __nv_bfloat16* __restrict__ q_in,  /* [M, key_dim] BF16 */
+    const __nv_bfloat16* __restrict__ k_in,  /* [M, key_dim] BF16 */
+    const __nv_bfloat16* __restrict__ v_in,  /* [M, value_dim] BF16 */
+    const float* __restrict__ weight,        /* [conv_dim, kernel_dim] FP32 */
+    int M, int key_dim, int value_dim, int kernel_dim)
+{
+    int token = blockIdx.x;
+    int conv_dim = 2 * key_dim + value_dim;
+
+    for (int ch = threadIdx.x; ch < conv_dim; ch += blockDim.x) {
+        const float* wt = weight + (int64_t)ch * kernel_dim;
+
+        float acc = 0.0f;
+        for (int w = 0; w < kernel_dim; w++) {
+            int src_pos = token + w - (kernel_dim - 1);
+            float val;
+            if (src_pos < 0) {
+                /* Read from conv state (left padding) */
+                val = conv_state[(int64_t)ch * kernel_dim + (kernel_dim + src_pos)];
+            } else {
+                /* Read from appropriate BF16 input buffer */
+                if (ch < key_dim) {
+                    val = bf16_to_float(q_in[(int64_t)src_pos * key_dim + ch]);
+                } else if (ch < 2 * key_dim) {
+                    val = bf16_to_float(k_in[(int64_t)src_pos * key_dim + (ch - key_dim)]);
+                } else {
+                    val = bf16_to_float(v_in[(int64_t)src_pos * value_dim + (ch - 2 * key_dim)]);
+                }
+            }
+            acc += val * wt[w];
+        }
+
+        /* SiLU activation */
+        float sig = 1.0f / (1.0f + expf(-acc));
+        float result = acc * sig;
+
+        /* Write to appropriate BF16 output buffer */
+        if (ch < key_dim) {
+            q_out[(int64_t)token * key_dim + ch] = float_to_bf16(result);
+        } else if (ch < 2 * key_dim) {
+            k_out[(int64_t)token * key_dim + (ch - key_dim)] = float_to_bf16(result);
+        } else {
+            v_out[(int64_t)token * value_dim + (ch - 2 * key_dim)] = float_to_bf16(result);
+        }
+    }
+}
+
+extern "C" void krasis_la_fused_conv1d_silu_bf16(
+    void* q_out, void* k_out, void* v_out,
+    const void* conv_state,
+    const void* q_in, const void* k_in, const void* v_in,
+    const void* weight,
+    int M, int key_dim, int value_dim, int kernel_dim, void* stream)
+{
+    if (M == 0) return;
+    int conv_dim = 2 * key_dim + value_dim;
+    int threads = min(1024, ((conv_dim + 31) / 32) * 32);
+    la_fused_conv1d_silu_bf16_kernel<<<M, threads, 0, (cudaStream_t)stream>>>(
+        (__nv_bfloat16*)q_out, (__nv_bfloat16*)k_out, (__nv_bfloat16*)v_out,
+        (const float*)conv_state,
+        (const __nv_bfloat16*)q_in, (const __nv_bfloat16*)k_in, (const __nv_bfloat16*)v_in,
+        (const float*)weight, M, key_dim, value_dim, kernel_dim);
+}
+
+/* ── Update conv state after fused conv ──────────────────────────────── */
+/*
+ * Copies the last kernel_dim token positions into conv_state.
+ * Tiny kernel (conv_dim * kernel_dim = ~32K values).
+ *
+ * Grid: (conv_dim, 1, 1), Block: (kernel_dim, 1, 1)
+ */
+extern "C" __global__ void la_update_conv_state_kernel(
+    float* __restrict__ conv_state,          /* [conv_dim, kernel_dim] FP32 */
+    const __nv_bfloat16* __restrict__ q_in,  /* [M, key_dim] BF16 */
+    const __nv_bfloat16* __restrict__ k_in,  /* [M, key_dim] BF16 */
+    const __nv_bfloat16* __restrict__ v_in,  /* [M, value_dim] BF16 */
+    int M, int key_dim, int value_dim, int kernel_dim)
+{
+    int ch = blockIdx.x;
+    int conv_dim = 2 * key_dim + value_dim;
+    if (ch >= conv_dim) return;
+
+    float* st = conv_state + (int64_t)ch * kernel_dim;
+
+    for (int w = threadIdx.x; w < kernel_dim; w += blockDim.x) {
+        int src_pos = M - kernel_dim + w;
+        if (src_pos < 0) {
+            /* Still from old state */
+            st[w] = st[kernel_dim + src_pos];
+        } else {
+            if (ch < key_dim) {
+                st[w] = bf16_to_float(q_in[(int64_t)src_pos * key_dim + ch]);
+            } else if (ch < 2 * key_dim) {
+                st[w] = bf16_to_float(k_in[(int64_t)src_pos * key_dim + (ch - key_dim)]);
+            } else {
+                st[w] = bf16_to_float(v_in[(int64_t)src_pos * value_dim + (ch - 2 * key_dim)]);
+            }
+        }
+    }
+}
+
+extern "C" void krasis_la_update_conv_state(
+    void* conv_state,
+    const void* q_in, const void* k_in, const void* v_in,
+    int M, int key_dim, int value_dim, int kernel_dim, void* stream)
+{
+    if (M == 0) return;
+    int conv_dim = 2 * key_dim + value_dim;
+    int threads = min(32, ((kernel_dim + 31) / 32) * 32);
+    la_update_conv_state_kernel<<<conv_dim, threads, 0, (cudaStream_t)stream>>>(
+        (float*)conv_state,
+        (const __nv_bfloat16*)q_in, (const __nv_bfloat16*)k_in, (const __nv_bfloat16*)v_in,
+        M, key_dim, value_dim, kernel_dim);
+}
+
+/* ── Gate/Beta computation with BF16 output ──────────────────────────── */
+/*
+ * Same as la_compute_gate_beta but outputs BF16 for direct FLA consumption.
+ * Eliminates 2 FP32->BF16 conversion kernels.
+ */
+extern "C" __global__ void la_compute_gate_beta_bf16_kernel(
+    __nv_bfloat16* __restrict__ beta_out,   /* [M, nv] BF16 */
+    __nv_bfloat16* __restrict__ gate_out,   /* [M, nv] BF16 */
+    const __nv_bfloat16* __restrict__ b_in, /* [M, nv] BF16 */
+    const __nv_bfloat16* __restrict__ a_in, /* [M, nv] BF16 */
+    const float* __restrict__ A_log,        /* [nv] FP32 */
+    const float* __restrict__ dt_bias,      /* [nv] FP32 */
+    int nv)
+{
+    int token = blockIdx.x;
+    const __nv_bfloat16* b_row = b_in + (int64_t)token * nv;
+    const __nv_bfloat16* a_row = a_in + (int64_t)token * nv;
+    __nv_bfloat16* beta_row = beta_out + (int64_t)token * nv;
+    __nv_bfloat16* gate_row = gate_out + (int64_t)token * nv;
+
+    for (int i = threadIdx.x; i < nv; i += blockDim.x) {
+        float b = bf16_to_float(b_row[i]);
+        float a = bf16_to_float(a_row[i]);
+        /* beta = sigmoid(b) */
+        beta_row[i] = float_to_bf16(1.0f / (1.0f + expf(-b)));
+        /* gate = -exp(A_log) * softplus(a + dt_bias) */
+        float sp = logf(1.0f + expf(a + dt_bias[i]));
+        gate_row[i] = float_to_bf16(-expf(A_log[i]) * sp);
+    }
+}
+
+/* ── Fused Repeat-Interleave + L2 Norm (BF16) ───────────────────────── */
+/*
+ * Combines repeat_interleave (nk -> nv heads) with L2 normalization.
+ * One pass: read from [M, nk, dk], normalize in FP32, write to [M, nv, dk] BF16.
+ * Eliminates separate repeat_interleave + l2norm + their intermediate buffers.
+ *
+ * Grid: (M, nv, 1), Block: (min(256, dk_pad32), 1, 1)
+ */
+extern "C" __global__ void la_fused_repeat_l2norm_bf16_kernel(
+    __nv_bfloat16* __restrict__ output,     /* [M, nv, dk] BF16 */
+    const __nv_bfloat16* __restrict__ input, /* [M, nk, dk] BF16 */
+    int nk, int dk, int hr, float scale)
+{
+    int token = blockIdx.x;
+    int v_head = blockIdx.y;
+    int k_head = v_head / hr;
+
+    const __nv_bfloat16* src = input + ((int64_t)token * nk + k_head) * dk;
+    __nv_bfloat16* dst = output + ((int64_t)token * (nk * hr) + v_head) * dk;
+
+    extern __shared__ float smem[];
+
+    /* Load values and compute sum of squares */
+    float local_ss = 0.0f;
+    for (int i = threadIdx.x; i < dk; i += blockDim.x) {
+        float v = bf16_to_float(src[i]);
+        local_ss += v * v;
+    }
+    smem[threadIdx.x] = local_ss;
+    __syncthreads();
+
+    /* Tree reduction */
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+
+    float inv_norm = rsqrtf(smem[0] + 1e-6f);
+
+    /* Normalize, scale, and write BF16 */
+    for (int i = threadIdx.x; i < dk; i += blockDim.x) {
+        float v = bf16_to_float(src[i]);
+        dst[i] = float_to_bf16(v * inv_norm * scale);
+    }
+}
+
+/* ── Gated RMSNorm with BF16 input ──────────────────────────────────── */
+/*
+ * Same as la_gated_rmsnorm but reads x as BF16 (FLA output) instead of FP32.
+ * Eliminates the BF16->FP32 conversion after FLA.
+ *
+ * x: [M, nv, dv] BF16 (FLA output)
+ * gate: [M, nv, dv] BF16 (z from uninterleave)
+ * weight: [dv] FP32
+ * out: [M, nv*dv] BF16
+ */
+extern "C" __global__ void la_gated_rmsnorm_bf16in_kernel(
+    __nv_bfloat16* __restrict__ out,          /* [M, nv*dv] BF16 */
+    const __nv_bfloat16* __restrict__ x,      /* [M, nv, dv] BF16 */
+    const __nv_bfloat16* __restrict__ gate,   /* [M, nv, dv] BF16 */
+    const float* __restrict__ weight,         /* [dv] FP32 */
+    int nv, int dv, float eps)
+{
+    int token = blockIdx.x;
+    int head = blockIdx.y;
+    const __nv_bfloat16* x_head = x + ((int64_t)token * nv + head) * dv;
+    const __nv_bfloat16* g_head = gate + ((int64_t)token * nv + head) * dv;
+    __nv_bfloat16* o_head = out + ((int64_t)token * nv + head) * dv;
+
+    extern __shared__ float smem[];
+
+    /* Compute variance in FP32 */
+    float local_ss = 0.0f;
+    for (int i = threadIdx.x; i < dv; i += blockDim.x) {
+        float v = bf16_to_float(x_head[i]);
+        local_ss += v * v;
+    }
+    smem[threadIdx.x] = local_ss;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+
+    float rms_inv = rsqrtf(smem[0] / (float)dv + eps);
+
+    /* Normalize, scale by weight, multiply by silu(gate) */
+    for (int i = threadIdx.x; i < dv; i += blockDim.x) {
+        float normed = bf16_to_float(x_head[i]) * rms_inv * weight[i];
+        float g = bf16_to_float(g_head[i]);
+        float silu_g = g / (1.0f + expf(-g));
+        o_head[i] = float_to_bf16(normed * silu_g);
+    }
+}
+
 /* ── Chunked delta rule: cumsum of g ─────────────────────────────────── */
 /*
  * Compute cumulative sum within each chunk.

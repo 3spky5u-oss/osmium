@@ -131,6 +131,12 @@ pub struct PrefillKernels {
     gated_q_split: RawCuFunc,        // split interleaved [M,H,2D] -> Q + gate
     la_split_conv_output: RawCuFunc, // split [M,conv_dim] -> q + k + v
     concat_3_bf16: RawCuFunc,       // concat q+k+v BF16 -> [M,conv_dim]
+    // Optimized BF16 LA pipeline (fused kernels for FLA path)
+    la_fused_conv1d_silu_bf16: RawCuFunc,  // fused conv+silu: 3 BF16 in -> 3 BF16 out
+    la_update_conv_state: RawCuFunc,       // update conv state after fused conv
+    la_compute_gate_beta_bf16: RawCuFunc,  // gate/beta with BF16 output
+    la_fused_repeat_l2norm_bf16: RawCuFunc, // fused repeat_interleave + l2norm BF16
+    la_gated_rmsnorm_bf16in: RawCuFunc,    // gated RMSNorm with BF16 input
     la_compute_v_new_strided: RawCuFunc,  // strided v_new (zero-copy chunk)
     la_chunk_output_strided: RawCuFunc,   // strided chunk output (zero-copy)
     la_state_update_strided: RawCuFunc,   // strided state update (zero-copy)
@@ -637,6 +643,23 @@ pub struct PrefillEngine {
     pub gqa_fa2_calls: Cell<u64>,    // number of FA2 calls (for averaging)
     pub gqa_fp8_calls: Cell<u64>,    // how many used FP8 path
     pub gqa_bf16_calls: Cell<u64>,   // how many used BF16 dequant path
+    // LA sub-component timing accumulators
+    pub t_la_proj: Cell<f64>,        // in_proj_qkvz + in_proj_ba GEMMs
+    pub t_la_uninterleave: Cell<f64>, // uninterleave qkvz + ba
+    pub t_la_conv: Cell<f64>,        // concat + conv1d + split
+    pub t_la_prep: Cell<f64>,        // gate/beta + repeat_interleave + l2norm
+    pub t_la_convert: Cell<f64>,     // FP32->BF16 conversions for FLA
+    pub t_la_fla: Cell<f64>,         // FLA kernel calls (6 steps)
+    pub t_la_postfla: Cell<f64>,     // BF16->FP32 conversion + state copy
+    pub t_la_norm: Cell<f64>,        // gated RMSNorm
+    pub t_la_oproj: Cell<f64>,       // output projection GEMM
+    // MoE sub-component timing accumulators
+    pub t_moe_gate: Cell<f64>,       // gate GEMM + top-k routing + alignment
+    pub t_moe_dma: Cell<f64>,        // expert weight DMA + sync
+    pub t_moe_w1: Cell<f64>,         // fused w1 GEMM + activation
+    pub t_moe_w2: Cell<f64>,         // fused w2 GEMM
+    pub t_moe_scatter: Cell<f64>,    // scatter-add + accum_to_bf16
+    pub t_moe_shared: Cell<f64>,     // shared expert (wait + add)
     // FLA (Flash Linear Attention) vendored kernels — replaces custom LA chunk recurrence
     pub fla: Option<FlaKernels>,
     // FLA intermediate buffers (allocated once at engine init if FLA available)
@@ -946,6 +969,21 @@ impl PrefillEngine {
             self.gqa_fa2_calls.set(0);
             self.gqa_fp8_calls.set(0);
             self.gqa_bf16_calls.set(0);
+            self.t_la_proj.set(0.0);
+            self.t_la_uninterleave.set(0.0);
+            self.t_la_conv.set(0.0);
+            self.t_la_prep.set(0.0);
+            self.t_la_convert.set(0.0);
+            self.t_la_fla.set(0.0);
+            self.t_la_postfla.set(0.0);
+            self.t_la_norm.set(0.0);
+            self.t_la_oproj.set(0.0);
+            self.t_moe_gate.set(0.0);
+            self.t_moe_dma.set(0.0);
+            self.t_moe_w1.set(0.0);
+            self.t_moe_w2.set(0.0);
+            self.t_moe_scatter.set(0.0);
+            self.t_moe_shared.set(0.0);
         }
         let mut t_norm_ms = 0.0f64;
         let mut t_attn_ms = 0.0f64;
@@ -1207,7 +1245,47 @@ impl PrefillEngine {
                 eprintln!("[PREFILL-TIMING]       gate:    {:>8.1}ms ({:>5.1}% of gqa)", gg, if t_gqa_ms > 0.0 { gg / t_gqa_ms * 100.0 } else { 0.0 });
                 eprintln!("[PREFILL-TIMING]       o_proj:  {:>8.1}ms ({:>5.1}% of gqa)", go, if t_gqa_ms > 0.0 { go / t_gqa_ms * 100.0 } else { 0.0 });
             }
+            // LA sub-component breakdown
+            let lp = self.t_la_proj.get();
+            let lu = self.t_la_uninterleave.get();
+            let lc = self.t_la_conv.get();
+            let lr = self.t_la_prep.get();
+            let lv = self.t_la_convert.get();
+            let lf = self.t_la_fla.get();
+            let lo = self.t_la_postfla.get();
+            let ln = self.t_la_norm.get();
+            let lq = self.t_la_oproj.get();
+            let la = lp + lu + lc + lr + lv + lf + lo + ln + lq;
+            if la > 0.0 {
+                eprintln!("[PREFILL-TIMING]     la breakdown (36 layers):");
+                eprintln!("[PREFILL-TIMING]       proj:    {:>8.1}ms ({:>5.1}% of la)", lp, lp / t_la_ms * 100.0);
+                eprintln!("[PREFILL-TIMING]       uninter: {:>8.1}ms ({:>5.1}% of la)", lu, lu / t_la_ms * 100.0);
+                eprintln!("[PREFILL-TIMING]       conv:    {:>8.1}ms ({:>5.1}% of la)", lc, lc / t_la_ms * 100.0);
+                eprintln!("[PREFILL-TIMING]       prep:    {:>8.1}ms ({:>5.1}% of la)", lr, lr / t_la_ms * 100.0);
+                eprintln!("[PREFILL-TIMING]       convert: {:>8.1}ms ({:>5.1}% of la)", lv, lv / t_la_ms * 100.0);
+                eprintln!("[PREFILL-TIMING]       fla:     {:>8.1}ms ({:>5.1}% of la)", lf, lf / t_la_ms * 100.0);
+                eprintln!("[PREFILL-TIMING]       postfla: {:>8.1}ms ({:>5.1}% of la)", lo, lo / t_la_ms * 100.0);
+                eprintln!("[PREFILL-TIMING]       norm:    {:>8.1}ms ({:>5.1}% of la)", ln, ln / t_la_ms * 100.0);
+                eprintln!("[PREFILL-TIMING]       o_proj:  {:>8.1}ms ({:>5.1}% of la)", lq, lq / t_la_ms * 100.0);
+            }
             eprintln!("[PREFILL-TIMING]   moe:    {:>8.1}ms ({:>5.1}%)", t_moe_ms, t_moe_ms / ms * 100.0);
+            // MoE sub-component breakdown
+            let mg = self.t_moe_gate.get();
+            let md = self.t_moe_dma.get();
+            let mw1 = self.t_moe_w1.get();
+            let mw2 = self.t_moe_w2.get();
+            let msc = self.t_moe_scatter.get();
+            let msh = self.t_moe_shared.get();
+            let ma = mg + md + mw1 + mw2 + msc + msh;
+            if ma > 0.0 {
+                eprintln!("[PREFILL-TIMING]     moe breakdown (48 layers):");
+                eprintln!("[PREFILL-TIMING]       gate:    {:>8.1}ms ({:>5.1}% of moe)", mg, if t_moe_ms > 0.0 { mg / t_moe_ms * 100.0 } else { 0.0 });
+                eprintln!("[PREFILL-TIMING]       dma:     {:>8.1}ms ({:>5.1}% of moe)", md, if t_moe_ms > 0.0 { md / t_moe_ms * 100.0 } else { 0.0 });
+                eprintln!("[PREFILL-TIMING]       w1+act:  {:>8.1}ms ({:>5.1}% of moe)", mw1, if t_moe_ms > 0.0 { mw1 / t_moe_ms * 100.0 } else { 0.0 });
+                eprintln!("[PREFILL-TIMING]       w2:      {:>8.1}ms ({:>5.1}% of moe)", mw2, if t_moe_ms > 0.0 { mw2 / t_moe_ms * 100.0 } else { 0.0 });
+                eprintln!("[PREFILL-TIMING]       scatter: {:>8.1}ms ({:>5.1}% of moe)", msc, if t_moe_ms > 0.0 { msc / t_moe_ms * 100.0 } else { 0.0 });
+                eprintln!("[PREFILL-TIMING]       shared:  {:>8.1}ms ({:>5.1}% of moe)", msh, if t_moe_ms > 0.0 { msh / t_moe_ms * 100.0 } else { 0.0 });
+            }
             eprintln!("[PREFILL-TIMING]   other:  {:>8.1}ms ({:>5.1}%)", unaccounted, unaccounted / ms * 100.0);
         }
 
@@ -2334,8 +2412,9 @@ impl PrefillEngine {
         let proj_buf = *self.scratch.d_la_proj_buf.as_ref().ok_or("no la_proj_buf")?.device_ptr();
 
         // q/k in [M, nv, dk] FP32, v in [M, nv, dv] FP32 after repeat-interleave
-        let la_q = *self.scratch.d_la_q.as_ref().ok_or("no la_q")?.device_ptr();
-        let la_k = *self.scratch.d_la_k.as_ref().ok_or("no la_k")?.device_ptr();
+        // mut: reassigned after repeat_interleave to avoid redundant memcpy_d2d
+        let mut la_q = *self.scratch.d_la_q.as_ref().ok_or("no la_q")?.device_ptr();
+        let mut la_k = *self.scratch.d_la_k.as_ref().ok_or("no la_k")?.device_ptr();
         let la_v = *self.scratch.d_la_v.as_ref().ok_or("no la_v")?.device_ptr();
         let la_z = *self.scratch.d_la_z.as_ref().ok_or("no la_z")?.device_ptr();
         let la_b = *self.scratch.d_la_b.as_ref().ok_or("no la_b")?.device_ptr();
@@ -2357,6 +2436,8 @@ impl PrefillEngine {
         let qkvz_dim = nk * group_dim;
         let ba_dim = nk * 2 * hr;
 
+        let lt = self.gqa_timing_enabled.get(); // reuse same env flag for LA timing
+        let lt0 = Instant::now();
         // 1. in_proj_qkvz GEMM: [M, hidden] -> [M, qkvz_dim] BF16
         self.la_gemm(hidden, &lw.la_in_proj_qkvz, &lw.la_in_proj_qkvz_bf16, proj_buf, m)?;
         let la_diag = std::env::var("KRASIS_PREFILL_DIAG").is_ok()
@@ -2440,315 +2521,199 @@ impl PrefillEngine {
                     )?;
                 }
             }
+            if lt { self.stream_sync()?; self.t_la_proj.set(self.t_la_proj.get() + lt0.elapsed().as_secs_f64() * 1000.0); }
 
-            // 5. Depthwise Conv1d + SiLU
-            // Input for conv: concatenate q_flat, k_flat, v_flat -> [M, conv_dim] BF16
-            // The conv kernel expects [conv_dim, M] layout and BF16 input row-major [M, conv_dim]
-            // We already have q_bf16 [M, key_dim], k_bf16 [M, key_dim], v_bf16 [M, value_dim]
-            // We need to concatenate them into a [M, conv_dim] BF16 buffer.
-            // Use proj_buf as the concatenated buffer (it's large enough: qkvz_dim > conv_dim)
-            //
-            // Actually conv_dim = 2*key_dim + value_dim, and proj_buf was [M, qkvz_dim].
-            // qkvz_dim = nk * (2*dk + 2*hr*dv) vs conv_dim = nk*dk*2 + nv*dv
-            // For QCN: qkvz = 16 * (256 + 256) = 8192, conv_dim = 2*2048 + 4096 = 8192. Equal.
-            // So proj_buf is exactly right size.
+            // ── BF16 optimized pipeline (FLA path) ──
+            // Fused kernels: conv outputs BF16 directly, gate_beta outputs BF16,
+            // fused repeat+l2norm, no FP32/BF16 conversion overhead.
+            if self.fla.is_some() {
+                let fp32_scratch = *self.scratch.d_fp32_scratch.device_ptr();
+                let lt1 = Instant::now();
+                let conv_state = lw.la_conv_state_ptr;
+                let conv_weight = lw.la_conv_weight_ptr;
 
-            // Concat q, k, v into proj_buf [M, conv_dim] via single kernel launch
-            {
-                let threads = std::cmp::max(32, ((std::cmp::min(256, conv_dim) + 31) / 32) * 32) as u32;
-                let mut cc0 = proj_buf;
-                let mut cc1 = q_bf16;
-                let mut cc2 = k_bf16;
-                let mut cc3 = v_bf16;
-                let mut cc4 = key_dim as i32;
-                let mut cc5 = key_dim as i32;
-                let mut cc6 = value_dim as i32;
-                unsafe {
-                    launch(self.kernels.concat_3_bf16,
-                        (m as u32, 1, 1), (threads, 1, 1), 0, self.stream,
-                        &mut [
-                            &mut cc0 as *mut _ as *mut std::ffi::c_void,
-                            &mut cc1 as *mut _ as *mut std::ffi::c_void,
-                            &mut cc2 as *mut _ as *mut std::ffi::c_void,
-                            &mut cc3 as *mut _ as *mut std::ffi::c_void,
-                            &mut cc4 as *mut _ as *mut std::ffi::c_void,
-                            &mut cc5 as *mut _ as *mut std::ffi::c_void,
-                            &mut cc6 as *mut _ as *mut std::ffi::c_void,
-                        ],
-                    )?;
-                }
-            }
-
-            // Launch conv kernel: conv_state + [M, conv_dim] BF16 -> [conv_dim, M] FP32
-            let conv_state = lw.la_conv_state_ptr;
-            let conv_weight = lw.la_conv_weight_ptr;
-            {
-                let ct = std::cmp::max(32, ((std::cmp::min(1024, m) + 31) / 32) * 32) as u32;
-                let mut c0 = la_conv_out;    // output [conv_dim, M] FP32
-                let mut c1 = conv_state;     // conv_state [conv_dim, kernel_dim] FP32
-                let mut c2 = proj_buf;       // input [M, conv_dim] BF16
-                let mut c3 = conv_weight;    // weight [conv_dim, kernel_dim] FP32
-                let mut c4 = m as i32;
-                let mut c5 = conv_dim as i32;
-                let mut c6 = kernel_dim as i32;
-                unsafe {
-                    launch(self.kernels.la_depthwise_conv1d_silu,
-                        (conv_dim as u32, 1, 1), (ct, 1, 1), 0, self.stream,
-                        &mut [
-                            &mut c0 as *mut _ as *mut std::ffi::c_void,
-                            &mut c1 as *mut _ as *mut std::ffi::c_void,
-                            &mut c2 as *mut _ as *mut std::ffi::c_void,
-                            &mut c3 as *mut _ as *mut std::ffi::c_void,
-                            &mut c4 as *mut _ as *mut std::ffi::c_void,
-                            &mut c5 as *mut _ as *mut std::ffi::c_void,
-                            &mut c6 as *mut _ as *mut std::ffi::c_void,
-                        ],
-                    )?;
-                }
-            }
-
-            // 6. Split conv_out [conv_dim, M] FP32 to q, k, v heads
-            // Conv output: [conv_dim, M] FP32. Need [M, conv_dim] then split to q/k/v.
-            // Step 1: Transpose [conv_dim, M] -> [M, conv_dim] via 2D transpose kernel
-            let fp32_scratch = *self.scratch.d_fp32_scratch.device_ptr();
-            self.launch_transpose_f32(fp32_scratch, la_conv_out, conv_dim, m)?;
-
-            // Step 2: Split [M, conv_dim] -> q[M,key_dim] + k[M,key_dim] + v[M,value_dim]
-            // via single kernel launch (replaces M per-token memcpy loops)
-            {
-                let threads = std::cmp::max(32, ((std::cmp::min(256, conv_dim) + 31) / 32) * 32) as u32;
-                let mut sp0 = la_q; let mut sp1 = la_k; let mut sp2 = la_v;
-                let mut sp3 = fp32_scratch;
-                let mut sp4 = key_dim as i32; let mut sp5 = value_dim as i32;
-                unsafe {
-                    launch(self.kernels.la_split_conv_output,
-                        (m as u32, 1, 1), (threads, 1, 1), 0, self.stream,
-                        &mut [
-                            &mut sp0 as *mut _ as *mut std::ffi::c_void,
-                            &mut sp1 as *mut _ as *mut std::ffi::c_void,
-                            &mut sp2 as *mut _ as *mut std::ffi::c_void,
-                            &mut sp3 as *mut _ as *mut std::ffi::c_void,
-                            &mut sp4 as *mut _ as *mut std::ffi::c_void,
-                            &mut sp5 as *mut _ as *mut std::ffi::c_void,
-                        ],
-                    )?;
-                }
-            }
-
-            // DIAG: norms after conv split (before L2 norm, FP32)
-            if la_diag {
-                self.stream_sync()?;
-                let q_f32 = self.diag_l2_norm_f32(la_q, 0, key_dim, key_dim);
-                let k_f32 = self.diag_l2_norm_f32(la_k, 0, key_dim, key_dim);
-                let v_f32 = self.diag_l2_norm_f32(la_v, 0, value_dim, value_dim);
-                eprintln!("[DIAG L{:02}] after_conv_split pos0: q={:.6} k={:.6} v={:.6} (FP32, pre-l2norm)",
-                    layer_idx, q_f32, k_f32, v_f32);
-            }
-
-            // 7. Compute gate and beta
-            {
-                let gt = std::cmp::max(32, ((std::cmp::min(1024, nv) + 31) / 32) * 32) as u32;
-                let mut g0 = la_beta;
-                let mut g1 = la_gate;
-                let mut g2 = la_b;
-                let mut g3 = la_a;
-                let mut g4 = lw.la_a_log_ptr;
-                let mut g5 = lw.la_dt_bias_ptr;
-                let mut g6 = nv as i32;
-                unsafe {
-                    launch(self.kernels.la_compute_gate_beta,
-                        (m as u32, 1, 1), (gt, 1, 1), 0, self.stream,
-                        &mut [
-                            &mut g0 as *mut _ as *mut std::ffi::c_void,
-                            &mut g1 as *mut _ as *mut std::ffi::c_void,
-                            &mut g2 as *mut _ as *mut std::ffi::c_void,
-                            &mut g3 as *mut _ as *mut std::ffi::c_void,
-                            &mut g4 as *mut _ as *mut std::ffi::c_void,
-                            &mut g5 as *mut _ as *mut std::ffi::c_void,
-                            &mut g6 as *mut _ as *mut std::ffi::c_void,
-                        ],
-                    )?;
-                }
-            }
-
-            // 8. Repeat-interleave k heads to match v heads (if hr > 1)
-            if hr > 1 {
-                // q: [M, nk, dk] -> [M, nv, dk]
-                // k: [M, nk, dk] -> [M, nv, dk]
-                // Need temporary buffers for expanded q and k.
-                // Use v_beta and k_beta as temp (they'll be overwritten later).
+                // Fused conv1d+SiLU: 3 BF16 inputs -> 3 BF16 outputs (single kernel)
+                // Replaces: concat + conv + transpose + split (4 kernels, ~458ms -> ~100ms)
+                // Conv output goes to la_q/la_k/la_v FP32 buffers used at BF16 (half capacity)
+                let conv_q_bf16 = la_q;  // reuse FP32 buffer for BF16 (half the bytes)
+                let conv_k_bf16 = la_k;
+                let conv_v_bf16 = la_v;
                 {
-                    let dt = std::cmp::max(32, ((std::cmp::min(256, dk) + 31) / 32) * 32) as u32;
-                    // Expand q
-                    let mut r0 = la_v_beta;  // temp for expanded q [M, nv, dk]
-                    let mut r1 = la_q;       // src [M, nk, dk]
+                    let ct = std::cmp::min(1024, ((conv_dim + 31) / 32) * 32) as u32;
+                    let mut c0 = conv_q_bf16;
+                    let mut c1 = conv_k_bf16;
+                    let mut c2 = conv_v_bf16;
+                    let mut c3 = conv_state;
+                    let mut c4 = q_bf16;     // input from uninterleave
+                    let mut c5 = k_bf16;
+                    let mut c6 = v_bf16;
+                    let mut c7 = conv_weight;
+                    let mut c8 = m as i32;
+                    let mut c9 = key_dim as i32;
+                    let mut c10 = value_dim as i32;
+                    let mut c11 = kernel_dim as i32;
+                    unsafe {
+                        launch(self.kernels.la_fused_conv1d_silu_bf16,
+                            (m as u32, 1, 1), (ct, 1, 1), 0, self.stream,
+                            &mut [
+                                &mut c0 as *mut _ as *mut std::ffi::c_void,
+                                &mut c1 as *mut _ as *mut std::ffi::c_void,
+                                &mut c2 as *mut _ as *mut std::ffi::c_void,
+                                &mut c3 as *mut _ as *mut std::ffi::c_void,
+                                &mut c4 as *mut _ as *mut std::ffi::c_void,
+                                &mut c5 as *mut _ as *mut std::ffi::c_void,
+                                &mut c6 as *mut _ as *mut std::ffi::c_void,
+                                &mut c7 as *mut _ as *mut std::ffi::c_void,
+                                &mut c8 as *mut _ as *mut std::ffi::c_void,
+                                &mut c9 as *mut _ as *mut std::ffi::c_void,
+                                &mut c10 as *mut _ as *mut std::ffi::c_void,
+                                &mut c11 as *mut _ as *mut std::ffi::c_void,
+                            ],
+                        )?;
+                    }
+                }
+
+                // Update conv state (tiny kernel, negligible cost)
+                {
+                    let ut = std::cmp::min(32, ((kernel_dim + 31) / 32) * 32) as u32;
+                    let mut u0 = conv_state;
+                    let mut u1 = q_bf16;  // original BF16 input (not conv output)
+                    let mut u2 = k_bf16;
+                    let mut u3 = v_bf16;
+                    let mut u4 = m as i32;
+                    let mut u5 = key_dim as i32;
+                    let mut u6 = value_dim as i32;
+                    let mut u7 = kernel_dim as i32;
+                    unsafe {
+                        launch(self.kernels.la_update_conv_state,
+                            (conv_dim as u32, 1, 1), (ut, 1, 1), 0, self.stream,
+                            &mut [
+                                &mut u0 as *mut _ as *mut std::ffi::c_void,
+                                &mut u1 as *mut _ as *mut std::ffi::c_void,
+                                &mut u2 as *mut _ as *mut std::ffi::c_void,
+                                &mut u3 as *mut _ as *mut std::ffi::c_void,
+                                &mut u4 as *mut _ as *mut std::ffi::c_void,
+                                &mut u5 as *mut _ as *mut std::ffi::c_void,
+                                &mut u6 as *mut _ as *mut std::ffi::c_void,
+                                &mut u7 as *mut _ as *mut std::ffi::c_void,
+                            ],
+                        )?;
+                    }
+                }
+
+                if lt { self.stream_sync()?; self.t_la_conv.set(self.t_la_conv.get() + lt1.elapsed().as_secs_f64() * 1000.0); }
+                let lt2 = Instant::now();
+
+                // Gate/beta computation directly to BF16 (eliminates 2 FP32->BF16 conversions)
+                let beta_bf16_buf = la_beta;  // reuse FP32 buffer at BF16
+                let gate_bf16_buf = la_gate;
+                {
+                    let gt = std::cmp::max(32, ((std::cmp::min(1024, nv) + 31) / 32) * 32) as u32;
+                    let mut g0 = beta_bf16_buf;
+                    let mut g1 = gate_bf16_buf;
+                    let mut g2 = la_b;
+                    let mut g3 = la_a;
+                    let mut g4 = lw.la_a_log_ptr;
+                    let mut g5 = lw.la_dt_bias_ptr;
+                    let mut g6 = nv as i32;
+                    unsafe {
+                        launch(self.kernels.la_compute_gate_beta_bf16,
+                            (m as u32, 1, 1), (gt, 1, 1), 0, self.stream,
+                            &mut [
+                                &mut g0 as *mut _ as *mut std::ffi::c_void,
+                                &mut g1 as *mut _ as *mut std::ffi::c_void,
+                                &mut g2 as *mut _ as *mut std::ffi::c_void,
+                                &mut g3 as *mut _ as *mut std::ffi::c_void,
+                                &mut g4 as *mut _ as *mut std::ffi::c_void,
+                                &mut g5 as *mut _ as *mut std::ffi::c_void,
+                                &mut g6 as *mut _ as *mut std::ffi::c_void,
+                            ],
+                        )?;
+                    }
+                }
+
+                // Fused repeat-interleave + L2 norm (BF16 in, BF16 out)
+                // Reads [M, nk, dk] BF16, writes [M, nv, dk] BF16 normalized
+                // Eliminates: 2 repeat_interleave + 2 l2norm + intermediate buffers
+                let fla_q_bf16 = *self.scratch.d_scratch1.device_ptr();
+                let fla_k_bf16 = *self.scratch.d_scratch2.device_ptr();
+                {
+                    let nt = std::cmp::max(32, ((std::cmp::min(256, dk) + 31) / 32) * 32) as u32;
+                    let smem = nt * 4;
+                    // q: conv_q_bf16 [M, nk, dk] -> fla_q_bf16 [M, nv, dk], scaled
+                    let mut r0 = fla_q_bf16;
+                    let mut r1 = conv_q_bf16;
                     let mut r2 = nk as i32;
                     let mut r3 = dk as i32;
                     let mut r4 = hr as i32;
+                    let mut r5 = scale;
                     unsafe {
-                        launch(self.kernels.la_repeat_interleave,
-                            (m as u32, nv as u32, 1), (dt, 1, 1), 0, self.stream,
+                        launch(self.kernels.la_fused_repeat_l2norm_bf16,
+                            (m as u32, nv as u32, 1), (nt, 1, 1), smem, self.stream,
                             &mut [
                                 &mut r0 as *mut _ as *mut std::ffi::c_void,
                                 &mut r1 as *mut _ as *mut std::ffi::c_void,
                                 &mut r2 as *mut _ as *mut std::ffi::c_void,
                                 &mut r3 as *mut _ as *mut std::ffi::c_void,
                                 &mut r4 as *mut _ as *mut std::ffi::c_void,
+                                &mut r5 as *mut _ as *mut std::ffi::c_void,
                             ],
                         )?;
                     }
-                    // Copy expanded q back
-                    self.memcpy_d2d(la_q, la_v_beta, (m * nv * dk * 4) as u64)?;
-
-                    // Expand k
-                    r0 = la_v_beta;
-                    r1 = la_k;
+                    // k: conv_k_bf16 [M, nk, dk] -> fla_k_bf16 [M, nv, dk], scale=1.0
+                    r0 = fla_k_bf16;
+                    r1 = conv_k_bf16;
+                    r5 = 1.0f32;
                     unsafe {
-                        launch(self.kernels.la_repeat_interleave,
-                            (m as u32, nv as u32, 1), (dt, 1, 1), 0, self.stream,
+                        launch(self.kernels.la_fused_repeat_l2norm_bf16,
+                            (m as u32, nv as u32, 1), (nt, 1, 1), smem, self.stream,
                             &mut [
                                 &mut r0 as *mut _ as *mut std::ffi::c_void,
                                 &mut r1 as *mut _ as *mut std::ffi::c_void,
                                 &mut r2 as *mut _ as *mut std::ffi::c_void,
                                 &mut r3 as *mut _ as *mut std::ffi::c_void,
                                 &mut r4 as *mut _ as *mut std::ffi::c_void,
+                                &mut r5 as *mut _ as *mut std::ffi::c_void,
                             ],
                         )?;
                     }
-                    self.memcpy_d2d(la_k, la_v_beta, (m * nv * dk * 4) as u64)?;
                 }
-            }
 
-            // 9. L2 normalize q (with scale) and k (scale=1)
-            {
-                let lt = std::cmp::max(32, ((std::cmp::min(256, dk) + 31) / 32) * 32) as u32;
-                let smem = lt * 4;
-                let mut l0 = la_q;
-                let mut l1 = scale;
-                let mut l2 = nv as i32;
-                let mut l3 = dk as i32;
-                unsafe {
-                    launch(self.kernels.la_l2norm_per_head,
-                        (m as u32, nv as u32, 1), (lt, 1, 1), smem, self.stream,
-                        &mut [
-                            &mut l0 as *mut _ as *mut std::ffi::c_void,
-                            &mut l1 as *mut _ as *mut std::ffi::c_void,
-                            &mut l2 as *mut _ as *mut std::ffi::c_void,
-                            &mut l3 as *mut _ as *mut std::ffi::c_void,
-                        ],
-                    )?;
-                }
-                l0 = la_k;
-                l1 = 1.0f32;
-                unsafe {
-                    launch(self.kernels.la_l2norm_per_head,
-                        (m as u32, nv as u32, 1), (lt, 1, 1), smem, self.stream,
-                        &mut [
-                            &mut l0 as *mut _ as *mut std::ffi::c_void,
-                            &mut l1 as *mut _ as *mut std::ffi::c_void,
-                            &mut l2 as *mut _ as *mut std::ffi::c_void,
-                            &mut l3 as *mut _ as *mut std::ffi::c_void,
-                        ],
-                    )?;
-                }
-            }
+                if lt { self.stream_sync()?; self.t_la_prep.set(self.t_la_prep.get() + lt2.elapsed().as_secs_f64() * 1000.0); }
 
-            // DIAG: norms after L2 norm (scale applied to q, k unit-normed per head)
-            if la_diag {
-                self.stream_sync()?;
-                let q_normed = self.diag_l2_norm_f32(la_q, 0, nv * dk, nv * dk);
-                let k_normed = self.diag_l2_norm_f32(la_k, 0, nv * dk, nv * dk);
-                eprintln!("[DIAG L{:02}] after_l2norm pos0: q={:.6} k={:.6} (q scaled by {:.6}, k by 1.0)",
-                    layer_idx, q_normed, k_normed, scale);
-                // Expected: each q head has norm = scale = 0.0884, so total q_norm = sqrt(nv) * scale
-                // Expected: each k head has norm = 1.0, so total k_norm = sqrt(nv) * 1.0
-                eprintln!("[DIAG L{:02}] expected: q={:.6} k={:.6}",
-                    layer_idx, (nv as f32).sqrt() * scale, (nv as f32).sqrt());
-            }
-
-            // ── FLA (Flash Linear Attention) fast path ──
-            // Uses pre-compiled Triton cubins for the Gated DeltaNet chunk recurrence.
-            // Replaces steps 10-19 (custom chunk kernels) with 6 fused FLA kernel calls.
-            // Result: FP32 output in la_v [M, nv, dv], ready for gated_rmsnorm.
-            if self.fla.is_some() {
-                let fla_bt: usize = 64; // FLA chunk size (baked into cubins)
+                // ── FLA (Flash Linear Attention) ──
+                // All inputs are already BF16 — no conversion needed!
+                let fla_bt: usize = 64;
                 let fla_pad = (fla_bt - m % fla_bt) % fla_bt;
                 let fla_total = m + fla_pad;
                 let fla_nt = fla_total / fla_bt;
 
-                // Zero-pad q, k, v, beta, gate beyond M
+                // v_bf16 for FLA: conv_v_bf16 [M, value_dim] BF16
+                // FLA expects v at [fla_total, nv, dv], which is same layout
+                let fla_v_bf16 = conv_v_bf16;
+                // beta and gate for FLA
+                let fla_beta_bf16 = beta_bf16_buf;
+                let fla_gate_bf16 = gate_bf16_buf;
+
+                // Zero-pad beyond M (BF16 = 2 bytes per element)
                 if fla_pad > 0 {
                     unsafe {
                         let _ = cuda_sys::lib().cuMemsetD8Async(
-                            la_q + (m * nv * dk * 4) as u64, 0, (fla_pad * nv * dk * 4) as usize, self.stream);
+                            fla_q_bf16 + (m * nv * dk * 2) as u64, 0, (fla_pad * nv * dk * 2) as usize, self.stream);
                         let _ = cuda_sys::lib().cuMemsetD8Async(
-                            la_k + (m * nv * dk * 4) as u64, 0, (fla_pad * nv * dk * 4) as usize, self.stream);
+                            fla_k_bf16 + (m * nv * dk * 2) as u64, 0, (fla_pad * nv * dk * 2) as usize, self.stream);
                         let _ = cuda_sys::lib().cuMemsetD8Async(
-                            la_v + (m * nv * dv * 4) as u64, 0, (fla_pad * nv * dv * 4) as usize, self.stream);
+                            fla_v_bf16 + (m * nv * dv * 2) as u64, 0, (fla_pad * nv * dv * 2) as usize, self.stream);
                         let _ = cuda_sys::lib().cuMemsetD8Async(
-                            la_beta + (m * nv * 4) as u64, 0, (fla_pad * nv * 4) as usize, self.stream);
+                            fla_beta_bf16 + (m * nv * 2) as u64, 0, (fla_pad * nv * 2) as usize, self.stream);
                         let _ = cuda_sys::lib().cuMemsetD8Async(
-                            la_gate + (m * nv * 4) as u64, 0, (fla_pad * nv * 4) as usize, self.stream);
+                            fla_gate_bf16 + (m * nv * 2) as u64, 0, (fla_pad * nv * 2) as usize, self.stream);
                     }
                 }
 
-                // Convert FP32 → BF16 for FLA input tensors
-                // FLA cubins were compiled with BF16 inputs (q, k, v, beta, gate)
-                // and FP32 for cumsum output (g) and final state (ht).
-                // q: la_q (FP32) → scratch1 (BF16)
-                // k: la_k (FP32) → scratch2 (BF16)
-                // v: la_v (FP32) → scratch1 upper half (BF16)
-                // beta: la_beta (FP32) → attn_out (BF16)
-                // gate: la_gate (FP32) → scratch2 upper half (BF16) — for cumsum input
-                let q_bf16 = *self.scratch.d_scratch1.device_ptr();
-                let k_bf16 = *self.scratch.d_scratch2.device_ptr();
-                let v_bf16 = q_bf16 + (fla_total * nv * dk * 2) as u64; // upper half of scratch1
-                let beta_bf16 = attn_out;
-                let gate_bf16 = k_bf16 + (fla_total * nv * dk * 2) as u64; // after k in scratch2
-                let stream_ptr = self.stream as *mut std::ffi::c_void;
-
-                // FP32 → BF16 conversion via la_fp32_to_bf16 kernel
-                // Kernel: (out_bf16, in_fp32, D) with grid=(M,1,1), block=(D_pad,1,1)
-                // q: [fla_total, nv*dk] FP32 → BF16
-                let qk_d = (nv * dk) as i32;
-                let v_d = (nv * dv) as i32;
-                let beta_d = nv as i32;
-                let qk_threads = std::cmp::min(1024, ((nv * dk + 31) / 32) * 32) as u32;
-                let v_threads = std::cmp::min(1024, ((nv * dv + 31) / 32) * 32) as u32;
-                let beta_threads = std::cmp::min(1024, ((nv + 31) / 32) * 32) as u32;
-                unsafe {
-                    let mut p0 = q_bf16; let mut p1 = la_q; let mut p2 = qk_d;
-                    launch(self.kernels.la_fp32_to_bf16,
-                        (fla_total as u32, 1, 1), (qk_threads, 1, 1), 0, self.stream,
-                        &mut [&mut p0 as *mut _ as *mut std::ffi::c_void,
-                              &mut p1 as *mut _ as *mut std::ffi::c_void,
-                              &mut p2 as *mut _ as *mut std::ffi::c_void])?;
-                    let mut p0 = k_bf16; let mut p1 = la_k; let mut p2 = qk_d;
-                    launch(self.kernels.la_fp32_to_bf16,
-                        (fla_total as u32, 1, 1), (qk_threads, 1, 1), 0, self.stream,
-                        &mut [&mut p0 as *mut _ as *mut std::ffi::c_void,
-                              &mut p1 as *mut _ as *mut std::ffi::c_void,
-                              &mut p2 as *mut _ as *mut std::ffi::c_void])?;
-                    let mut p0 = v_bf16; let mut p1 = la_v; let mut p2 = v_d;
-                    launch(self.kernels.la_fp32_to_bf16,
-                        (fla_total as u32, 1, 1), (v_threads, 1, 1), 0, self.stream,
-                        &mut [&mut p0 as *mut _ as *mut std::ffi::c_void,
-                              &mut p1 as *mut _ as *mut std::ffi::c_void,
-                              &mut p2 as *mut _ as *mut std::ffi::c_void])?;
-                    let mut p0 = beta_bf16; let mut p1 = la_beta; let mut p2 = beta_d;
-                    launch(self.kernels.la_fp32_to_bf16,
-                        (fla_total as u32, 1, 1), (beta_threads, 1, 1), 0, self.stream,
-                        &mut [&mut p0 as *mut _ as *mut std::ffi::c_void,
-                              &mut p1 as *mut _ as *mut std::ffi::c_void,
-                              &mut p2 as *mut _ as *mut std::ffi::c_void])?;
-                    // gate: [fla_total, nv] FP32 → BF16 for cumsum input
-                    let mut p0 = gate_bf16; let mut p1 = la_gate; let mut p2 = beta_d;
-                    launch(self.kernels.la_fp32_to_bf16,
-                        (fla_total as u32, 1, 1), (beta_threads, 1, 1), 0, self.stream,
-                        &mut [&mut p0 as *mut _ as *mut std::ffi::c_void,
-                              &mut p1 as *mut _ as *mut std::ffi::c_void,
-                              &mut p2 as *mut _ as *mut std::ffi::c_void])?;
-                }
+                // No conversion timing — there are no conversions!
+                self.t_la_convert.set(0.0); // explicit zero for reporting
+                let lt4 = Instant::now();
 
                 // Buffer assignments for FLA intermediates
                 // All FLA intermediate dtypes match what compile_kernels.py compiled:
@@ -2776,10 +2741,12 @@ impl PrefillEngine {
                         h0_fla, 0, (nv * dk * dv * 2) as usize, self.stream);
                 }
 
+                let stream_ptr = self.stream as *mut std::ffi::c_void;
+
                 // Step 1: cumsum — gate(BF16) → g_cumsum(FP32)
                 // Grid: (NT, B*H) = (fla_nt, nv)
                 let rc = unsafe {
-                    (fla.cumsum)(gate_bf16, la_g_cum, t_arg,
+                    (fla.cumsum)(fla_gate_bf16, la_g_cum, t_arg,
                         fla_nt as u32, nv as u32, 1, stream_ptr)
                 };
                 if rc != 0 { return Err(format!("FLA cumsum failed: {}", rc)); }
@@ -2787,7 +2754,7 @@ impl PrefillEngine {
                 // Step 2: kkt — k, g_cumsum, beta → A
                 // Grid: (NT, B*H) = (fla_nt, nv)
                 let rc = unsafe {
-                    (fla.kkt)(k_bf16, la_g_cum, beta_bf16, a_fla, t_arg,
+                    (fla.kkt)(fla_k_bf16, la_g_cum, fla_beta_bf16, a_fla, t_arg,
                         fla_nt as u32, nv as u32, 1, stream_ptr)
                 };
                 if rc != 0 { return Err(format!("FLA kkt failed: {}", rc)); }
@@ -2804,7 +2771,7 @@ impl PrefillEngine {
                 // Grid: (NT, B*H) = (fla_nt, nv)
                 // Note: after step 3, A (la_conv_out) is dead, so u can reuse that space
                 let rc = unsafe {
-                    (fla.wy_repr)(k_bf16, v_bf16, beta_bf16, w_fla, u_fla, ai_fla, la_g_cum, t_arg,
+                    (fla.wy_repr)(fla_k_bf16, fla_v_bf16, fla_beta_bf16, w_fla, u_fla, ai_fla, la_g_cum, t_arg,
                         fla_nt as u32, nv as u32, 1, stream_ptr)
                 };
                 if rc != 0 { return Err(format!("FLA wy_repr failed: {}", rc)); }
@@ -2817,7 +2784,7 @@ impl PrefillEngine {
                 let sr_grid_x = ((dv + 31) / 32) as u32;
                 let rc = unsafe {
                     (fla.state_recurrence)(
-                        k_bf16,     // k (BF16)
+                        fla_k_bf16,     // k (BF16)
                         u_fla,      // v (kernel param) = Python's u (BF16)
                         w_fla,      // w (kernel param) = Python's w (BF16)
                         v_new_fla,  // v_new output (BF16)
@@ -2841,8 +2808,8 @@ impl PrefillEngine {
                 // Passing scale=1.0 avoids double-scaling.
                 let rc = unsafe {
                     (fla.output)(
-                        q_bf16,     // q (already includes scale from step 9)
-                        k_bf16,     // k
+                        fla_q_bf16,     // q (already includes scale from fused repeat+l2norm)
+                        fla_k_bf16,     // k
                         v_new_fla,  // v (kernel param) = v_new from step 5
                         h_fla,      // h (per-chunk states from step 5)
                         la_g_cum,   // g (cumsum gate, FP32)
@@ -2852,27 +2819,173 @@ impl PrefillEngine {
                         o_grid_x, fla_nt as u32, nv as u32, stream_ptr)
                 };
                 if rc != 0 { return Err(format!("FLA output failed: {}", rc)); }
+                if lt { self.stream_sync()?; self.t_la_fla.set(self.t_la_fla.get() + lt4.elapsed().as_secs_f64() * 1000.0); }
+                let lt5 = Instant::now();
 
-                // Convert FLA output from BF16 to FP32 in la_v
-                // o_fla (la_v_beta) BF16 → la_v FP32 [fla_total, nv, dv]
-                // FLA output is [B, T, H, V] = [T, nv, dv] which is already [M, nv, dv] layout
-                unsafe {
-                    let mut p0 = la_v; let mut p1 = o_fla; let mut p2 = v_d;
-                    launch(self.kernels.la_bf16_to_fp32,
-                        (fla_total as u32, 1, 1), (v_threads, 1, 1), 0, self.stream,
-                        &mut [&mut p0 as *mut _ as *mut std::ffi::c_void,
-                              &mut p1 as *mut _ as *mut std::ffi::c_void,
-                              &mut p2 as *mut _ as *mut std::ffi::c_void])?;
-                }
-
-                // Copy final state to decode state buffer
+                // Copy final state to decode state buffer (FP32, unchanged)
                 if lw.la_recur_state_ptr != 0 {
                     self.memcpy_d2d(lw.la_recur_state_ptr, la_state, (nv * dk * dv * 4) as u64)?;
                 }
 
-                // la_v now has [fla_total, nv, dv] FP32 — first m positions valid
-                // No transpose needed (FLA output is already [T, H, V] layout)
+                if lt { self.stream_sync()?; self.t_la_postfla.set(self.t_la_postfla.get() + lt5.elapsed().as_secs_f64() * 1000.0); }
+
+                // Gated RMSNorm with BF16 input (reads FLA output directly, no BF16->FP32 conversion)
+                let lt6 = Instant::now();
+                {
+                    let nt = std::cmp::max(32, ((std::cmp::min(256, dv) + 31) / 32) * 32) as u32;
+                    let smem = nt * 4;
+                    let mut n0 = attn_out;   // BF16 output [M, nv*dv]
+                    let mut n1 = o_fla;      // BF16 input (FLA output, in la_v_beta)
+                    let mut n2 = la_z;       // BF16 gate [M, nv, dv]
+                    let mut n3 = lw.la_norm_weight_ptr; // FP32 weight [dv]
+                    let mut n4 = nv as i32;
+                    let mut n5 = dv as i32;
+                    let mut n6 = cfg.rms_norm_eps;
+                    unsafe {
+                        launch(self.kernels.la_gated_rmsnorm_bf16in,
+                            (m as u32, nv as u32, 1), (nt, 1, 1), smem, self.stream,
+                            &mut [
+                                &mut n0 as *mut _ as *mut std::ffi::c_void,
+                                &mut n1 as *mut _ as *mut std::ffi::c_void,
+                                &mut n2 as *mut _ as *mut std::ffi::c_void,
+                                &mut n3 as *mut _ as *mut std::ffi::c_void,
+                                &mut n4 as *mut _ as *mut std::ffi::c_void,
+                                &mut n5 as *mut _ as *mut std::ffi::c_void,
+                                &mut n6 as *mut _ as *mut std::ffi::c_void,
+                            ],
+                        )?;
+                    }
+                }
+                if lt { self.stream_sync()?; self.t_la_norm.set(self.t_la_norm.get() + lt6.elapsed().as_secs_f64() * 1000.0); }
+
             } else {
+            // ── Old FP32 pipeline (non-FLA fallback) ──
+            let lt1 = Instant::now();
+            let conv_state = lw.la_conv_state_ptr;
+            let conv_weight = lw.la_conv_weight_ptr;
+
+            // 5. Concat + Conv1d + SiLU + Split (old 4-kernel path)
+            {
+                let threads = std::cmp::max(32, ((std::cmp::min(256, conv_dim) + 31) / 32) * 32) as u32;
+                let mut cc0 = proj_buf; let mut cc1 = q_bf16; let mut cc2 = k_bf16;
+                let mut cc3 = v_bf16; let mut cc4 = key_dim as i32;
+                let mut cc5 = key_dim as i32; let mut cc6 = value_dim as i32;
+                unsafe {
+                    launch(self.kernels.concat_3_bf16,
+                        (m as u32, 1, 1), (threads, 1, 1), 0, self.stream,
+                        &mut [&mut cc0 as *mut _ as *mut std::ffi::c_void,
+                              &mut cc1 as *mut _ as *mut std::ffi::c_void,
+                              &mut cc2 as *mut _ as *mut std::ffi::c_void,
+                              &mut cc3 as *mut _ as *mut std::ffi::c_void,
+                              &mut cc4 as *mut _ as *mut std::ffi::c_void,
+                              &mut cc5 as *mut _ as *mut std::ffi::c_void,
+                              &mut cc6 as *mut _ as *mut std::ffi::c_void])?;
+                }
+            }
+            {
+                let ct = std::cmp::max(32, ((std::cmp::min(1024, m) + 31) / 32) * 32) as u32;
+                let mut c0 = la_conv_out; let mut c1 = conv_state; let mut c2 = proj_buf;
+                let mut c3 = conv_weight; let mut c4 = m as i32;
+                let mut c5 = conv_dim as i32; let mut c6 = kernel_dim as i32;
+                unsafe {
+                    launch(self.kernels.la_depthwise_conv1d_silu,
+                        (conv_dim as u32, 1, 1), (ct, 1, 1), 0, self.stream,
+                        &mut [&mut c0 as *mut _ as *mut std::ffi::c_void,
+                              &mut c1 as *mut _ as *mut std::ffi::c_void,
+                              &mut c2 as *mut _ as *mut std::ffi::c_void,
+                              &mut c3 as *mut _ as *mut std::ffi::c_void,
+                              &mut c4 as *mut _ as *mut std::ffi::c_void,
+                              &mut c5 as *mut _ as *mut std::ffi::c_void,
+                              &mut c6 as *mut _ as *mut std::ffi::c_void])?;
+                }
+            }
+            let fp32_scratch = *self.scratch.d_fp32_scratch.device_ptr();
+            self.launch_transpose_f32(fp32_scratch, la_conv_out, conv_dim, m)?;
+            {
+                let threads = std::cmp::max(32, ((std::cmp::min(256, conv_dim) + 31) / 32) * 32) as u32;
+                let mut sp0 = la_q; let mut sp1 = la_k; let mut sp2 = la_v;
+                let mut sp3 = fp32_scratch; let mut sp4 = key_dim as i32; let mut sp5 = value_dim as i32;
+                unsafe {
+                    launch(self.kernels.la_split_conv_output,
+                        (m as u32, 1, 1), (threads, 1, 1), 0, self.stream,
+                        &mut [&mut sp0 as *mut _ as *mut std::ffi::c_void,
+                              &mut sp1 as *mut _ as *mut std::ffi::c_void,
+                              &mut sp2 as *mut _ as *mut std::ffi::c_void,
+                              &mut sp3 as *mut _ as *mut std::ffi::c_void,
+                              &mut sp4 as *mut _ as *mut std::ffi::c_void,
+                              &mut sp5 as *mut _ as *mut std::ffi::c_void])?;
+                }
+            }
+            if lt { self.stream_sync()?; self.t_la_conv.set(self.t_la_conv.get() + lt1.elapsed().as_secs_f64() * 1000.0); }
+            let lt2 = Instant::now();
+
+            // 7. Gate/beta + repeat_interleave + l2norm (FP32 path)
+            {
+                let gt = std::cmp::max(32, ((std::cmp::min(1024, nv) + 31) / 32) * 32) as u32;
+                let mut g0 = la_beta; let mut g1 = la_gate; let mut g2 = la_b;
+                let mut g3 = la_a; let mut g4 = lw.la_a_log_ptr;
+                let mut g5 = lw.la_dt_bias_ptr; let mut g6 = nv as i32;
+                unsafe {
+                    launch(self.kernels.la_compute_gate_beta,
+                        (m as u32, 1, 1), (gt, 1, 1), 0, self.stream,
+                        &mut [&mut g0 as *mut _ as *mut std::ffi::c_void,
+                              &mut g1 as *mut _ as *mut std::ffi::c_void,
+                              &mut g2 as *mut _ as *mut std::ffi::c_void,
+                              &mut g3 as *mut _ as *mut std::ffi::c_void,
+                              &mut g4 as *mut _ as *mut std::ffi::c_void,
+                              &mut g5 as *mut _ as *mut std::ffi::c_void,
+                              &mut g6 as *mut _ as *mut std::ffi::c_void])?;
+                }
+            }
+            if hr > 1 {
+                let dt = std::cmp::max(32, ((std::cmp::min(256, dk) + 31) / 32) * 32) as u32;
+                let mut r0 = la_v_beta; let mut r1 = la_q; let mut r2 = nk as i32;
+                let mut r3 = dk as i32; let mut r4 = hr as i32;
+                unsafe {
+                    launch(self.kernels.la_repeat_interleave,
+                        (m as u32, nv as u32, 1), (dt, 1, 1), 0, self.stream,
+                        &mut [&mut r0 as *mut _ as *mut std::ffi::c_void,
+                              &mut r1 as *mut _ as *mut std::ffi::c_void,
+                              &mut r2 as *mut _ as *mut std::ffi::c_void,
+                              &mut r3 as *mut _ as *mut std::ffi::c_void,
+                              &mut r4 as *mut _ as *mut std::ffi::c_void])?;
+                }
+                r0 = la_k_beta; r1 = la_k;
+                unsafe {
+                    launch(self.kernels.la_repeat_interleave,
+                        (m as u32, nv as u32, 1), (dt, 1, 1), 0, self.stream,
+                        &mut [&mut r0 as *mut _ as *mut std::ffi::c_void,
+                              &mut r1 as *mut _ as *mut std::ffi::c_void,
+                              &mut r2 as *mut _ as *mut std::ffi::c_void,
+                              &mut r3 as *mut _ as *mut std::ffi::c_void,
+                              &mut r4 as *mut _ as *mut std::ffi::c_void])?;
+                }
+                la_q = la_v_beta;
+                la_k = la_k_beta;
+            }
+            {
+                let nt = std::cmp::max(32, ((std::cmp::min(256, dk) + 31) / 32) * 32) as u32;
+                let smem = nt * 4;
+                let mut l0 = la_q; let mut l1 = scale; let mut l2 = nv as i32; let mut l3 = dk as i32;
+                unsafe {
+                    launch(self.kernels.la_l2norm_per_head,
+                        (m as u32, nv as u32, 1), (nt, 1, 1), smem, self.stream,
+                        &mut [&mut l0 as *mut _ as *mut std::ffi::c_void,
+                              &mut l1 as *mut _ as *mut std::ffi::c_void,
+                              &mut l2 as *mut _ as *mut std::ffi::c_void,
+                              &mut l3 as *mut _ as *mut std::ffi::c_void])?;
+                }
+                l0 = la_k; l1 = 1.0f32;
+                unsafe {
+                    launch(self.kernels.la_l2norm_per_head,
+                        (m as u32, nv as u32, 1), (nt, 1, 1), smem, self.stream,
+                        &mut [&mut l0 as *mut _ as *mut std::ffi::c_void,
+                              &mut l1 as *mut _ as *mut std::ffi::c_void,
+                              &mut l2 as *mut _ as *mut std::ffi::c_void,
+                              &mut l3 as *mut _ as *mut std::ffi::c_void])?;
+                }
+            }
+            if lt { self.stream_sync()?; self.t_la_prep.set(self.t_la_prep.get() + lt2.elapsed().as_secs_f64() * 1000.0); }
 
             // 10. Pad to multiple of chunk_size
             let pad_size = (chunk_size - m % chunk_size) % chunk_size;
@@ -3263,72 +3376,38 @@ impl PrefillEngine {
             // la_v now has [total_len, nv, dv] FP32 — first m positions are valid
             } // end else (custom chunk recurrence path)
 
-            if la_diag {
-                self.stream_sync()?;
-                // Recurrence output norm at pos 0 (before gated RMSNorm)
-                let recur_norm = self.diag_l2_norm_f32(la_v, 0, nv * dv, nv * dv);
-                // Z gate norm at pos 0 (BF16)
-                let z_norm = self.diag_l2_norm(la_z, 0, value_dim, value_dim);
-                eprintln!("[DIAG L{:02}] recurrence pos0 norm={:.6} (before gated_rmsnorm)", layer_idx, recur_norm);
-                eprintln!("[DIAG L{:02}] z_gate pos0 norm={:.6}", layer_idx, z_norm);
-
-                // Element-level diagnostics for gated_rmsnorm inputs
-                // x: la_v [total_len, nv, dv] FP32, head 0 pos 0 = offset 0
-                let x_vals = self.diag_download_f32(la_v, 4);
-                eprintln!("[DIAG L{:02}] grmsnorm x[h0p0][0:4]=[{:.8},{:.8},{:.8},{:.8}]",
-                    layer_idx, x_vals[0], x_vals[1], x_vals[2], x_vals[3]);
-
-                // gate: la_z [M, nv, dv] BF16, head 0 pos 0 = offset 0
-                let z_vals = self.diag_download_bf16(la_z, 4);
-                eprintln!("[DIAG L{:02}] grmsnorm z[h0p0][0:4]=[{:.8},{:.8},{:.8},{:.8}]",
-                    layer_idx, z_vals[0], z_vals[1], z_vals[2], z_vals[3]);
-
-                // norm weight: la_norm_weight_ptr [dv] FP32
-                let w_vals = self.diag_download_f32(lw.la_norm_weight_ptr, 4);
-                eprintln!("[DIAG L{:02}] grmsnorm weight[0:4]=[{:.8},{:.8},{:.8},{:.8}]",
-                    layer_idx, w_vals[0], w_vals[1], w_vals[2], w_vals[3]);
-
-                // Compute what the kernel would produce for element 0
-                let sum_sq: f64 = {
-                    let all_x = self.diag_download_f32(la_v, dv);
-                    all_x.iter().map(|&v| (v as f64) * (v as f64)).sum()
-                };
-                let rms_inv = 1.0 / ((sum_sq / dv as f64) + cfg.rms_norm_eps as f64).sqrt();
-                let normed_0 = x_vals[0] as f64 * rms_inv * w_vals[0] as f64;
-                let g_0 = z_vals[0] as f64;
-                let silu_g_0 = g_0 / (1.0 + (-g_0).exp());
-                let out_0 = normed_0 * silu_g_0;
-                eprintln!("[DIAG L{:02}] grmsnorm manual: rms_inv={:.8} normed[0]={:.8} silu_g[0]={:.8} out[0]={:.8}",
-                    layer_idx, rms_inv, normed_0, silu_g_0, out_0);
-            }
-
-            // 20. Gated RMSNorm: out = rmsnorm(x) * weight * silu(z)
-            {
-                let nt = std::cmp::max(32, ((std::cmp::min(256, dv) + 31) / 32) * 32) as u32;
-                let smem = nt * 4;
-                let mut n0 = attn_out; // BF16 output [M, nv*dv]
-                let mut n1 = la_v;     // FP32 input [M, nv, dv]
-                let mut n2 = la_z;     // BF16 gate [M, nv, dv]
-                let mut n3 = lw.la_norm_weight_ptr; // BF16 weight [dv]
-                let mut n4 = nv as i32;
-                let mut n5 = dv as i32;
-                let mut n6 = cfg.rms_norm_eps;
-                unsafe {
-                    launch(self.kernels.la_gated_rmsnorm,
-                        (m as u32, nv as u32, 1), (nt, 1, 1), smem, self.stream,
-                        &mut [
-                            &mut n0 as *mut _ as *mut std::ffi::c_void,
-                            &mut n1 as *mut _ as *mut std::ffi::c_void,
-                            &mut n2 as *mut _ as *mut std::ffi::c_void,
-                            &mut n3 as *mut _ as *mut std::ffi::c_void,
-                            &mut n4 as *mut _ as *mut std::ffi::c_void,
-                            &mut n5 as *mut _ as *mut std::ffi::c_void,
-                            &mut n6 as *mut _ as *mut std::ffi::c_void,
-                        ],
-                    )?;
+            // Gated RMSNorm for non-FLA fallback path (FP32 input from chunk recurrence)
+            // FLA path has its own BF16 gated_rmsnorm above
+            if self.fla.is_none() {
+                let lt6 = Instant::now();
+                {
+                    let nt = std::cmp::max(32, ((std::cmp::min(256, dv) + 31) / 32) * 32) as u32;
+                    let smem = nt * 4;
+                    let mut n0 = attn_out;
+                    let mut n1 = la_v;
+                    let mut n2 = la_z;
+                    let mut n3 = lw.la_norm_weight_ptr;
+                    let mut n4 = nv as i32;
+                    let mut n5 = dv as i32;
+                    let mut n6 = cfg.rms_norm_eps;
+                    unsafe {
+                        launch(self.kernels.la_gated_rmsnorm,
+                            (m as u32, nv as u32, 1), (nt, 1, 1), smem, self.stream,
+                            &mut [
+                                &mut n0 as *mut _ as *mut std::ffi::c_void,
+                                &mut n1 as *mut _ as *mut std::ffi::c_void,
+                                &mut n2 as *mut _ as *mut std::ffi::c_void,
+                                &mut n3 as *mut _ as *mut std::ffi::c_void,
+                                &mut n4 as *mut _ as *mut std::ffi::c_void,
+                                &mut n5 as *mut _ as *mut std::ffi::c_void,
+                                &mut n6 as *mut _ as *mut std::ffi::c_void,
+                            ],
+                        )?;
+                    }
                 }
+                if lt { self.stream_sync()?; self.t_la_norm.set(self.t_la_norm.get() + lt6.elapsed().as_secs_f64() * 1000.0); }
             }
-
+            let lt7 = Instant::now();
             // 21. Output projection: [M, nv*dv] BF16 -> [M, hidden] BF16
             // Use scratch1 as temp to avoid Marlin GEMM input/output aliasing.
             if la_diag {
@@ -3349,6 +3428,7 @@ impl PrefillEngine {
                 eprintln!("[DIAG L{:02}] post_out_proj pos0 norm={:.6} (mixer output, dim={})", layer_idx, post_oproj_norm, cfg.hidden_size);
             }
 
+            if lt { self.stream_sync()?; self.t_la_oproj.set(self.t_la_oproj.get() + lt7.elapsed().as_secs_f64() * 1000.0); }
         }
 
         Ok(())
@@ -3416,6 +3496,8 @@ impl PrefillEngine {
     /// One kernel launch handles ALL active experts per GEMM (w1, w2).
     fn forward_moe_fused(&mut self, layer_idx: usize, m: usize) -> Result<(), String> {
         let diag_moe = std::env::var("KRASIS_PREFILL_DIAG").is_ok();
+        let mt = self.gqa_timing_enabled.get(); // MoE timing flag (reuses same env var)
+        let mt0 = if mt { self.stream_sync()?; Some(Instant::now()) } else { None };
         let lw = &self.layer_weights[layer_idx];
         let h = self.config.hidden_size;
         let n_experts = lw.moe_num_experts;
@@ -3580,6 +3662,10 @@ impl PrefillEngine {
 
         // Sync to get routing results on CPU for selective expert DMA
         self.stream_sync()?;
+        if let Some(t) = mt0 {
+            self.t_moe_gate.set(self.t_moe_gate.get() + t.elapsed().as_secs_f64() * 1000.0);
+        }
+        let mt1 = if mt { Some(Instant::now()) } else { None };
 
         // Download expert counts to determine which experts are active
         let mut h_expert_counts = vec![0i32; n_experts];
@@ -3665,6 +3751,12 @@ impl PrefillEngine {
         unsafe {
             cuda_sys::lib().cuStreamWaitEvent(self.stream, self.dma_event, 0);
         }
+        if let Some(t) = mt1 {
+            // Sync to measure actual DMA wait time (timing mode only)
+            self.stream_sync()?;
+            self.t_moe_dma.set(self.t_moe_dma.get() + t.elapsed().as_secs_f64() * 1000.0);
+        }
+        let mt2 = if mt { Some(Instant::now()) } else { None };
 
         // Verify DMA: check first 16 bytes of fused buffer are non-zero
         if diag_moe && layer_idx == 0 {
@@ -3902,6 +3994,12 @@ impl PrefillEngine {
             }
         }
 
+        if let Some(t) = mt2 {
+            self.stream_sync()?;
+            self.t_moe_w1.set(self.t_moe_w1.get() + t.elapsed().as_secs_f64() * 1000.0);
+        }
+        let mt3 = if mt { Some(Instant::now()) } else { None };
+
         // 10. MarlinDefault for w2 (down projection)
         // w2 trick: top_k=1, size_m=m*topk so kernel reads A[sorted_id/1] = A[sorted_id] directly
         // This lets each (token,expert) pair access its own intermediate result
@@ -3956,6 +4054,12 @@ impl PrefillEngine {
                 false,                                // is_zp_float
             );
         }
+
+        if let Some(t) = mt3 {
+            self.stream_sync()?;
+            self.t_moe_w2.set(self.t_moe_w2.get() + t.elapsed().as_secs_f64() * 1000.0);
+        }
+        let mt4 = if mt { Some(Instant::now()) } else { None };
 
         // DIAG: compare fused w2 output vs ORIGINAL weights (HCS/cold) for token 0's experts
         if diag_moe && layer_idx == 0 {
@@ -4133,6 +4237,12 @@ impl PrefillEngine {
             eprintln!("[DIAG FUSED L0] accum[tok0][0..8] = {:?}, L2={:.4}", h_acc, norm);
         }
 
+        if let Some(t) = mt4 {
+            self.stream_sync()?;
+            self.t_moe_scatter.set(self.t_moe_scatter.get() + t.elapsed().as_secs_f64() * 1000.0);
+        }
+        let mt5 = if mt { Some(Instant::now()) } else { None };
+
         // 12. Wait for shared expert on shared_stream, then add to accumulator with sigmoid gate
         if has_shared {
             // Wait for shared expert to complete on shared_stream
@@ -4237,6 +4347,11 @@ impl PrefillEngine {
                     ],
                 )?;
             }
+        }
+
+        if let Some(t) = mt5 {
+            self.stream_sync()?;
+            self.t_moe_shared.set(self.t_moe_shared.get() + t.elapsed().as_secs_f64() * 1000.0);
         }
 
         // DIAG: d_hidden after bf16 conversion
@@ -5986,6 +6101,12 @@ impl PrefillKernels {
                 "moe_accum_to_bf16_kernel",
                 "kv_cache_append_fp8_kernel",
                 "kv_cache_dequant_concat_kernel",
+                // Optimized LA kernels (BF16 pipeline)
+                "la_fused_conv1d_silu_bf16_kernel",
+                "la_update_conv_state_kernel",
+                "la_compute_gate_beta_bf16_kernel",
+                "la_fused_repeat_l2norm_bf16_kernel",
+                "la_gated_rmsnorm_bf16in_kernel",
             ],
         ).map_err(|e| format!("Load prefill PTX: {e}"))?;
 
@@ -6075,6 +6196,11 @@ impl PrefillKernels {
             gated_q_split: get("gated_q_split_kernel")?,
             la_split_conv_output: get("la_split_conv_output_kernel")?,
             concat_3_bf16: get("concat_3_bf16_kernel")?,
+            la_fused_conv1d_silu_bf16: get("la_fused_conv1d_silu_bf16_kernel")?,
+            la_update_conv_state: get("la_update_conv_state_kernel")?,
+            la_compute_gate_beta_bf16: get("la_compute_gate_beta_bf16_kernel")?,
+            la_fused_repeat_l2norm_bf16: get("la_fused_repeat_l2norm_bf16_kernel")?,
+            la_gated_rmsnorm_bf16in: get("la_gated_rmsnorm_bf16in_kernel")?,
             la_compute_v_new_strided: get("la_compute_v_new_strided_kernel")?,
             la_chunk_output_strided: get("la_chunk_output_strided_kernel")?,
             la_state_update_strided: get("la_state_update_strided_kernel")?,
