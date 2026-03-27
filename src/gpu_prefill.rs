@@ -497,13 +497,21 @@ pub struct PrefillScratch {
     pub d_mamba2_ssd_out: Option<CudaSlice<u16>>,
     // MoE scratch buffers
     pub d_gate_out: CudaSlice<f32>,         // [max_tokens, max_experts] FP32
-    pub d_moe_accum: CudaSlice<f32>,        // [max_tokens, hidden] FP32 (for atomic scatter)
-    pub d_moe_gathered: CudaSlice<u16>,     // [max_tokens * topk, hidden] BF16
-    pub d_moe_expert_out: CudaSlice<u16>,   // [max_tokens * topk, hidden] BF16
-    pub d_moe_gate_up: CudaSlice<u16>,      // [max_tokens * topk, 2*inter] BF16
-    pub d_moe_inter: CudaSlice<u16>,        // [max_tokens * topk, inter] BF16
-    pub d_gather_src_map: CudaSlice<i32>,   // [max_tokens * topk]
+    // Shared MoE buffers: sized for fused_sorted_count (= max_tokens * topk + n_routed * block_size).
+    // Used by BOTH sequential and fused MoE paths (never simultaneously).
+    // Sequential uses [max_tokens * topk] entries; fused uses [fused_sorted_count].
+    pub d_moe_accum: CudaSlice<f32>,        // [fused_sorted_count, max(w1_n, h)] FP32 -- fused C_tmp or [m,h] scatter
+    pub d_moe_gathered: CudaSlice<u16>,     // [fused_sorted_count, hidden] BF16 -- fused_input or gathered
+    pub d_moe_expert_out: CudaSlice<u16>,   // [fused_sorted_count, hidden] BF16 -- fused_output or expert_out
+    pub d_moe_gate_up: CudaSlice<u16>,      // [fused_sorted_count, w1_n] BF16 -- fused_inter_cache or gate_up
+    pub d_moe_inter: CudaSlice<u16>,        // [fused_sorted_count, inter] BF16 -- fused_inter2 or inter
+    pub d_gather_src_map: CudaSlice<i32>,   // [fused_sorted_count] -- sorted_token_ids or gather_src_map
     pub d_gather_weight_map: CudaSlice<f32>,// [max_tokens * topk]
+    // Fused MoE sorted dispatch buffers (in scratch so both paths share VRAM)
+    pub d_fused_expert_ids: CudaSlice<i32>, // [fused_blocks]
+    pub d_num_tokens_post: CudaSlice<i32>,  // [1]
+    pub fused_sorted_count: usize,
+    pub fused_blocks: usize,
     // GPU-only routing scratch
     pub d_expert_counts: CudaSlice<i32>,    // [max_experts]
     pub d_expert_offsets: CudaSlice<i32>,   // [max_experts + 1]
@@ -616,15 +624,8 @@ pub struct PrefillEngine {
     pub w1_scales_per_expert: usize,
     pub w2_packed_per_expert: usize,
     pub w2_scales_per_expert: usize,
-    // Sorted MoE buffers for fused kernel
-    pub d_sorted_token_ids: Option<CudaSlice<i32>>,   // [max_sorted]
-    pub d_fused_expert_ids: Option<CudaSlice<i32>>,    // [max_blocks]
-    pub d_num_tokens_post: Option<CudaSlice<i32>>,     // [1]
-    pub d_fused_input: Option<CudaSlice<u16>>,         // [max_sorted, hidden] gathered BF16
-    pub d_fused_inter_cache: Option<CudaSlice<u16>>,   // [max_sorted, 2*inter] intermediate BF16
-    pub d_fused_inter2: Option<CudaSlice<u16>>,        // [max_sorted, inter] after activation BF16
-    pub d_fused_output: Option<CudaSlice<u16>>,        // [max_sorted, hidden] output BF16
-    pub d_fused_c_tmp: Option<CudaSlice<f32>>,         // FP32 reduce workspace
+    // Fused MoE token buffers now live in PrefillScratch (shared with sequential).
+    // Only the fused_sorted_count is tracked here for reference.
     pub max_sorted: usize,
     // Preloaded layer index tracking for group-level double-buffer (gap 2)
     pub preloaded_moe_layer: Option<usize>,
@@ -962,7 +963,7 @@ impl PrefillEngine {
         }
 
         let use_fused = self.kernels.fused_moe_fn.is_some()
-            && self.d_fused_input.is_some()
+            && (self.d_fused_expert_w1_a.is_some() || self.d_expert_w1_ptrs.is_some())
             && std::env::var("KRASIS_SEQUENTIAL_MOE").is_err();
 
         // ═══════════════════════════════════════════════════════════
@@ -1485,7 +1486,7 @@ impl PrefillEngine {
         // Preload first MoE layer (same as run_prefill)
         // Skip in pointer table mode (forward_moe_fused builds tables per-layer)
         let use_fused = self.kernels.fused_moe_fn.is_some()
-            && self.d_fused_input.is_some()
+            && (self.d_fused_expert_w1_a.is_some() || self.d_expert_w1_ptrs.is_some())
             && std::env::var("KRASIS_SEQUENTIAL_MOE").is_err();
         if use_fused && self.d_expert_w1_ptrs.is_none() {
             for i in 0..num_hidden_layers {
@@ -3613,7 +3614,7 @@ impl PrefillEngine {
         // Uses bulk layer DMA with double-buffered cross-layer pipelining.
         // Set KRASIS_SEQUENTIAL_MOE=1 to force sequential path for debugging.
         let use_fused = self.kernels.fused_moe_fn.is_some()
-            && self.d_fused_input.is_some()
+            && (self.d_fused_expert_w1_a.is_some() || self.d_expert_w1_ptrs.is_some())
             && std::env::var("KRASIS_SEQUENTIAL_MOE").is_err();
         if use_fused {
             if layer_idx == 0 {
@@ -3745,12 +3746,9 @@ impl PrefillEngine {
 
         // Padded prefix sum (block_size aligned)
         // Dereference device_ptr() immediately to avoid holding borrows on self
-        let sorted_ids_val = *self.d_sorted_token_ids.as_ref()
-            .ok_or("sorted_token_ids not allocated")?.device_ptr();
-        let fused_expert_ids_val = *self.d_fused_expert_ids.as_ref()
-            .ok_or("fused_expert_ids not allocated")?.device_ptr();
-        let num_tokens_post_val = *self.d_num_tokens_post.as_ref()
-            .ok_or("num_tokens_post not allocated")?.device_ptr();
+        let sorted_ids_val = *self.scratch.d_gather_src_map.device_ptr();
+        let fused_expert_ids_val = *self.scratch.d_fused_expert_ids.device_ptr();
+        let num_tokens_post_val = *self.scratch.d_num_tokens_post.device_ptr();
         {
             let ps_threads = std::cmp::max(32, ((std::cmp::min(1024, n_experts) + 31) / 32) * 32) as u32;
             let mut p0 = expert_offsets_ptr;
@@ -3914,8 +3912,44 @@ impl PrefillEngine {
                     self.h_expert_w2s_ptrs[eid] = hw2s;
                     hcs_count += 1;
                 } else if let Some(md) = moe_data {
-                    // Cold expert: H2D to staging slot
-                    if eid < md.experts.len() && cold_slot < self.max_cold_experts {
+                    // Cold expert: H2D to staging slot.
+                    // If cold staging is full, fall back to the contiguous fused buffer.
+                    if eid < md.experts.len() && cold_slot >= self.max_cold_experts {
+                        // Overflow: DMA to contiguous fused buffer slot (if available)
+                        let (w1_buf, w1s_buf, w2_buf, w2s_buf) = if self.fused_expert_buf_cur == 0 {
+                            (self.d_fused_expert_w1_a.as_ref(), self.d_fused_expert_w1s_a.as_ref(),
+                             self.d_fused_expert_w2_a.as_ref(), self.d_fused_expert_w2s_a.as_ref())
+                        } else {
+                            (self.d_fused_expert_w1_b.as_ref(), self.d_fused_expert_w1s_b.as_ref(),
+                             self.d_fused_expert_w2_b.as_ref(), self.d_fused_expert_w2s_b.as_ref())
+                        };
+                        if let (Some(w1b), Some(w1sb), Some(w2b), Some(w2sb)) = (w1_buf, w1s_buf, w2_buf, w2s_buf) {
+                            let e = &md.experts[eid];
+                            let w1_off = eid * self.w1_packed_per_expert;
+                            let w1s_off = eid * self.w1_scales_per_expert;
+                            let w2_off = eid * self.w2_packed_per_expert;
+                            let w2s_off = eid * self.w2_scales_per_expert;
+                            unsafe {
+                                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                    *w1b.device_ptr() + w1_off as u64, e.w13_packed_ptr as *const _,
+                                    e.w13_packed_bytes, self.copy_stream);
+                                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                    *w1sb.device_ptr() + w1s_off as u64, e.w13_scales_ptr as *const _,
+                                    e.w13_scales_bytes, self.copy_stream);
+                                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                    *w2b.device_ptr() + w2_off as u64, e.w2_packed_ptr as *const _,
+                                    e.w2_packed_bytes, self.copy_stream);
+                                cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                                    *w2sb.device_ptr() + w2s_off as u64, e.w2_scales_ptr as *const _,
+                                    e.w2_scales_bytes, self.copy_stream);
+                            }
+                            self.h_expert_w1_ptrs[eid] = *w1b.device_ptr() + w1_off as u64;
+                            self.h_expert_w1s_ptrs[eid] = *w1sb.device_ptr() + w1s_off as u64;
+                            self.h_expert_w2_ptrs[eid] = *w2b.device_ptr() + w2_off as u64;
+                            self.h_expert_w2s_ptrs[eid] = *w2sb.device_ptr() + w2s_off as u64;
+                            cold_count += 1;
+                        }
+                    } else if eid < md.experts.len() && cold_slot < self.max_cold_experts {
                         let e = &md.experts[eid];
                         let slot_base = cold_staging_base + (cold_slot * self.cold_expert_bytes) as u64;
                         let mut off = 0u64;
@@ -4053,7 +4087,7 @@ impl PrefillEngine {
         // 6. Replicate hidden states: [m, h] -> [m*topk, h]
         // Required for top_k=1 trick: avoids C_tmp collision in fp32_reduce.
         // Each (token, slot) pair needs its own entry so C_tmp positions are unique.
-        let fused_input_ptr = *self.d_fused_input.as_ref().ok_or("fused_input")?.device_ptr();
+        let fused_input_ptr = *self.scratch.d_moe_gathered.device_ptr();
         let m_topk = m * topk;
         {
             let rt = std::cmp::max(32, ((std::cmp::min(1024, h) + 31) / 32) * 32) as u32;
@@ -4082,8 +4116,8 @@ impl PrefillEngine {
         let fused_fn = self.kernels.fused_moe_fn.ok_or("fused MoE fn not loaded")?;
         let w1_n = if gated { 2 * inter } else { inter };
         let num_groups_w1 = (h / gs) as i32;
-        let fused_inter_ptr = *self.d_fused_inter_cache.as_ref().ok_or("fused_inter_cache")?.device_ptr();
-        let fused_c_tmp_ptr = *self.d_fused_c_tmp.as_ref().ok_or("fused_c_tmp")?.device_ptr();
+        let fused_inter_ptr = *self.scratch.d_moe_gate_up.device_ptr();
+        let fused_c_tmp_ptr = *self.scratch.d_moe_accum.device_ptr();
 
         // Stream dependency: compute stream already waits on DMA event (above).
         // Routing data is on self.stream (same as compute). No ctx sync needed.
@@ -4239,7 +4273,7 @@ impl PrefillEngine {
 
         // 9. Activation (silu_mul or relu2) on fused_inter -> fused_inter2
         // w1 writes C at sorted_id positions [0..m*topk), so activation grid = m_topk
-        let fused_inter2_ptr = *self.d_fused_inter2.as_ref().ok_or("fused_inter2")?.device_ptr();
+        let fused_inter2_ptr = *self.scratch.d_moe_inter.device_ptr();
         if gated {
             let act_t = std::cmp::max(32, ((std::cmp::min(1024, inter) + 31) / 32) * 32) as u32;
             let mut ac0 = fused_inter2_ptr;
@@ -4283,7 +4317,7 @@ impl PrefillEngine {
         // 10. MarlinDefault for w2 (down projection)
         // w2 trick: top_k=1, size_m=m*topk so kernel reads A[sorted_id/1] = A[sorted_id] directly
         // This lets each (token,expert) pair access its own intermediate result
-        let fused_output_ptr = *self.d_fused_output.as_ref().ok_or("fused_output")?.device_ptr();
+        let fused_output_ptr = *self.scratch.d_moe_expert_out.device_ptr();
         let num_groups_w2 = (inter / self.config.group_size) as i32;
         let w2_input = if gated { fused_inter2_ptr } else { fused_inter_ptr };
 
@@ -6918,8 +6952,8 @@ impl PrefillKernels {
 //  Scratch allocation
 // ════════════════════════════════════════════════════════════════════════
 
-/// Compute total VRAM bytes needed for scratch buffers as a function of max_tokens.
-/// Returns (fixed_bytes, per_token_bytes) so that total = fixed + per_token * max_tokens.
+/// Compute total VRAM bytes needed for prefill buffers as a function of max_tokens.
+/// Returns (fixed_bytes, per_token_bytes) including both scratch AND fused MoE buffers.
 /// This is used to dynamically compute the largest chunk size that fits in available VRAM.
 pub fn compute_scratch_vram(config: &PrefillModelConfig) -> (usize, usize) {
     let h = config.hidden_size;
@@ -6986,22 +7020,26 @@ pub fn compute_scratch_vram(config: &PrefillModelConfig) -> (usize, usize) {
     per_token += config.num_kv_heads * config.head_dim * 2;
     // d_v: max_tokens * num_kv_heads * head_dim * 2
     per_token += config.num_kv_heads * config.head_dim * 2;
-    // MoE buffers (scale with max_tokens * topk mostly)
+    // MoE buffers: sized for fused_sorted_count = max_tokens * topk + n_routed * block_size.
+    // Both sequential and fused paths share these buffers (never run simultaneously).
+    let w1_n = if config.moe_gated { 2 * moe_inter } else { moe_inter };
+    let block_size_moe: usize = 64; // MarlinDefault block_size_m
     // d_gate_out: max_tokens * n_routed_experts * 4
     per_token += config.n_routed_experts.max(1) * 4;
-    // d_moe_accum: max_tokens * h * 4
-    per_token += h * 4;
-    // d_moe_gathered: max_tokens * topk * h * 2
+    // d_moe_accum: fused_sorted_count * max(w1_n, h) * 4 (serves as Marlin C_tmp for fused,
+    // or [m, h] FP32 scatter accumulator for sequential -- fused size dominates)
+    per_token += topk * std::cmp::max(w1_n, h) * 4;
+    // d_moe_gathered: fused_sorted_count * h * 2 (fused_input or gathered)
     per_token += topk * h * 2;
-    // d_moe_expert_out: max_tokens * topk * h * 2
+    // d_moe_expert_out: fused_sorted_count * h * 2 (fused_output or expert_out)
     per_token += topk * h * 2;
-    // d_moe_gate_up: max_tokens * topk * 2 * moe_inter * 2
-    per_token += topk * moe_inter * 2 * 2;
-    // d_moe_inter: max_tokens * topk * moe_inter * 2
+    // d_moe_gate_up: fused_sorted_count * w1_n * 2 (fused_inter_cache or gate_up)
+    per_token += topk * w1_n * 2;
+    // d_moe_inter: fused_sorted_count * moe_inter * 2 (fused_inter2 or inter)
     per_token += topk * moe_inter * 2;
-    // d_gather_src_map: max_tokens * topk * 4
+    // d_gather_src_map: fused_sorted_count * 4 (sorted_token_ids or gather_src_map)
     per_token += topk * 4;
-    // d_gather_weight_map: max_tokens * topk * 4
+    // d_gather_weight_map: max_tokens * topk * 4 (sequential only, small)
     per_token += topk * 4;
     // LA buffers (scale with la_max_len = max_tokens + la_chunk_size, approx max_tokens)
     if has_la {
@@ -7038,12 +7076,36 @@ pub fn compute_scratch_vram(config: &PrefillModelConfig) -> (usize, usize) {
     fixed += config.n_routed_experts.max(1) * 4 * 3;
     // Expert DMA double-buffers (A+B for w13, w13s, w2, w2s -- 8 buffers total, each one expert)
     if config.n_routed_experts > 0 {
+        let n_routed = config.n_routed_experts;
+        let gs = config.group_size.max(1);
+        let bits = config.expert_bits as usize;
         let w13_n = if config.moe_gated { 2 * moe_inter } else { moe_inter };
-        let expert_bytes = h * w13_n * config.expert_bits as usize / 8  // w13 packed
-            + (h / config.group_size.max(1)) * w13_n * 2               // w13 scales
-            + moe_inter * h * config.expert_bits as usize / 8          // w2 packed
-            + (moe_inter / config.group_size.max(1)) * h * 2;          // w2 scales
-        fixed += expert_bytes * 2; // A + B buffers
+        let expert_bytes = h * w13_n * bits / 8  // w13 packed
+            + (h / gs) * w13_n * 2               // w13 scales
+            + moe_inter * h * bits / 8           // w2 packed
+            + (moe_inter / gs) * h * 2;          // w2 scales
+        fixed += expert_bytes * 2; // A + B staging buffers (one expert each)
+
+        // Fused MoE: block padding on shared sorted buffers.
+        // fused_sorted_count = max_tokens * topk + n_routed * block_size.
+        // The per-token part is accounted for above. The n_routed * block_size padding is fixed.
+        let per_sorted_entry = std::cmp::max(w1_n, h) * 4  // d_moe_accum (FP32)
+            + h * 2 + h * 2 + w1_n * 2 + moe_inter * 2    // gathered + expert_out + gate_up + inter (BF16)
+            + 4;                                             // d_gather_src_map (i32)
+        fixed += n_routed * block_size_moe * per_sorted_entry;
+
+        // Fused expert_ids buffer: fused_blocks * 4 (approx n_routed + padding)
+        // and num_tokens_post: 4 bytes. Small, just add a rough estimate.
+        fixed += (n_routed + 1024) * 4 + 4;
+
+        // Cold staging buffer: 1 full set of all expert weights (worst case: no HCS hits).
+        // In pointer-table mode, cold staging is the primary expert DMA target.
+        // Fused expert weight buffers (A/B sets) are allocated opportunistically AFTER
+        // cold staging only if spare VRAM exists — they are NOT budgeted here.
+        fixed += n_routed * expert_bytes;
+
+        // Pointer table buffers: 4 arrays of n_routed * u64
+        fixed += 4 * n_routed * 8;
     }
     if has_la {
         let nv = config.la_num_v_heads;
@@ -7171,15 +7233,59 @@ pub fn allocate_scratch(
         d_mamba2_ssd_out: if has_mamba2 {
             Some(alloc_u16(max_tokens * config.mamba_d_inner, "mamba2_ssd_out")?)
         } else { None },
-        // MoE buffers
+        // MoE buffers: sized for fused_sorted_count so both fused and sequential share them.
+        // fused_sorted_count = max_tokens * topk + n_routed * block_size
         d_gate_out: alloc_f32(max_tokens * config.n_routed_experts.max(1), "gate_out")?,
-        d_moe_accum: alloc_f32(max_tokens * h, "moe_accum")?,
-        d_moe_gathered: alloc_u16(max_tokens * topk * h, "moe_gathered")?,
-        d_moe_expert_out: alloc_u16(max_tokens * topk * h, "moe_expert_out")?,
-        d_moe_gate_up: alloc_u16(max_tokens * topk * moe_inter * 2, "moe_gate_up")?,
-        d_moe_inter: alloc_u16(max_tokens * topk * moe_inter, "moe_inter")?,
-        d_gather_src_map: alloc_i32(max_tokens * topk, "gather_src_map")?,
+        d_moe_accum: {
+            let w1_n = if config.moe_gated { 2 * moe_inter } else { moe_inter };
+            let block_sz: usize = 64; // MarlinDefault block_size_m
+            let n_routed = config.n_routed_experts;
+            let fsc = max_tokens * topk + n_routed * block_sz;
+            alloc_f32(fsc * std::cmp::max(w1_n, h), "moe_accum")?
+        },
+        d_moe_gathered: {
+            let block_sz: usize = 64;
+            let fsc = max_tokens * topk + config.n_routed_experts * block_sz;
+            alloc_u16(fsc * h, "moe_gathered")?
+        },
+        d_moe_expert_out: {
+            let block_sz: usize = 64;
+            let fsc = max_tokens * topk + config.n_routed_experts * block_sz;
+            alloc_u16(fsc * h, "moe_expert_out")?
+        },
+        d_moe_gate_up: {
+            let w1_n = if config.moe_gated { 2 * moe_inter } else { moe_inter };
+            let block_sz: usize = 64;
+            let fsc = max_tokens * topk + config.n_routed_experts * block_sz;
+            alloc_u16(fsc * w1_n, "moe_gate_up")?
+        },
+        d_moe_inter: {
+            let block_sz: usize = 64;
+            let fsc = max_tokens * topk + config.n_routed_experts * block_sz;
+            alloc_u16(fsc * moe_inter, "moe_inter")?
+        },
+        d_gather_src_map: {
+            let block_sz: usize = 64;
+            let fsc = max_tokens * topk + config.n_routed_experts * block_sz;
+            alloc_i32(fsc, "gather_src_map")?
+        },
         d_gather_weight_map: alloc_f32(max_tokens * topk, "gather_weight_map")?,
+        d_fused_expert_ids: {
+            let block_sz: usize = 64;
+            let fsc = max_tokens * topk + config.n_routed_experts * block_sz;
+            let fb = fsc / block_sz + config.n_routed_experts;
+            alloc_i32(fb, "fused_expert_ids")?
+        },
+        d_num_tokens_post: alloc_i32(1, "num_tokens_post")?,
+        fused_sorted_count: {
+            let block_sz: usize = 64;
+            max_tokens * topk + config.n_routed_experts * block_sz
+        },
+        fused_blocks: {
+            let block_sz: usize = 64;
+            let fsc = max_tokens * topk + config.n_routed_experts * block_sz;
+            fsc / block_sz + config.n_routed_experts
+        },
         // GPU-only routing scratch
         d_expert_counts: alloc_i32(config.n_routed_experts.max(1), "expert_counts")?,
         d_expert_offsets: alloc_i32(config.n_routed_experts.max(1) + 1, "expert_offsets")?,

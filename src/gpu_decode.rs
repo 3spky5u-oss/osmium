@@ -5550,25 +5550,34 @@ impl GpuDecodeStore {
         };
 
         // Compute dynamic prefill chunk size from available VRAM.
-        // Called BEFORE HCS allocation, so most free VRAM is available for scratch.
+        // Strategy: maximize chunk size (fewer MoE DMA passes = faster prefill).
+        // HCS gets whatever VRAM remains after prefill scratch is allocated.
+        // Data shows HCS coverage has minimal impact on decode speed (55 tok/s
+        // at both 15% and 48% HCS), while chunk count directly scales DMA cost.
         {
             let (fixed_bytes, per_token_bytes) = crate::gpu_prefill::compute_scratch_vram(&config);
             let mut free: usize = 0;
             let mut _total: usize = 0;
             unsafe { cuda_sys::lib().cuMemGetInfo_v2(&mut free, &mut _total); }
-            // Reserve safety margin (600 MB for CUDA overhead, cold staging, pointer tables)
-            let safety_mb = 600;
-            let usable = free.saturating_sub(safety_mb * 1024 * 1024).saturating_sub(fixed_bytes);
+
+            // Safety margin for CUDA allocator overhead, context, fragmentation.
+            // Proportional to total VRAM: ~7.5% covers PyTorch caching allocator
+            // and driver overhead observed on 32GB cards. Floor at 600 MB.
+            let safety_mb = std::cmp::max(600, _total / (1024 * 1024) * 75 / 1000);
+            let reserved = safety_mb * 1024 * 1024;
+            let usable = free.saturating_sub(reserved).saturating_sub(fixed_bytes);
             let max_by_vram = if per_token_bytes > 0 { usable / per_token_bytes } else { 50000 };
-            // Cap at 50K tokens (more than any practical prompt), floor at 2000
+            // Cap at 50K tokens, floor at 2000
             let chunk_size = max_by_vram.max(2000).min(50000);
             config.prefill_chunk_size = chunk_size;
-            eprintln!("[PREFILL] Dynamic chunk size: {} tokens ({:.1} MB scratch, {} bytes/tok, {:.0} MB VRAM free, {} MB safety)",
-                chunk_size,
-                (fixed_bytes + per_token_bytes * chunk_size) as f64 / (1024.0 * 1024.0),
-                per_token_bytes,
+            let scratch_mb = (fixed_bytes + per_token_bytes * chunk_size) as f64 / (1024.0 * 1024.0);
+            let remaining_mb = (free.saturating_sub(reserved)
+                .saturating_sub(fixed_bytes + per_token_bytes * chunk_size)) as f64 / (1024.0 * 1024.0);
+            eprintln!("[PREFILL] Dynamic chunk size: {} tokens ({:.0} MB scratch+fused, {} bytes/tok, \
+                {:.0} MB VRAM free, {:.0} MB remaining for HCS, {} MB safety)",
+                chunk_size, scratch_mb, per_token_bytes,
                 free as f64 / (1024.0 * 1024.0),
-                safety_mb);
+                remaining_mb, safety_mb);
         }
 
         // Build per-layer weights
@@ -5983,93 +5992,69 @@ impl GpuDecodeStore {
         // AND there is enough free VRAM. Otherwise fall back to per-expert sequential dispatch.
         let has_moe = n_routed > 0;
         let has_fused_kernel = kernels.fused_moe_fn.is_some();
+        let can_fused = has_moe && has_fused_kernel;
 
-        // Estimate total VRAM needed for fused MoE buffers before allocating
-        let block_size = 128usize; // MarlinDefault block_size_m
+        // Cold staging + pointer tables are the PRIMARY approach for fused MoE.
+        // They allow zero-copy HCS expert access and H2D staging without contiguous buffers.
+        // Fused expert weight buffers (A/B sets) are SECONDARY — only needed as overflow
+        // when cold staging is full, or for the legacy non-pointer-table path.
         let total_w1_packed = n_routed * w1_packed_per_expert;
         let total_w1_scales = n_routed * w1_scales_per_expert;
         let total_w2_packed = n_routed * w2_packed_per_expert;
         let total_w2_scales = n_routed * w2_scales_per_expert;
-        let fused_sorted_count = scratch_tokens * n_topk + n_routed * block_size;
-        let fused_blocks = fused_sorted_count / block_size + n_routed;
+        let cold_per_expert = w1_packed_per_expert + w1_scales_per_expert
+            + w2_packed_per_expert + w2_scales_per_expert;
 
-        let fused_expert_bytes = 2 * (total_w1_packed + total_w1_scales + total_w2_packed + total_w2_scales); // 2 sets (A/B)
-        let fused_sorted_bytes = fused_sorted_count * 4 // sorted_token_ids (i32)
-            + fused_blocks * 4 // expert_ids (i32)
-            + 4 // num_tokens_post (i32)
-            + fused_sorted_count * h * 2 // fused_input (u16)
-            + fused_sorted_count * w1_n * 2 // fused_inter_cache (u16)
-            + fused_sorted_count * moe_inter * 2 // fused_inter2 (u16)
-            + fused_sorted_count * h * 2 // fused_output (u16)
-            + fused_sorted_count * h * 4; // fused_c_tmp (f32)
-        let fused_total_mb = (fused_expert_bytes + fused_sorted_bytes) / (1024 * 1024);
+        let max_sorted = scratch.fused_sorted_count;
 
-        // Check free VRAM (leave 100 MB headroom for kernel intermediates)
-        eprintln!("[FUSED-ALLOC] has_moe={}, has_fused_kernel={}, fused_total_mb={}", has_moe, has_fused_kernel, fused_total_mb);
-        let fused_vram_ok = if has_moe && has_fused_kernel {
-            let (free, _total) = cudarc::driver::result::mem_get_info()
+        // 1. Allocate cold staging first (budgeted in compute_scratch_vram)
+        let (d_cold_staging_buf, actual_max_cold) = if can_fused {
+            let max_cold = n_routed; // Always allocate for all experts (budgeted in scratch VRAM)
+            let total_cold = max_cold * cold_per_expert;
+            eprintln!("[PTR-TABLE] Allocating cold staging: {} MB ({}/{} experts x {} bytes)",
+                total_cold / (1024 * 1024), max_cold, n_routed, cold_per_expert);
+            let buf = self.device.alloc_zeros::<u8>(total_cold)
+                .map_err(|e| format!("alloc cold_staging: {e}"))?;
+            (Some(buf), max_cold)
+        } else {
+            (None, 0)
+        };
+
+        // 2. Try to allocate fused expert weight buffers opportunistically.
+        //    These are NOT required when cold staging covers all experts (pointer table mode).
+        //    Only allocate if there's spare VRAM after cold staging.
+        let (d_fused_expert_w1_a, d_fused_expert_w1s_a, d_fused_expert_w2_a, d_fused_expert_w2s_a,
+         d_fused_expert_w1_b, d_fused_expert_w1s_b, d_fused_expert_w2_b, d_fused_expert_w2s_b) = if can_fused {
+            let one_set_bytes = total_w1_packed + total_w1_scales + total_w2_packed + total_w2_scales;
+            let two_sets_mb = 2 * one_set_bytes / (1024 * 1024);
+            let (free, _) = cudarc::driver::result::mem_get_info()
                 .map_err(|e| format!("mem_get_info: {e}"))?;
             let free_mb = free / (1024 * 1024);
-            let ok = free_mb > fused_total_mb + 100;
-            if ok {
-                eprintln!("[FUSED-ALLOC] Allocating {} MB ({} MB free)", fused_total_mb, free_mb);
+            if actual_max_cold >= n_routed {
+                // Cold staging covers all experts — fused buffers not needed
+                eprintln!("[FUSED-ALLOC] Skipped: cold staging covers all {} experts, fused buffers not needed", n_routed);
+                (None, None, None, None, None, None, None, None)
+            } else if free_mb > two_sets_mb + 200 {
+                // Enough VRAM for fused buffers (overflow path)
+                eprintln!("[FUSED-ALLOC] Allocating {} MB expert weight buffers ({} MB free)", two_sets_mb, free_mb);
+                let alloc = |size: usize, name: &str| -> Result<Option<CudaSlice<u8>>, String> {
+                    Ok(Some(self.device.alloc_zeros::<u8>(size.max(1)).map_err(|e| format!("alloc {name}: {e}"))?))
+                };
+                (alloc(total_w1_packed, "fused_w1_a")?,
+                 alloc(total_w1_scales, "fused_w1s_a")?,
+                 alloc(total_w2_packed, "fused_w2_a")?,
+                 alloc(total_w2_scales, "fused_w2s_a")?,
+                 alloc(total_w1_packed, "fused_w1_b")?,
+                 alloc(total_w1_scales, "fused_w1s_b")?,
+                 alloc(total_w2_packed, "fused_w2_b")?,
+                 alloc(total_w2_scales, "fused_w2s_b")?)
             } else {
-                eprintln!("[FUSED-ALLOC] SKIPPING (needs {} MB, only {} MB free)", fused_total_mb, free_mb);
+                eprintln!("[FUSED-ALLOC] Skipped: needs {} MB, only {} MB free (pointer table mode)", two_sets_mb, free_mb);
+                (None, None, None, None, None, None, None, None)
             }
-            ok
         } else {
-            eprintln!("[FUSED-ALLOC] Disabled: has_moe={}, has_fused_kernel={}", has_moe, has_fused_kernel);
-            false
+            (None, None, None, None, None, None, None, None)
         };
-
-        let has_fused = has_fused_kernel && fused_vram_ok;
-
-        let alloc_fused_buf = |size: usize, name: &str| -> Result<Option<CudaSlice<u8>>, String> {
-            if has_fused {
-                Ok(Some(self.device.alloc_zeros::<u8>(size).map_err(|e| format!("alloc {name}: {e}"))?))
-            } else {
-                Ok(None)
-            }
-        };
-
-        let d_fused_expert_w1_a = alloc_fused_buf(total_w1_packed.max(1), "fused_w1_a")?;
-        let d_fused_expert_w1s_a = alloc_fused_buf(total_w1_scales.max(1), "fused_w1s_a")?;
-        let d_fused_expert_w2_a = alloc_fused_buf(total_w2_packed.max(1), "fused_w2_a")?;
-        let d_fused_expert_w2s_a = alloc_fused_buf(total_w2_scales.max(1), "fused_w2s_a")?;
-        let d_fused_expert_w1_b = alloc_fused_buf(total_w1_packed.max(1), "fused_w1_b")?;
-        let d_fused_expert_w1s_b = alloc_fused_buf(total_w1_scales.max(1), "fused_w1s_b")?;
-        let d_fused_expert_w2_b = alloc_fused_buf(total_w2_packed.max(1), "fused_w2_b")?;
-        let d_fused_expert_w2s_b = alloc_fused_buf(total_w2_scales.max(1), "fused_w2s_b")?;
-
-        // Sorted MoE buffers for fused kernel dispatch
-        let max_sorted = if has_fused { fused_sorted_count } else { 1 };
-
-        let alloc_fused_i32 = |n: usize, name: &str| -> Result<Option<CudaSlice<i32>>, String> {
-            if has_fused {
-                Ok(Some(self.device.alloc_zeros::<i32>(n).map_err(|e| format!("alloc {name}: {e}"))?))
-            } else { Ok(None) }
-        };
-        let alloc_fused_u16 = |n: usize, name: &str| -> Result<Option<CudaSlice<u16>>, String> {
-            if has_fused {
-                Ok(Some(self.device.alloc_zeros::<u16>(n).map_err(|e| format!("alloc {name}: {e}"))?))
-            } else { Ok(None) }
-        };
-        let alloc_fused_f32 = |n: usize, name: &str| -> Result<Option<CudaSlice<f32>>, String> {
-            if has_fused {
-                Ok(Some(self.device.alloc_zeros::<f32>(n).map_err(|e| format!("alloc {name}: {e}"))?))
-            } else { Ok(None) }
-        };
-
-        let max_blocks = if has_fused { fused_blocks } else { 1 };
-
-        let d_sorted_token_ids = alloc_fused_i32(max_sorted, "sorted_token_ids")?;
-        let d_fused_expert_ids = alloc_fused_i32(max_blocks, "fused_expert_ids")?;
-        let d_num_tokens_post = alloc_fused_i32(1, "num_tokens_post")?;
-        let d_fused_input = alloc_fused_u16(max_sorted * h, "fused_input")?;
-        let d_fused_inter_cache = alloc_fused_u16(max_sorted * w1_n, "fused_inter_cache")?;
-        let d_fused_inter2 = alloc_fused_u16(max_sorted * moe_inter, "fused_inter2")?;
-        let d_fused_output = alloc_fused_u16(max_sorted * h, "fused_output")?;
-        let d_fused_c_tmp = alloc_fused_f32(max_sorted * h, "fused_c_tmp")?;
 
         // Build engine
         let topk = config.num_experts_per_tok.max(1);
@@ -6134,14 +6119,6 @@ impl GpuDecodeStore {
             w1_scales_per_expert,
             w2_packed_per_expert,
             w2_scales_per_expert,
-            d_sorted_token_ids,
-            d_fused_expert_ids,
-            d_num_tokens_post,
-            d_fused_input,
-            d_fused_inter_cache,
-            d_fused_inter2,
-            d_fused_output,
-            d_fused_c_tmp,
             max_sorted,
             preloaded_moe_layer: None,
             pinning_pool_ptr: 0,
@@ -6151,19 +6128,19 @@ impl GpuDecodeStore {
             pinning_active: false,
             prescan_active_experts: Vec::new(),
             // Expert pointer table for zero-copy MoE
-            d_expert_w1_ptrs: if has_fused {
+            d_expert_w1_ptrs: if can_fused {
                 Some(self.device.alloc_zeros::<u64>(n_routed.max(1))
                     .map_err(|e| format!("alloc expert_w1_ptrs: {e}"))?)
             } else { None },
-            d_expert_w1s_ptrs: if has_fused {
+            d_expert_w1s_ptrs: if can_fused {
                 Some(self.device.alloc_zeros::<u64>(n_routed.max(1))
                     .map_err(|e| format!("alloc expert_w1s_ptrs: {e}"))?)
             } else { None },
-            d_expert_w2_ptrs: if has_fused {
+            d_expert_w2_ptrs: if can_fused {
                 Some(self.device.alloc_zeros::<u64>(n_routed.max(1))
                     .map_err(|e| format!("alloc expert_w2_ptrs: {e}"))?)
             } else { None },
-            d_expert_w2s_ptrs: if has_fused {
+            d_expert_w2s_ptrs: if can_fused {
                 Some(self.device.alloc_zeros::<u64>(n_routed.max(1))
                     .map_err(|e| format!("alloc expert_w2s_ptrs: {e}"))?)
             } else { None },
@@ -6171,19 +6148,9 @@ impl GpuDecodeStore {
             h_expert_w1s_ptrs: vec![0u64; n_routed.max(1)],
             h_expert_w2_ptrs: vec![0u64; n_routed.max(1)],
             h_expert_w2s_ptrs: vec![0u64; n_routed.max(1)],
-            d_cold_staging: if has_fused {
-                // Cold staging: sized for n_routed experts (worst case: no HCS hits)
-                let cold_per_expert = w1_packed_per_expert + w1_scales_per_expert
-                    + w2_packed_per_expert + w2_scales_per_expert;
-                let total_cold = n_routed * cold_per_expert;
-                eprintln!("[PTR-TABLE] Allocating cold staging: {} MB ({} experts x {} bytes)",
-                    total_cold / (1024 * 1024), n_routed, cold_per_expert);
-                Some(self.device.alloc_zeros::<u8>(total_cold.max(1))
-                    .map_err(|e| format!("alloc cold_staging: {e}"))?)
-            } else { None },
-            cold_expert_bytes: w1_packed_per_expert + w1_scales_per_expert
-                + w2_packed_per_expert + w2_scales_per_expert,
-            max_cold_experts: n_routed,
+            d_cold_staging: d_cold_staging_buf,
+            cold_expert_bytes: cold_per_expert,
+            max_cold_experts: actual_max_cold,
             q_type,
             qk_norm_bf16_bufs,
             gqa_timing_enabled: std::cell::Cell::new(false),
