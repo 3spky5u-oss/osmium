@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-03-26 17:57:47
+Krasis Benchmark — 2026-03-27 23:37:11
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -26,25 +26,25 @@ Strategy:
   Mode:           gpu_decode (layer_grouped(2))
 
 Prefill (internal) — 6 runs at different lengths:
-  Run 1:  579.2 tok/s (1,000 tokens in 1726.5ms)
-  Run 2:  2,879.4 tok/s (5,000 tokens in 1736.5ms)
-  Run 3:  2,684.8 tok/s (10,000 tokens in 3724.6ms)
-  Run 4:  2,183.9 tok/s (20,000 tokens in 9157.7ms)
-  Run 5:  1,647.7 tok/s (35,000 tokens in 21241.3ms)
-  Run 6:  1,344.1 tok/s (50,000 tokens in 37199.3ms)
-  Best:   2,879.4 tok/s (5,000 tokens)
+  Run 1:  665.3 tok/s (1,000 tokens in 1503.0ms)
+  Run 2:  2,899.2 tok/s (5,000 tokens in 1724.6ms)
+  Run 3:  5,096.0 tok/s (10,000 tokens in 1962.3ms)
+  Run 4:  7,707.0 tok/s (20,000 tokens in 2595.0ms)
+  Run 5:  9,578.6 tok/s (35,000 tokens in 3654.0ms)
+  Run 6:  10,009.9 tok/s (50,000 tokens in 4995.0ms)
+  Best:   10,009.9 tok/s (50,000 tokens)
 
 Decode (internal) — 50/100/250 tokens, 3 separate prompts:
-   50 tokens: 65.74 tok/s (15.2ms/tok)
-  100 tokens: 68.11 tok/s (14.7ms/tok)
-  250 tokens: 63.87 tok/s (15.7ms/tok)
-  Best:    68.11 tok/s
-  HCS:     13601/24576 experts (55.3%)
-  Min free VRAM: 566 MB
+   50 tokens: 59.04 tok/s (16.9ms/tok)
+  100 tokens: FAILED (EOS at 29 tokens) -> -1 tok/s
+  250 tokens: 63.47 tok/s (15.8ms/tok)
+  Best:    63.47 tok/s
+  HCS:     16068/24576 experts (65.4%)
+  Min free VRAM: 532 MB
 
 Round trip (network) — 50/100/250 tokens via HTTP:
-   50 tokens: 107.03 tok/s (2.44s total)
-  100 tokens: 85.33 tok/s (3.08s total)
-  250 tokens: 68.99 tok/s (5.53s total)
-  Best:    107.03 tok/s
+   50 tokens: FAILED (EOS at 8 tokens) -> -1 tok/s
+  100 tokens: 84.07 tok/s (3.39s total)
+  250 tokens: FAILED (EOS at 23 tokens) -> -1 tok/s
+  Best:    84.07 tok/s
 ================================================================

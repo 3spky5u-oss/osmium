@@ -758,6 +758,14 @@ pub struct PrefillEngine {
     pub t_moe_w2: Cell<f64>,         // fused w2 GEMM
     pub t_moe_scatter: Cell<f64>,    // scatter-add + accum_to_bf16
     pub t_moe_shared: Cell<f64>,     // shared expert (wait + add)
+    // Pin-as-you-go prefill expert cache: experts loaded during prefill are retained in VRAM.
+    // Key: (moe_layer_idx, expert_id), Value: (w13_packed_ptr, w13_scales_ptr, w2_packed_ptr, w2_scales_ptr).
+    // Managed via raw cuMemAlloc per expert. After prefill, exported to HCS decode cache.
+    pub prefill_cache: std::collections::HashMap<(usize, usize), [u64; 4]>,
+    // GPU buffers backing the prefill cache (kept alive so cuMemFree happens on clear)
+    pub prefill_cache_bufs: Vec<CudaSlice<u8>>,
+    // Total bytes pinned in prefill cache (for VRAM budget tracking)
+    pub prefill_cache_bytes: usize,
     // FLA (Flash Linear Attention) vendored kernels — replaces custom LA chunk recurrence
     pub fla: Option<FlaKernels>,
     // FLA intermediate buffers (allocated once at engine init if FLA available)
@@ -795,7 +803,18 @@ impl PrefillEngine {
         self.hcs_num_experts_per_layer = num_experts_per_layer;
     }
 
-    /// Check if an expert is GPU-resident in HCS.
+    /// Check if an expert is GPU-resident (prefill cache first, then HCS).
+    /// Returns Some((w13_packed, w13_scales, w2_packed, w2_scales)) if resident.
+    fn expert_lookup(&self, moe_layer_idx: usize, expert_idx: usize) -> Option<(u64, u64, u64, u64)> {
+        // Tier 0: prefill pin-as-you-go cache (experts loaded during this prefill)
+        if let Some(ptrs) = self.prefill_cache.get(&(moe_layer_idx, expert_idx)) {
+            return Some((ptrs[0], ptrs[1], ptrs[2], ptrs[3]));
+        }
+        // Tier 1: HCS hard pool (experts from decode)
+        self.hcs_lookup(moe_layer_idx, expert_idx)
+    }
+
+    /// Check if an expert is GPU-resident in HCS only (no prefill cache check).
     /// Returns Some((w13_packed, w13_scales, w2_packed, w2_scales)) if resident.
     fn hcs_lookup(&self, moe_layer_idx: usize, expert_idx: usize) -> Option<(u64, u64, u64, u64)> {
         if self.hcs_num_experts_per_layer == 0 { return None; }
@@ -810,6 +829,78 @@ impl PrefillEngine {
         } else {
             None
         }
+    }
+
+    /// Pin a cold expert in the prefill cache after it has been loaded to GPU.
+    /// Allocates a persistent VRAM buffer and copies from the staging slot.
+    /// Returns true if pinned successfully, false if VRAM is too tight.
+    fn pin_expert(&mut self, moe_layer_idx: usize, expert_idx: usize,
+                  w13p_src: u64, w13p_bytes: usize,
+                  w13s_src: u64, w13s_bytes: usize,
+                  w2p_src: u64, w2p_bytes: usize,
+                  w2s_src: u64, w2s_bytes: usize) -> bool {
+        // Skip if already pinned
+        if self.prefill_cache.contains_key(&(moe_layer_idx, expert_idx)) {
+            return true;
+        }
+
+        let total_bytes = w13p_bytes + w13s_bytes + w2p_bytes + w2s_bytes;
+
+        // Check VRAM headroom before allocating
+        let mut free: usize = 0;
+        let mut total: usize = 0;
+        unsafe { cuda_sys::lib().cuMemGetInfo_v2(&mut free, &mut total); }
+        let safety = std::cmp::max(400 * 1024 * 1024, total / 20); // 5% or 400MB min
+        if free < total_bytes + safety {
+            return false; // not enough VRAM headroom
+        }
+
+        // Allocate persistent buffer
+        let buf = match unsafe { self.device.alloc::<u8>(total_bytes) } {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        let base = *buf.device_ptr();
+
+        // Copy from staging to persistent buffer (D2D, fast)
+        let w13p_off = 0u64;
+        let w13s_off = w13p_bytes as u64;
+        let w2p_off = w13s_off + w13s_bytes as u64;
+        let w2s_off = w2p_off + w2p_bytes as u64;
+        unsafe {
+            cuda_sys::lib().cuMemcpyDtoDAsync_v2(base + w13p_off, w13p_src, w13p_bytes, self.stream);
+            cuda_sys::lib().cuMemcpyDtoDAsync_v2(base + w13s_off, w13s_src, w13s_bytes, self.stream);
+            cuda_sys::lib().cuMemcpyDtoDAsync_v2(base + w2p_off, w2p_src, w2p_bytes, self.stream);
+            cuda_sys::lib().cuMemcpyDtoDAsync_v2(base + w2s_off, w2s_src, w2s_bytes, self.stream);
+        }
+
+        self.prefill_cache.insert(
+            (moe_layer_idx, expert_idx),
+            [base + w13p_off, base + w13s_off, base + w2p_off, base + w2s_off],
+        );
+        self.prefill_cache_bufs.push(buf);
+        self.prefill_cache_bytes += total_bytes;
+        true
+    }
+
+    /// Clear prefill cache, freeing all pinned expert VRAM.
+    fn clear_prefill_cache(&mut self) {
+        if !self.prefill_cache.is_empty() {
+            let count = self.prefill_cache.len();
+            let mb = self.prefill_cache_bytes as f64 / (1024.0 * 1024.0);
+            eprintln!("[PREFILL-CACHE] Clearing {} pinned experts ({:.1} MB)", count, mb);
+        }
+        self.prefill_cache.clear();
+        self.prefill_cache_bufs.clear();
+        self.prefill_cache_bytes = 0;
+    }
+
+    /// Export prefill cache as flat (layer, expert, [4 ptrs]) entries for HCS import.
+    /// The returned Vec borrows nothing — caller can consume it after engine is unlocked.
+    pub fn export_prefill_cache(&self) -> Vec<(usize, usize, [u64; 4])> {
+        self.prefill_cache.iter()
+            .map(|(&(l, e), ptrs)| (l, e, *ptrs))
+            .collect()
     }
 
     /// Run the full prefill pipeline with token chunking.
@@ -959,6 +1050,9 @@ impl PrefillEngine {
     pub fn prepare_for_prefill(&mut self, prompt_tokens: usize) -> Result<(), String> {
         self.bind_cuda_context()?;
 
+        // 0. Clear prefill cache from previous request (frees pinned expert VRAM)
+        self.clear_prefill_cache();
+
         // 1. Synchronize all GPU work (ensures pending cuMemFreeAsync from HCS
         //    soft eviction have completed on cudarc's internal stream).
         unsafe { cuda_sys::lib().cuCtxSynchronize(); }
@@ -1057,6 +1151,8 @@ impl PrefillEngine {
         self.bind_cuda_context()?;
         // Synchronize to ensure all prefill GPU work is done before freeing buffers.
         unsafe { cuda_sys::lib().cuCtxSynchronize(); }
+        // Clear prefill cache first — frees pinned expert VRAM so decode HCS can reclaim it
+        self.clear_prefill_cache();
         // Replace scratch with zero-capacity (drops old, frees VRAM immediately).
         self.scratch = allocate_scratch(&self.device, &self.config, 0)
             .map_err(|e| format!("alloc empty scratch: {e}"))?;
@@ -3137,7 +3233,7 @@ impl PrefillEngine {
                         o_grid_x, fla_nt as u32, nv as u32, stream_ptr)
                 };
                 if rc != 0 { return Err(format!("FLA output failed: {}", rc)); }
-                if fla_debug { self.stream_sync().map_err(|e| format!("FLA output sync: {e}"))?; eprintln!("[FLA-DBG] step6 output OK"); }
+                if std::env::var("KRASIS_FLA_DEBUG").is_ok() { self.stream_sync().map_err(|e| format!("FLA output sync: {e}"))?; eprintln!("[FLA-DBG] step6 output OK"); }
                 if lt { self.stream_sync()?; self.t_la_fla.set(self.t_la_fla.get() + lt4.elapsed().as_secs_f64() * 1000.0); }
                 let lt5 = Instant::now();
 
@@ -4102,8 +4198,8 @@ impl PrefillEngine {
             } else { None };
 
             for &eid in &active {
-                // Try HCS first (zero copy — point directly into HCS VRAM)
-                if let Some((hw1p, hw1s, hw2p, hw2s)) = self.hcs_lookup(mi, eid) {
+                // Try prefill cache + HCS first (zero copy — point directly into VRAM)
+                if let Some((hw1p, hw1s, hw2p, hw2s)) = self.expert_lookup(mi, eid) {
                     self.h_expert_w1_ptrs[eid] = hw1p;
                     self.h_expert_w1s_ptrs[eid] = hw1s;
                     self.h_expert_w2_ptrs[eid] = hw2p;
@@ -4635,7 +4731,7 @@ impl PrefillEngine {
                 // Get ORIGINAL weight locations (HCS or cold), NOT from fused buffer
                 let (orig_w1p, orig_w1s, orig_w2p, orig_w2s) =
                     if let Some(moe_idx) = moe_layer_idx {
-                        if let Some((hw1p, hw1s, hw2p, hw2s)) = self.hcs_lookup(moe_idx, eid) {
+                        if let Some((hw1p, hw1s, hw2p, hw2s)) = self.expert_lookup(moe_idx, eid) {
                             (hw1p, hw1s, hw2p, hw2s)
                         } else {
                             // Cold expert: skip (would need H2D copy)
@@ -4924,6 +5020,10 @@ impl PrefillEngine {
             eprintln!("[DIAG FUSED L0] hidden_after_bf16[tok0] L2={:.4} first4={:?}",
                 norm, h_hid[..4].iter().map(|&v| half::bf16::from_bits(v).to_f32()).collect::<Vec<f32>>());
         }
+
+        // NOTE: Pin-as-you-go caching is deferred to rolling-scan pipeline (multi-chunk only).
+        // Single-chunk prompts have no cross-chunk reuse, so pinning wastes VRAM and fragments
+        // the allocator. The fused_pin_queue data is available when rolling-scan is implemented.
 
         // Free per-layer pointer table GPU buffers (allocated with raw cuMemAlloc_v2)
         if use_ptr_table {
@@ -5230,7 +5330,7 @@ impl PrefillEngine {
         let num_groups_w13 = if gs > 0 { h / gs } else { 0 };
         let num_groups_w2 = if gs > 0 { inter / gs } else { 0 };
 
-        // Collect active experts, check HCS residency
+        // Collect active experts, check cache residency (prefill cache -> HCS -> cold)
         struct ExpertWork {
             eid: usize,
             count: usize,
@@ -5239,7 +5339,7 @@ impl PrefillEngine {
             w13_scales: u64,
             w2_packed: u64,
             w2_scales: u64,
-            is_hcs: bool,
+            is_cached: bool,  // true = in prefill cache or HCS (zero-copy, no DMA needed)
         }
         let mut work: Vec<ExpertWork> = Vec::new();
 
@@ -5251,12 +5351,12 @@ impl PrefillEngine {
             let eo = expert_offsets[eid];
 
             if let Some(moe_idx) = moe_layer_idx {
-                if let Some((w13p, w13s, w2p, w2s)) = self.hcs_lookup(moe_idx, eid) {
+                if let Some((w13p, w13s, w2p, w2s)) = self.expert_lookup(moe_idx, eid) {
                     work.push(ExpertWork {
                         eid, count, offset: eo,
                         w13_packed: w13p, w13_scales: w13s,
                         w2_packed: w2p, w2_scales: w2s,
-                        is_hcs: true,
+                        is_cached: true,
                     });
                     continue;
                 }
@@ -5266,14 +5366,14 @@ impl PrefillEngine {
                 eid, count, offset: eo,
                 w13_packed: 0, w13_scales: 0,
                 w2_packed: 0, w2_scales: 0,
-                is_hcs: false,
+                is_cached: false,
             });
         }
 
-        // Launch shared expert async if all experts are HCS-resident (no DMA conflict)
+        // Launch shared expert async if all experts are cached (no DMA conflict)
         // Force sync when diagnostics are active so we can add intermediate norm checks
-        let all_hcs = work.iter().all(|w| w.is_hcs);
-        let shared_async = has_shared && all_hcs && !(diag && layer_idx < diag_layer_limit);
+        let all_cached = work.iter().all(|w| w.is_cached);
+        let shared_async = has_shared && all_cached && !(diag && layer_idx < diag_layer_limit);
         if shared_async {
             unsafe {
                 cuda_sys::lib().cuEventRecord(self.compute_event, self.stream);
@@ -5283,9 +5383,9 @@ impl PrefillEngine {
             self.launch_shared_expert_async(layer_idx, m)?;
         }
 
-        // Process HCS experts first (no DMA)
+        // Process cached experts first (no DMA — from prefill cache or HCS)
         for w in &work {
-            if !w.is_hcs { continue; }
+            if !w.is_cached { continue; }
             let gathered_slice = gathered + (w.offset * h * 2) as u64;
             self.run_expert_gemm(
                 gathered_slice, expert_out, gate_up_buf, inter_buf,
@@ -5300,9 +5400,8 @@ impl PrefillEngine {
         let cold_work: Vec<&ExpertWork> = if std::env::var("KRASIS_SKIP_COLD").is_ok() {
             Vec::new()
         } else {
-            work.iter().filter(|w| !w.is_hcs).collect()
+            work.iter().filter(|w| !w.is_cached).collect()
         };
-
         if !cold_work.is_empty() {
             if let Some(moe_idx) = moe_layer_idx {
                 if let Some(Some(moe_data)) = self.moe_layers.get(moe_idx) {
@@ -5381,6 +5480,9 @@ impl PrefillEngine {
             }
         }
 
+        // NOTE: Pin-as-you-go caching deferred to rolling-scan pipeline (multi-chunk only).
+        // pin_queue data is available when rolling-scan is implemented.
+
         // Diagnostic: dump per-row expert_out norms before scatter to find outliers
         if diag && diag_moe_detail && layer_idx < diag_layer_limit && total_active > 0 {
             self.stream_sync()?;
@@ -5426,9 +5528,9 @@ impl PrefillEngine {
                 eprintln!("[DIAG] layer{:02}_moe OUTLIER expert_out rows (norm>5): {} of {} rows",
                     layer_idx, outlier_rows.len(), total_active);
                 for &(row, tok, norm, wt, eid) in outlier_rows.iter().take(30) {
-                    let is_hcs = work.iter().find(|w| w.eid == eid).map(|w| w.is_hcs).unwrap_or(false);
-                    eprintln!("[DIAG]   row={} tok={} expert={} norm={:.4} wt={:.6} hcs={}",
-                        row, tok, eid, norm, wt, is_hcs);
+                    let is_cached = work.iter().find(|w| w.eid == eid).map(|w| w.is_cached).unwrap_or(false);
+                    eprintln!("[DIAG]   row={} tok={} expert={} norm={:.4} wt={:.6} cached={}",
+                        row, tok, eid, norm, wt, is_cached);
                 }
             }
             // Also check gathered input norm for outlier rows
@@ -6470,8 +6572,8 @@ impl PrefillEngine {
             let w2_off = (eid * self.w2_packed_per_expert) as u64;
             let w2s_off = (eid * self.w2_scales_per_expert) as u64;
 
-            // Tier 1: Check HCS hard pool (already GPU-resident from decode)
-            if let Some((hw1p, hw1s, hw2p, hw2s)) = self.hcs_lookup(model_layer_idx, eid) {
+            // Tier 1: Check prefill cache + HCS (GPU-resident experts)
+            if let Some((hw1p, hw1s, hw2p, hw2s)) = self.expert_lookup(model_layer_idx, eid) {
                 // Fast D2D from HCS cache to fused buffer
                 unsafe {
                     cuda_sys::lib().cuMemcpyDtoDAsync_v2(
