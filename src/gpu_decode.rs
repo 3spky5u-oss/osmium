@@ -5502,7 +5502,7 @@ impl GpuDecodeStore {
             }
         }
 
-        let config = PrefillModelConfig {
+        let mut config = PrefillModelConfig {
             hidden_size: graph.hidden_size,
             intermediate_size: graph.moe_intermediate_size.max(graph.intermediate_size),
             moe_intermediate_size: graph.moe_intermediate_size,
@@ -5545,9 +5545,31 @@ impl GpuDecodeStore {
             la_scale,
             la_chunk_size: 64,
             rope_half_dim: graph.rope_half_dim,
-            prefill_chunk_size: 5000, // match Python default; 0 = no chunking
+            prefill_chunk_size: 0, // computed dynamically below
             layer_group_size: 4,      // group MoE layers for expert DMA pipelining
         };
+
+        // Compute dynamic prefill chunk size from available VRAM.
+        // Called BEFORE HCS allocation, so most free VRAM is available for scratch.
+        {
+            let (fixed_bytes, per_token_bytes) = crate::gpu_prefill::compute_scratch_vram(&config);
+            let mut free: usize = 0;
+            let mut _total: usize = 0;
+            unsafe { cuda_sys::lib().cuMemGetInfo_v2(&mut free, &mut _total); }
+            // Reserve safety margin (600 MB for CUDA overhead, cold staging, pointer tables)
+            let safety_mb = 600;
+            let usable = free.saturating_sub(safety_mb * 1024 * 1024).saturating_sub(fixed_bytes);
+            let max_by_vram = if per_token_bytes > 0 { usable / per_token_bytes } else { 50000 };
+            // Cap at 50K tokens (more than any practical prompt), floor at 2000
+            let chunk_size = max_by_vram.max(2000).min(50000);
+            config.prefill_chunk_size = chunk_size;
+            eprintln!("[PREFILL] Dynamic chunk size: {} tokens ({:.1} MB scratch, {} bytes/tok, {:.0} MB VRAM free, {} MB safety)",
+                chunk_size,
+                (fixed_bytes + per_token_bytes * chunk_size) as f64 / (1024.0 * 1024.0),
+                per_token_bytes,
+                free as f64 / (1024.0 * 1024.0),
+                safety_mb);
+        }
 
         // Build per-layer weights
         let mut layer_weights = Vec::with_capacity(num_layers);
@@ -5872,7 +5894,7 @@ impl GpuDecodeStore {
         } else {
             max_tokens
         };
-        log::info!("Prefill scratch: {} tokens (chunk_size={}, max_context={})",
+        eprintln!("[PREFILL] Scratch allocated: {} tokens (chunk_size={}, max_context={})",
             scratch_tokens, config.prefill_chunk_size, max_tokens);
         let scratch = allocate_scratch(&self.device, &config, scratch_tokens)?;
 

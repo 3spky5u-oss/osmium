@@ -6918,6 +6918,155 @@ impl PrefillKernels {
 //  Scratch allocation
 // ════════════════════════════════════════════════════════════════════════
 
+/// Compute total VRAM bytes needed for scratch buffers as a function of max_tokens.
+/// Returns (fixed_bytes, per_token_bytes) so that total = fixed + per_token * max_tokens.
+/// This is used to dynamically compute the largest chunk size that fits in available VRAM.
+pub fn compute_scratch_vram(config: &PrefillModelConfig) -> (usize, usize) {
+    let h = config.hidden_size;
+    let inter = config.intermediate_size;
+    let moe_inter = config.moe_intermediate_size;
+    let topk = config.num_experts_per_tok.max(1);
+    let has_la = config.layer_types.iter().any(|&t| t == 3);
+    let has_mamba2 = config.layer_types.iter().any(|&t| t == 1);
+
+    // Per-token costs (in bytes):
+    let mut per_token: usize = 0;
+
+    // d_hidden: max_tokens * h * 2 (BF16)
+    per_token += h * 2;
+    // d_residual: max_tokens * h * 2
+    per_token += h * 2;
+    // d_scratch1: max(max_tokens * inter * 2, max_tokens * num_q_heads * head_dim * 2) * 2 bytes
+    let max_inter_per_tok = std::cmp::max(
+        inter * 2,
+        config.num_q_heads * config.head_dim * 2,
+    );
+    per_token += max_inter_per_tok * 2; // BF16
+    // d_scratch2: same size
+    per_token += max_inter_per_tok * 2;
+    // d_fp32_scratch: max(marlin_ctmp, la_size) -- both scale with max_tokens
+    {
+        let mut max_gemm_n = std::cmp::max(h, inter * 2);
+        let gqa_q_n = config.num_q_heads * config.head_dim * 2;
+        if gqa_q_n > max_gemm_n { max_gemm_n = gqa_q_n; }
+        if has_la {
+            let nk = config.la_num_k_heads;
+            let dk = config.la_k_head_dim;
+            let dv = config.la_v_head_dim;
+            let hr = config.la_head_ratio.max(1);
+            let group_dim = 2 * dk + 2 * hr * dv;
+            let qkvz_n = nk * group_dim;
+            if qkvz_n > max_gemm_n { max_gemm_n = qkvz_n; }
+        }
+        let marlin_per_tok = max_gemm_n; // FP32 = 4 bytes each
+        let la_per_tok = if has_la {
+            let nv = config.la_num_v_heads;
+            let dv = config.la_v_head_dim;
+            let conv_dim = config.la_conv_dim;
+            // output_buf = nv * max_tokens * dv, conv_transpose = max_tokens * conv_dim
+            // (chunk_temps are fixed-size based on la_chunk_size, not max_tokens)
+            std::cmp::max(nv * dv, conv_dim)
+        } else { 0 };
+        per_token += std::cmp::max(marlin_per_tok, la_per_tok) * 4; // FP32
+    }
+    // d_workspace: fixed (sms * 4 * 4 bytes) -- ignore per-token
+    // d_topk_weights: max_tokens * topk * 4
+    per_token += topk * 4;
+    // d_topk_ids: max_tokens * topk * 4
+    per_token += topk * 4;
+    // d_token_ids: max_tokens * 4
+    per_token += 4;
+    // d_positions: max_tokens * 4
+    per_token += 4;
+    // d_attn_out: max_tokens * h * 2
+    per_token += h * 2;
+    // d_q: max_tokens * num_q_heads * head_dim * 2
+    per_token += config.num_q_heads * config.head_dim * 2;
+    // d_k: max_tokens * num_kv_heads * head_dim * 2
+    per_token += config.num_kv_heads * config.head_dim * 2;
+    // d_v: max_tokens * num_kv_heads * head_dim * 2
+    per_token += config.num_kv_heads * config.head_dim * 2;
+    // MoE buffers (scale with max_tokens * topk mostly)
+    // d_gate_out: max_tokens * n_routed_experts * 4
+    per_token += config.n_routed_experts.max(1) * 4;
+    // d_moe_accum: max_tokens * h * 4
+    per_token += h * 4;
+    // d_moe_gathered: max_tokens * topk * h * 2
+    per_token += topk * h * 2;
+    // d_moe_expert_out: max_tokens * topk * h * 2
+    per_token += topk * h * 2;
+    // d_moe_gate_up: max_tokens * topk * 2 * moe_inter * 2
+    per_token += topk * moe_inter * 2 * 2;
+    // d_moe_inter: max_tokens * topk * moe_inter * 2
+    per_token += topk * moe_inter * 2;
+    // d_gather_src_map: max_tokens * topk * 4
+    per_token += topk * 4;
+    // d_gather_weight_map: max_tokens * topk * 4
+    per_token += topk * 4;
+    // LA buffers (scale with la_max_len = max_tokens + la_chunk_size, approx max_tokens)
+    if has_la {
+        let nv = config.la_num_v_heads;
+        let dk = config.la_k_head_dim;
+        let dv = config.la_v_head_dim;
+        // d_la_q, d_la_k: max_tokens * nv * dk * 4 (FP32) each
+        per_token += nv * dk * 4 * 2;
+        // d_la_v: max_tokens * nv * dv * 4
+        per_token += nv * dv * 4;
+        // d_la_z: max_tokens * nv * dv * 2 (BF16)
+        per_token += nv * dv * 2;
+        // d_la_b, d_la_a: max_tokens * nv * 2 each
+        per_token += nv * 2 * 2;
+        // d_la_beta, d_la_gate: max_tokens * nv * 4 each
+        per_token += nv * 4 * 2;
+        // d_la_conv_out: conv_dim * max_tokens * 4
+        per_token += config.la_conv_dim * 4;
+        // d_la_v_beta, d_la_v_new: nv * max_tokens * dv * 4 each
+        per_token += nv * dv * 4 * 2;
+        // d_la_g_cum: nv * max_tokens * 4 (approx -- actual is nv * num_chunks * chunk_size)
+        per_token += nv * 4;
+        // d_la_chunk_out, d_la_q_contig: nv * chunk_size * dk * 4 -- fixed, not per-token
+    }
+    // Mamba2 buffers: mostly fixed-size, ignore for per-token estimate
+
+    // Fixed costs (independent of max_tokens):
+    let mut fixed: usize = 0;
+    // d_workspace: sms * 4 * 4
+    fixed += config.sms * 4 * 4;
+    // d_logits: vocab_size * 4
+    fixed += config.vocab_size * 4;
+    // d_expert_counts, offsets, write_offsets: n_routed * 4 each
+    fixed += config.n_routed_experts.max(1) * 4 * 3;
+    // Expert DMA double-buffers (A+B for w13, w13s, w2, w2s -- 8 buffers total, each one expert)
+    if config.n_routed_experts > 0 {
+        let w13_n = if config.moe_gated { 2 * moe_inter } else { moe_inter };
+        let expert_bytes = h * w13_n * config.expert_bits as usize / 8  // w13 packed
+            + (h / config.group_size.max(1)) * w13_n * 2               // w13 scales
+            + moe_inter * h * config.expert_bits as usize / 8          // w2 packed
+            + (moe_inter / config.group_size.max(1)) * h * 2;          // w2 scales
+        fixed += expert_bytes * 2; // A + B buffers
+    }
+    if has_la {
+        let nv = config.la_num_v_heads;
+        let dk = config.la_k_head_dim;
+        let dv = config.la_v_head_dim;
+        let cs = config.la_chunk_size;
+        // LA chunk-sized buffers (fixed)
+        fixed += nv * cs * dk * 4; // d_la_chunk_out
+        fixed += nv * cs * dk * 4; // d_la_q_contig
+    }
+    if has_mamba2 {
+        fixed += config.mamba_conv_dim * config.mamba_conv_kernel.max(2) * 4;
+        fixed += config.mamba_num_heads * config.mamba_head_dim * config.mamba_d_state * 4;
+        let dim = 2 * config.mamba_d_inner
+            + 2 * config.mamba_n_groups * config.mamba_d_state
+            + config.mamba_num_heads;
+        fixed += dim * 2; // per token but just 1 token for mamba init
+        fixed += config.mamba_d_inner * 2;
+    }
+
+    (fixed, per_token)
+}
+
 pub fn allocate_scratch(
     device: &Arc<CudaDevice>,
     config: &PrefillModelConfig,
