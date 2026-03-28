@@ -1,5 +1,5 @@
 ================================================================
-Krasis Benchmark — 2026-03-28 09:21:02
+Krasis Benchmark — 2026-03-28 20:21:49
 ================================================================
 Model:            Qwen3-Coder-Next
 Architecture:     qwen3_next, 48 layers, 512 experts, top-10, 12 GQA + 36 linear
@@ -7,7 +7,7 @@ PP Partition:     [48] (1 GPUs)
 
 Hardware:
   CPU:            AMD EPYC 7742 64-Core Processor (64 cores)
-  RAM:            1007 GB total, 43.5 GB used by process
+  RAM:            1007 GB total, 66.3 GB used by process
   GPU 0:          NVIDIA GeForce RTX 5090 (32607 MB), 3792 MB allocated
   GPU 1:          NVIDIA RTX 2000 Ada Generation (16380 MB), N/A
 
@@ -26,25 +26,25 @@ Strategy:
   Mode:           gpu_decode (layer_grouped(2))
 
 Prefill (internal) — 6 runs at different lengths:
-  Run 1:  1,250.7 tok/s (1,000 tokens in 799.5ms)
-  Run 2:  4,778.1 tok/s (5,000 tokens in 1046.4ms)
-  Run 3:  6,967.1 tok/s (10,000 tokens in 1435.3ms)
-  Run 4:  8,316.2 tok/s (20,000 tokens in 2405.0ms)
-  Run 5:  9,127.6 tok/s (35,000 tokens in 3834.5ms)
-  Run 6:  9,746.7 tok/s (50,000 tokens in 5129.9ms)
-  Best:   9,746.7 tok/s (50,000 tokens)
+  Run 1:  1,409.9 tok/s (1,000 tokens in 709.3ms)
+  Run 2:  4,729.6 tok/s (5,000 tokens in 1057.2ms)
+  Run 3:  6,558.4 tok/s (10,000 tokens in 1524.8ms)
+  Run 4:  7,701.3 tok/s (20,000 tokens in 2597.0ms)
+  Run 5:  9,521.6 tok/s (35,000 tokens in 3675.9ms)
+  Run 6:  10,052.3 tok/s (50,000 tokens in 4974.0ms)
+  Best:   10,052.3 tok/s (50,000 tokens)
 
 Decode (internal) — 50/100/250 tokens, 3 separate prompts:
-   50 tokens: 55.35 tok/s (18.1ms/tok)
-  100 tokens: FAILED (EOS at 8 tokens) -> -1 tok/s
-  250 tokens: 61.66 tok/s (16.2ms/tok)
-  Best:    61.66 tok/s
-  HCS:     14881/24576 experts (60.6%)
-  Min free VRAM: 2388 MB
+   50 tokens: FAILED (EOS at 24 tokens) -> -1 tok/s
+  100 tokens: 61.07 tok/s (16.4ms/tok)
+  250 tokens: 63.12 tok/s (15.8ms/tok)
+  Best:    63.12 tok/s
+  HCS:     16897/24576 experts (68.8%)
+  Min free VRAM: 530 MB
 
 Round trip (network) — 50/100/250 tokens via HTTP:
-   50 tokens: FAILED (EOS at 25 tokens) -> -1 tok/s
-  100 tokens: FAILED (EOS at 7 tokens) -> -1 tok/s
-  250 tokens: 66.46 tok/s (4.43s total)
-  Best:    66.46 tok/s
+   50 tokens: 118.13 tok/s (1.27s total)
+  100 tokens: 86.20 tok/s (1.91s total)
+  250 tokens: 70.23 tok/s (4.27s total)
+  Best:    118.13 tok/s
 ================================================================

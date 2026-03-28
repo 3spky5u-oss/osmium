@@ -674,8 +674,10 @@ pub struct PrefillEngine {
     pub shared_stream: cuda_sys::CUstream,
     pub shared_event: cuda_sys::CUevent,
     // Separate Marlin workspace for shared_stream (avoids d_fp32_scratch conflict)
-    pub d_shared_fp32_scratch: CudaSlice<f32>,
-    pub d_shared_workspace: CudaSlice<i32>,
+    // These are allocated dynamically in prepare_for_prefill and freed in release_scratch
+    // to maximize VRAM available for HCS during decode.
+    pub d_shared_fp32_scratch: Option<CudaSlice<f32>>,
+    pub d_shared_workspace: Option<CudaSlice<i32>>,
     // Contiguous expert weight buffers for fused MoE (gap 1)
     // Two sets (A/B) for double-buffered layer-level preload (gap 2)
     pub d_fused_expert_w1_a: Option<CudaSlice<u8>>,  // [E, w1_packed_bytes_per_expert]
@@ -968,7 +970,6 @@ impl PrefillEngine {
         // 2. Trim cudarc's default memory pool to release HCS soft VRAM back to OS.
         //    This only releases UNUSED (freed) pool memory — HCS hard pool is still
         //    allocated and untouched. Safe because we just synchronized all streams.
-        let cold_ptr_before = self.d_cold_staging.as_ref().map_or(0, |s| *s.device_ptr());
         let mut free_before: usize = 0;
         let mut total_before: usize = 0;
         unsafe { cuda_sys::lib().cuMemGetInfo_v2(&mut free_before, &mut total_before); }
@@ -982,21 +983,20 @@ impl PrefillEngine {
                 let mut free_after: usize = 0;
                 let mut total_after: usize = 0;
                 cuda_sys::lib().cuMemGetInfo_v2(&mut free_after, &mut total_after);
-                let cold_ptr_after = self.d_cold_staging.as_ref().map_or(0, |s| *s.device_ptr());
-                eprintln!("[SCRATCH] Pool trim: {:?}, freed {} MB, cold_staging ptr: 0x{:x} -> 0x{:x} ({})",
-                    trim_err,
-                    (free_after - free_before) / (1024 * 1024),
-                    cold_ptr_before, cold_ptr_after,
-                    if cold_ptr_before == cold_ptr_after { "OK" } else { "CHANGED!" });
+                eprintln!("[SCRATCH] Pool trim: {:?}, freed {} MB",
+                    trim_err, (free_after - free_before) / (1024 * 1024));
             }
         }
 
         // 3. Drop old scratch to free its VRAM (GpuBuf::drop = cuMemFree_v2, immediate).
-        //    Replace with a zero-capacity scratch temporarily.
+        //    Also free prefill-only GPU buffers from previous request.
         let old_tokens = self.scratch.max_tokens;
         self.scratch = allocate_scratch(&self.device, &self.config, 0)
             .map_err(|e| format!("alloc empty scratch: {e}"))?;
-        // Old scratch is now dropped, VRAM is freed.
+        self.d_cold_staging = None;
+        self.d_shared_fp32_scratch = None;
+        self.d_shared_workspace = None;
+        // Old scratch + prefill buffers now dropped, VRAM is freed.
 
         // 4. Measure free VRAM and compute optimal chunk_size for this prompt.
         let (fixed_bytes, per_token_bytes) = compute_scratch_vram(&self.config);
@@ -1005,19 +1005,40 @@ impl PrefillEngine {
         unsafe { cuda_sys::lib().cuMemGetInfo_v2(&mut free_bytes, &mut total_bytes); }
         // Safety margin covers CUDA context overhead, allocator fragmentation, and
         // FLA Triton kernel temporaries. 600 MB is sufficient based on runtime measurements.
-        // NOTE: cold_staging is already allocated (reflected in free_bytes), do NOT
-        // double-count it here.
         let safety_bytes: usize = PREFILL_SAFETY_MARGIN_MB * 1024 * 1024;
 
         let usable = free_bytes.saturating_sub(safety_bytes).saturating_sub(fixed_bytes);
         let max_by_vram = if per_token_bytes > 0 { usable / per_token_bytes } else { 50000 };
 
-        // Size for this prompt: cap at prompt_tokens (no point allocating more),
-        // but allow at least 1000 tokens for safety.
+        // Size for this prompt: cap at prompt_tokens (no point allocating more).
+        // Minimum 128: fused MoE Marlin kernels use block_size_m=64, need enough
+        // tokens for stable sorted dispatch. 128 adds ~57 MB scratch overhead.
         let target = prompt_tokens.min(50000);
-        let scratch_tokens = max_by_vram.min(target).max(1000);
+        let scratch_tokens = max_by_vram.min(target).max(128);
 
-        // 5. Allocate new scratch sized for this prompt.
+        // 5. Allocate prefill-only GPU buffers: cold staging + shared expert scratch.
+        //    These are freed in release_scratch to maximize VRAM for HCS during decode.
+        let n_routed = self.config.n_routed_experts;
+        if n_routed > 0 {
+            let total_cold = n_routed * self.cold_expert_bytes;
+            let buf = self.device.alloc_zeros::<u8>(total_cold)
+                .map_err(|e| format!("alloc cold_staging: {e}"))?;
+            eprintln!("[PREFILL] Cold staging: {} MB ({} experts)", total_cold / (1024 * 1024), n_routed);
+            self.d_cold_staging = Some(buf);
+            self.max_cold_experts = n_routed;
+        }
+
+        // Shared expert Marlin workspace: sized for actual chunk, not max possible.
+        let shared_scratch_n = std::cmp::max(self.config.hidden_size, self.config.moe_intermediate_size);
+        let shared_scratch_elems = scratch_tokens * shared_scratch_n;
+        if shared_scratch_elems > 0 {
+            self.d_shared_fp32_scratch = Some(self.device.alloc_zeros::<f32>(shared_scratch_elems)
+                .map_err(|e| format!("alloc shared_fp32_scratch: {e}"))?);
+            self.d_shared_workspace = Some(self.device.alloc_zeros::<i32>(self.config.sms * 4)
+                .map_err(|e| format!("alloc shared_workspace: {e}"))?);
+        }
+
+        // 6. Allocate new scratch sized for this prompt.
         self.scratch = allocate_scratch(&self.device, &self.config, scratch_tokens)?;
         self.config.prefill_chunk_size = scratch_tokens;
 
@@ -1028,23 +1049,10 @@ impl PrefillEngine {
                 free_bytes as f64 / (1024.0 * 1024.0));
         }
 
-        // Verify cold staging is still readable after pool trim + scratch alloc.
-        if let Some(ref cold) = self.d_cold_staging {
-            let cold_ptr = *cold.device_ptr();
-            let mut probe: u8 = 0;
-            let err = unsafe {
-                cuda_sys::lib().cuMemcpyDtoH_v2(&mut probe as *mut u8 as *mut _, cold_ptr, 1)
-            };
-            if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                eprintln!("[SCRATCH] FATAL: cold staging at 0x{:x} is UNREADABLE after scratch alloc: {:?}", cold_ptr, err);
-                return Err(format!("cold staging corrupted by pool trim: {:?}", err));
-            }
-        }
-
         Ok(())
     }
 
-    /// Release scratch VRAM after prefill so HCS can reclaim it for decode.
+    /// Release scratch VRAM and prefill-only buffers so HCS can reclaim VRAM for decode.
     /// GpuBuf::drop calls cuMemFree_v2 (synchronous, immediate release).
     pub fn release_scratch(&mut self) -> Result<(), String> {
         self.bind_cuda_context()?;
@@ -1054,6 +1062,23 @@ impl PrefillEngine {
         self.scratch = allocate_scratch(&self.device, &self.config, 0)
             .map_err(|e| format!("alloc empty scratch: {e}"))?;
         self.config.prefill_chunk_size = 0;
+        // Free prefill-only GPU buffers: cold staging + shared expert scratch.
+        // These are only needed during prefill and waste ~1.2 GB of HCS space if kept.
+        self.d_cold_staging = None;
+        self.d_shared_fp32_scratch = None;
+        self.d_shared_workspace = None;
+        // Trim cudarc's memory pool so freed memory returns to the OS immediately.
+        // Without this, cudarc holds the freed cold_staging/shared_scratch in its pool,
+        // and HCS reload can't use that VRAM.
+        unsafe {
+            let mut pool: cuda_sys::CUmemoryPool = std::ptr::null_mut();
+            let mut dev: i32 = 0;
+            cuda_sys::lib().cuCtxGetDevice(&mut dev);
+            let err = cuda_sys::lib().cuDeviceGetDefaultMemPool(&mut pool, dev);
+            if err == cuda_sys::CUresult::CUDA_SUCCESS && !pool.is_null() {
+                cuda_sys::lib().cuMemPoolTrimTo(pool, 0);
+            }
+        }
         Ok(())
     }
 
@@ -5747,8 +5772,10 @@ impl PrefillEngine {
         let st = if sw1.num_bits == 4 { &ScalarType::U4B8 } else { &ScalarType::U8B128 };
         let f = self.kernels.marlin_mm.ok_or("Marlin GEMM not loaded")?;
 
-        let shared_scratch = *self.d_shared_fp32_scratch.device_ptr();
-        let shared_ws = *self.d_shared_workspace.device_ptr();
+        let shared_scratch = *self.d_shared_fp32_scratch.as_ref()
+            .ok_or("d_shared_fp32_scratch not allocated (call prepare_for_prefill first)")?.device_ptr();
+        let shared_ws = *self.d_shared_workspace.as_ref()
+            .ok_or("d_shared_workspace not allocated (call prepare_for_prefill first)")?.device_ptr();
         let shared_ws_len = self.config.sms * 4;
 
         // Zero workspace + C_tmp before w1 GEMM
@@ -6541,8 +6568,10 @@ impl PrefillEngine {
         let f = self.kernels.marlin_mm.ok_or("Marlin GEMM not loaded")?;
 
         // Use shared_stream + shared workspace to avoid conflicts
-        let shared_scratch = *self.d_shared_fp32_scratch.device_ptr();
-        let shared_ws = *self.d_shared_workspace.device_ptr();
+        let shared_scratch = *self.d_shared_fp32_scratch.as_ref()
+            .ok_or("d_shared_fp32_scratch not allocated")?.device_ptr();
+        let shared_ws = *self.d_shared_workspace.as_ref()
+            .ok_or("d_shared_workspace not allocated")?.device_ptr();
 
         // w1 GEMM on shared_stream — zero workspace locks + C_tmp first
         unsafe {
@@ -7268,6 +7297,11 @@ pub fn compute_scratch_vram(config: &PrefillModelConfig) -> (usize, usize) {
     per_token += topk * 4;
     // d_gather_weight_map: max_tokens * topk * 4 (sequential only, small)
     per_token += topk * 4;
+    // d_shared_fp32_scratch: max_tokens * max(h, moe_inter) * 4 (FP32)
+    // Shared expert Marlin workspace, allocated dynamically in prepare_for_prefill.
+    if config.n_routed_experts > 0 {
+        per_token += std::cmp::max(h, moe_inter) * 4;
+    }
     // LA buffers (scale with la_max_len = max_tokens + la_chunk_size, approx max_tokens)
     if has_la {
         let nv = config.la_num_v_heads;
@@ -7305,6 +7339,10 @@ pub fn compute_scratch_vram(config: &PrefillModelConfig) -> (usize, usize) {
     let mut fixed: usize = 0;
     // d_workspace: sms * 4 * 4
     fixed += config.sms * 4 * 4;
+    // d_shared_workspace: sms * 4 * 4 (shared expert stream, allocated in prepare_for_prefill)
+    if config.n_routed_experts > 0 {
+        fixed += config.sms * 4 * 4;
+    }
     // d_logits: vocab_size * 4
     fixed += config.vocab_size * 4;
     // d_expert_counts, offsets, write_offsets: n_routed * 4 each
@@ -7373,6 +7411,19 @@ pub fn allocate_scratch(
     let inter = config.intermediate_size;           // max of dense + moe for general scratch
     let moe_inter = config.moe_intermediate_size;   // actual MoE expert intermediate
     let topk = config.num_experts_per_tok.max(1);
+
+    // Fused sorted count: max_tokens * topk + n_routed * block_size (block padding for Marlin).
+    // When max_tokens=0 (init/release), use fsc=1 to avoid allocating ~608 MB of block-padding
+    // buffers that sit idle during decode. These buffers eat HCS space and cause double-counting
+    // in the VRAM budget. compute_scratch_vram correctly reports the full cost including padding
+    // for budget purposes; we just avoid physically allocating it when nothing is running.
+    let block_size_moe: usize = 64;
+    let n_routed = config.n_routed_experts;
+    let fsc = if max_tokens > 0 {
+        max_tokens * topk + n_routed * block_size_moe
+    } else {
+        1 // minimal placeholder — no MoE execution at 0 tokens
+    };
 
     // GpuBuf uses raw cuMemAlloc_v2 (synchronous, no pool) so alloc/free
     // is immediate and deterministic — no interaction with cudarc's pool.
@@ -7479,59 +7530,29 @@ pub fn allocate_scratch(
         d_mamba2_ssd_out: if has_mamba2 {
             Some(alloc_u16(max_tokens * config.mamba_d_inner, "mamba2_ssd_out")?)
         } else { None },
-        // MoE buffers: sized for fused_sorted_count so both fused and sequential share them.
-        // fused_sorted_count = max_tokens * topk + n_routed * block_size
+        // MoE buffers: sized for fsc (fused_sorted_count) computed above.
+        // When max_tokens=0 (init/release), fsc=1 to avoid wasting ~608 MB on block padding.
         d_gate_out: alloc_f32(max_tokens * config.n_routed_experts.max(1), "gate_out")?,
         d_moe_accum: {
             let w1_n = if config.moe_gated { 2 * moe_inter } else { moe_inter };
-            let block_sz: usize = 64; // MarlinDefault block_size_m
-            let n_routed = config.n_routed_experts;
-            let fsc = max_tokens * topk + n_routed * block_sz;
             alloc_f32(fsc * std::cmp::max(w1_n, h), "moe_accum")?
         },
-        d_moe_gathered: {
-            let block_sz: usize = 64;
-            let fsc = max_tokens * topk + config.n_routed_experts * block_sz;
-            alloc_u16(fsc * h, "moe_gathered")?
-        },
-        d_moe_expert_out: {
-            let block_sz: usize = 64;
-            let fsc = max_tokens * topk + config.n_routed_experts * block_sz;
-            alloc_u16(fsc * h, "moe_expert_out")?
-        },
+        d_moe_gathered: alloc_u16(fsc * h, "moe_gathered")?,
+        d_moe_expert_out: alloc_u16(fsc * h, "moe_expert_out")?,
         d_moe_gate_up: {
             let w1_n = if config.moe_gated { 2 * moe_inter } else { moe_inter };
-            let block_sz: usize = 64;
-            let fsc = max_tokens * topk + config.n_routed_experts * block_sz;
             alloc_u16(fsc * w1_n, "moe_gate_up")?
         },
-        d_moe_inter: {
-            let block_sz: usize = 64;
-            let fsc = max_tokens * topk + config.n_routed_experts * block_sz;
-            alloc_u16(fsc * moe_inter, "moe_inter")?
-        },
-        d_gather_src_map: {
-            let block_sz: usize = 64;
-            let fsc = max_tokens * topk + config.n_routed_experts * block_sz;
-            alloc_i32(fsc, "gather_src_map")?
-        },
+        d_moe_inter: alloc_u16(fsc * moe_inter, "moe_inter")?,
+        d_gather_src_map: alloc_i32(fsc, "gather_src_map")?,
         d_gather_weight_map: alloc_f32(max_tokens * topk, "gather_weight_map")?,
         d_fused_expert_ids: {
-            let block_sz: usize = 64;
-            let fsc = max_tokens * topk + config.n_routed_experts * block_sz;
-            let fb = fsc / block_sz + config.n_routed_experts;
-            alloc_i32(fb, "fused_expert_ids")?
+            let fb = fsc / block_size_moe + n_routed;
+            alloc_i32(fb.max(1), "fused_expert_ids")?
         },
         d_num_tokens_post: alloc_i32(1, "num_tokens_post")?,
-        fused_sorted_count: {
-            let block_sz: usize = 64;
-            max_tokens * topk + config.n_routed_experts * block_sz
-        },
-        fused_blocks: {
-            let block_sz: usize = 64;
-            let fsc = max_tokens * topk + config.n_routed_experts * block_sz;
-            fsc / block_sz + config.n_routed_experts
-        },
+        fused_sorted_count: fsc,
+        fused_blocks: fsc / block_size_moe + n_routed,
         // GPU-only routing scratch
         d_expert_counts: alloc_i32(config.n_routed_experts.max(1), "expert_counts")?,
         d_expert_offsets: alloc_i32(config.n_routed_experts.max(1) + 1, "expert_offsets")?,

@@ -810,8 +810,9 @@ def main():
     parser.add_argument("--multi-gpu-hcs", action="store_true", default=False,
                         help="Pin HCS experts across ALL GPUs (more capacity, but cross-device transfer)")
     # NOTE: --hcs-headroom-mb removed — HCS budget is computed from 4-point VRAM calibration, not a fixed headroom
-    parser.add_argument("--vram-safety-margin", type=int, default=600,
-                        help="VRAM safety margin in MB — reserved free VRAM below which warnings fire (default: 600)")
+    parser.add_argument("--vram-safety-margin", type=int, default=0,
+                        help="VRAM safety margin in MB — reserved free VRAM for decode kernel intermediates "
+                             "and CUDA allocator headroom (default: auto = 3.5%% of total VRAM, min 600 MB)")
     parser.add_argument("--stream-attention", action="store_true",
                         help="Stream attention weights from CPU instead of keeping resident on GPU. "
                              "Use when attention weights don't fit in VRAM (e.g. very large models).")
@@ -1076,7 +1077,16 @@ def main():
 
     # ── Start VRAM monitor before warmup for visibility ──
     from krasis import VramMonitor
-    SAFETY_MARGIN_MB = args.vram_safety_margin
+    if args.vram_safety_margin > 0:
+        SAFETY_MARGIN_MB = args.vram_safety_margin
+    else:
+        # Auto-compute: 3.5% of total VRAM, minimum 600 MB.
+        # Decode needs headroom for kernel intermediates, CUDA allocator fragmentation,
+        # and async HCS reload chunk allocation. Proportional to GPU size so it works
+        # on both 16 GB and 32+ GB cards.
+        import torch
+        _total = torch.cuda.mem_get_info(devices[0].index)[1] // (1024 * 1024)
+        SAFETY_MARGIN_MB = max(600, int(_total * 0.035))
     vram_monitor = VramMonitor(device_indices, poll_interval_ms=50, safety_margin_mb=SAFETY_MARGIN_MB)
     vram_monitor.start()
     _dim("VRAM monitor started (tracking warmup)")
@@ -1150,34 +1160,22 @@ def main():
     _detail(f"Free VRAM after startup: {_free_mb:,} MB / {_total_mb:,} MB")
     logger.info("VRAM budget: free=%d MB, total=%d MB", _free_mb, _total_mb)
 
-    # Compute scratch reservation at two tiers:
-    # - max: absolute worst case (50K tokens) — determines minimum hard budget
-    # - typical: baseline prompt size — determines hard/soft split
-    # With dynamic scratch (alloc before prefill, free after), small prompts
-    # skip soft eviction entirely when scratch fits in free VRAM.
-    # The hard pool stays permanently loaded; soft is the overflow that
-    # gets evicted only when large prompts need the VRAM.
+    # Compute max scratch: worst case prompt (50K tokens).
+    # This determines how much VRAM prefill can claim via soft eviction.
     max_scratch_tokens = min(50000, _model.cfg.max_position_embeddings)
     max_scratch_mb = gpu_store.prefill_scratch_reservation_mb(max_scratch_tokens)
-    # Typical scratch: use 5K tokens as baseline. Most prompts are under this.
-    # Larger prompts evict soft HCS dynamically via prepare_for_prefill.
-    typical_scratch_tokens = 5000
-    typical_scratch_mb = gpu_store.prefill_scratch_reservation_mb(typical_scratch_tokens)
-    _detail(f"Scratch reservation: typical={typical_scratch_mb:,} MB (at {typical_scratch_tokens:,} tokens), max={max_scratch_mb:,} MB (at {max_scratch_tokens:,} tokens)")
+    _detail(f"Scratch reservation: max={max_scratch_mb:,} MB (at {max_scratch_tokens:,} tokens)")
 
-    # Hard tier = survives even worst-case prefill (small, permanent).
-    # Soft tier = evicted when large prompts need scratch VRAM, reloaded for decode.
-    # Hard must fit alongside the max scratch allocation + safety.
-    # Soft fills remaining VRAM MINUS headroom for minimum scratch allocation.
-    # This headroom allows small prompts (<= min_scratch) to skip soft eviction
-    # entirely, avoiding the expensive ~950ms evict/reload cycle.
+    # Two constraints determine the budget:
+    # 1. Decode needs SAFETY_MARGIN_MB free (CUDA overhead, kernel intermediates)
+    # 2. Worst-case prefill needs max_scratch + safety free, sourced from evicting soft
+    #    => hard must survive alongside max_scratch + safety
+    # Total HCS = free - safety (maximize expert coverage during decode).
+    # Hard = free - max_scratch - safety (permanent, survives worst-case prefill).
+    # Soft = total - hard (evictable proportionally via chunked pool).
+    total_hcs = max(0, _free_mb - SAFETY_MARGIN_MB)
     hard_budget = max(0, _free_mb - max_scratch_mb - SAFETY_MARGIN_MB)
-    # Reserve headroom so small prompts fit without evicting soft.
-    # min_scratch is at 1000 tokens (the minimum chunk size in prepare_for_prefill).
-    min_scratch_tokens = 1000
-    min_scratch_mb = gpu_store.prefill_scratch_reservation_mb(min_scratch_tokens)
-    soft_headroom = min_scratch_mb + SAFETY_MARGIN_MB
-    soft_budget = max(0, _free_mb - hard_budget - soft_headroom)
+    soft_budget = total_hcs - hard_budget
 
     # Pass calibration to Rust. Hard budget is small (permanent). Soft is the scratch area.
     short_tokens = 500
@@ -1193,8 +1191,8 @@ def main():
 
     vram_monitor.report_event("calibration_end")
     _status("VRAM budget complete")
-    _detail(f"Hard HCS budget: {hard_budget:,} MB (free={_free_mb}, max_scratch={max_scratch_mb}, safety={SAFETY_MARGIN_MB})")
-    _detail(f"Soft HCS budget: {soft_budget:,} MB (headroom={soft_headroom:,} MB for skip-eviction at {min_scratch_tokens} tokens)")
+    _detail(f"Hard HCS budget: {hard_budget:,} MB (survives worst-case {max_scratch_tokens:,}-token prefill)")
+    _detail(f"Soft HCS budget: {soft_budget:,} MB (evictable chunks, total HCS={total_hcs:,} MB)")
     logger.info("VRAM budget: hard=%d MB, soft=%d MB, free=%d MB", hard_budget, soft_budget, _free_mb)
 
     # ── Pre-compute multi-GPU layer splits (before HCS, so we can filter rankings) ──
