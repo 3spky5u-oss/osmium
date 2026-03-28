@@ -4336,9 +4336,7 @@ impl PrefillEngine {
                                 moe_data, layer_idx, mi,
                                 w1_base, w1s_base, w2_base, w2s_base,
                                 &active)?;
-                            if layer_idx == 0 {
-                                eprintln!("[FUSED-DMA] layer0: selective {} hcs + {} pinned + {} cold", h, p, c);
-                            }
+                            let _ = (h, p, c);
                         } else {
                             self.bulk_dma_layer(moe_data, w1_base, w1s_base, w2_base, w2s_base)?;
                         }
@@ -4351,14 +4349,8 @@ impl PrefillEngine {
         }
 
         // Wait for DMA/pointer table upload to complete (stream dependency)
-        if layer_idx == 0 { eprintln!("[FUSED-DBG] L0: waiting on DMA event..."); }
         unsafe {
             cuda_sys::lib().cuStreamWaitEvent(self.stream, self.dma_event, 0);
-        }
-        if layer_idx == 0 {
-            // Force sync to check if DMA completes
-            self.stream_sync()?;
-            eprintln!("[FUSED-DBG] L0: DMA+sync done, launching kernels...");
         }
         if let Some(t) = mt1 {
             // Sync to measure actual DMA wait time (timing mode only)
@@ -4460,22 +4452,6 @@ impl PrefillEngine {
         // w1: A = fused_input (replicated [m*topk, h]), top_k=1 so kernel reads A[sorted_id] directly
         //     C written at sorted_id positions (token*topk+slot), range [0, m*topk)
         //     C_tmp also at sorted_id positions (unique, no collision in fp32_reduce)
-        if layer_idx == 0 {
-            eprintln!("[FUSED-DBG] w1 params: A={:#x} B={:#x} C={:#x} C_tmp={:#x} scales={:#x}",
-                fused_input_ptr, w1_b_param, fused_inter_ptr, fused_c_tmp_ptr, w1s_b_param);
-            eprintln!("[FUSED-DBG] w1 dims: m_topk={} n={} k={} total_sorted={} block_size={} sms={}",
-                m_topk, w1_n, h, total_sorted, block_size, self.config.sms);
-            eprintln!("[FUSED-DBG] w1 ptrs: B_expert_ptrs={:#x} S_expert_ptrs={:#x} sorted={:#x}",
-                w1_ptrs_gpu, w1s_ptrs_gpu, sorted_ids_val);
-            eprintln!("[FUSED-DBG] w1 ptr_table={} cold_staging={:#x} w1_base={:#x}",
-                use_ptr_table, cold_staging_base, w1_base);
-            // Dump first 4 pointer table entries
-            let mut h_ptrs = [0u64; 4];
-            unsafe { cuda_sys::lib().cuMemcpyDtoH_v2(
-                h_ptrs.as_mut_ptr() as *mut _, w1_ptrs_gpu, 32); }
-            eprintln!("[FUSED-DBG] w1 ptrs[0..4] = [{:#x}, {:#x}, {:#x}, {:#x}]",
-                h_ptrs[0], h_ptrs[1], h_ptrs[2], h_ptrs[3]);
-        }
         unsafe {
             fused_fn(
                 fused_input_ptr as *const _,         // A: [m*topk, K=hidden] replicated
@@ -4520,12 +4496,6 @@ impl PrefillEngine {
                 if use_ptr_table { w1s_ptrs_gpu as *const _ } else { std::ptr::null() },  // S_expert_ptrs
             );
         }
-        if layer_idx == 0 {
-            eprintln!("[FUSED-DBG] L0: w1 kernel launched, syncing...");
-            self.stream_sync()?;
-            eprintln!("[FUSED-DBG] L0: w1 kernel DONE");
-        }
-
         // DIAG: Compare MoE Marlin vs Regular Marlin for one expert
         // (Skip in pointer table mode -- fused buffer offsets not valid)
         if diag_moe && layer_idx == 0 && !use_ptr_table {

@@ -12526,7 +12526,38 @@ impl GpuDecodeStore {
             return (0, 0.0);
         }
 
-        // Always evict soft tier before prefill — prefill needs the VRAM headroom.
+        // Check if scratch fits in free VRAM without eviction.
+        // If so, skip the expensive evict/reload cycle entirely.
+        if let Some(ref engine) = self.prefill_engine_slot {
+            let (fixed_bytes, per_token_bytes) = crate::gpu_prefill::compute_scratch_vram(&engine.config);
+            let scratch_bytes = fixed_bytes + per_token_bytes * estimated_tokens;
+            let scratch_mb = scratch_bytes / (1024 * 1024);
+
+            // Measure actual free VRAM (cudarc allocation)
+            let free_mb = unsafe {
+                let mut free: usize = 0;
+                let mut total: usize = 0;
+                let err = cuda_sys::lib().cuMemGetInfo_v2(
+                    &mut free as *mut usize,
+                    &mut total as *mut usize);
+                if err == cuda_sys::CUresult::CUDA_SUCCESS {
+                    free / (1024 * 1024)
+                } else {
+                    0
+                }
+            };
+
+            let safety_mb = 600; // same safety margin used in budget calculation
+            if free_mb > scratch_mb + safety_mb {
+                eprintln!("  \x1b[32mHCS soft: skip eviction — {} MB free > {} MB scratch + {} MB safety\x1b[0m",
+                    free_mb, scratch_mb, safety_mb);
+                log::info!("HCS soft: skip eviction — {} MB free > {} MB scratch + {} MB safety",
+                    free_mb, scratch_mb, safety_mb);
+                return (0, 0.0);
+            }
+        }
+
+        // Must evict soft tier — not enough free VRAM for scratch.
         // Soft tier is reloaded asynchronously after prefill completes.
 
         let t0 = std::time::Instant::now();

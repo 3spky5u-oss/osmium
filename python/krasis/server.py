@@ -1150,15 +1150,27 @@ def main():
     _detail(f"Free VRAM after startup: {_free_mb:,} MB / {_total_mb:,} MB")
     logger.info("VRAM budget: free=%d MB, total=%d MB", _free_mb, _total_mb)
 
-    # Compute max scratch reservation from model config dimensions.
-    # This is how much VRAM prepare_for_prefill() will claim for worst-case prompts.
+    # Compute scratch reservation at two tiers:
+    # - max: absolute worst case (50K tokens) — determines minimum hard budget
+    # - typical: baseline prompt size — determines hard/soft split
+    # With dynamic scratch (alloc before prefill, free after), small prompts
+    # skip soft eviction entirely when scratch fits in free VRAM.
+    # The hard pool stays permanently loaded; soft is the overflow that
+    # gets evicted only when large prompts need the VRAM.
     max_scratch_tokens = min(50000, _model.cfg.max_position_embeddings)
     max_scratch_mb = gpu_store.prefill_scratch_reservation_mb(max_scratch_tokens)
-    _detail(f"Max scratch reservation: {max_scratch_mb:,} MB (at {max_scratch_tokens:,} tokens)")
+    # Typical scratch: use 5K tokens as baseline. Most prompts are under this.
+    # Larger prompts evict soft HCS dynamically via prepare_for_prefill.
+    typical_scratch_tokens = 5000
+    typical_scratch_mb = gpu_store.prefill_scratch_reservation_mb(typical_scratch_tokens)
+    _detail(f"Scratch reservation: typical={typical_scratch_mb:,} MB (at {typical_scratch_tokens:,} tokens), max={max_scratch_mb:,} MB (at {max_scratch_tokens:,} tokens)")
 
-    # Hard tier = survives worst-case prefill. Soft tier = reclaimable scratch area.
+    # Hard tier = survives even worst-case prefill (small, permanent).
+    # Soft tier = evicted when large prompts need scratch VRAM, reloaded for decode.
+    # Hard must fit alongside the max scratch allocation + safety.
+    # Soft covers the rest — during decode (scratch freed), all of it reloads.
     hard_budget = max(0, _free_mb - max_scratch_mb - SAFETY_MARGIN_MB)
-    soft_budget = max_scratch_mb  # During decode, scratch is released → soft HCS fills this space
+    soft_budget = max(0, _free_mb - hard_budget - SAFETY_MARGIN_MB)  # Everything else
 
     # Pass calibration to Rust. Hard budget is small (permanent). Soft is the scratch area.
     short_tokens = 500
@@ -1174,8 +1186,8 @@ def main():
 
     vram_monitor.report_event("calibration_end")
     _status("VRAM budget complete")
-    _detail(f"Hard HCS budget: {hard_budget:,} MB (free={_free_mb}, scratch={max_scratch_mb}, safety={SAFETY_MARGIN_MB})")
-    _detail(f"Soft HCS budget: {soft_budget:,} MB (reclaimable scratch area)")
+    _detail(f"Hard HCS budget: {hard_budget:,} MB (free={_free_mb}, max_scratch={max_scratch_mb}, safety={SAFETY_MARGIN_MB})")
+    _detail(f"Soft HCS budget: {soft_budget:,} MB (evicted for large prompts, reloaded for decode)")
     logger.info("VRAM budget: hard=%d MB, soft=%d MB, free=%d MB", hard_budget, soft_budget, _free_mb)
 
     # ── Pre-compute multi-GPU layer splits (before HCS, so we can filter rankings) ──
