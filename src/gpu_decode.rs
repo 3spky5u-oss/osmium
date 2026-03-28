@@ -413,8 +413,16 @@ struct HcsState {
     pool_slot_to_expert: Vec<Option<(usize, usize)>>,
 
     // ── Soft-tier HCS (evicted during prefill, reloaded before decode) ──
-    /// Separate VRAM allocation for soft-tier experts.
-    soft_buf: Option<cudarc::driver::CudaSlice<u8>>,
+    /// Chunked VRAM allocations for soft-tier experts.
+    /// Each chunk is ~1 GB (proportional to total VRAM). Chunk 0 = hottest experts.
+    /// Eviction drops chunks from the tail (coldest first), proportional to scratch needs.
+    soft_chunks: Vec<cudarc::driver::CudaSlice<u8>>,
+    /// Number of expert slots per chunk (all chunks same size except possibly the last).
+    soft_slots_per_chunk: usize,
+    /// Total number of chunks when fully loaded.
+    soft_total_chunks: usize,
+    /// Number of chunks currently loaded (always a prefix: chunks 0..loaded-1).
+    soft_chunks_loaded: usize,
     /// Number of slots in the soft pool.
     soft_num_slots: usize,
     /// Bytes per soft slot (same as pool_slot_size).
@@ -485,7 +493,10 @@ impl HcsState {
             pool_num_slots: 0,
             pool_free_slots: Vec::new(),
             pool_slot_to_expert: Vec::new(),
-            soft_buf: None,
+            soft_chunks: Vec::new(),
+            soft_slots_per_chunk: 0,
+            soft_total_chunks: 0,
+            soft_chunks_loaded: 0,
             soft_num_slots: 0,
             soft_slot_size: 0,
             soft_slot_to_expert: Vec::new(),
@@ -506,6 +517,17 @@ impl HcsState {
             mapped_fallback: Vec::new(),
             mapped_reads_available: false,
         }
+    }
+
+    /// Get the GPU base pointer for a soft slot, resolving chunk index.
+    #[inline]
+    fn soft_slot_ptr(&self, slot: usize) -> u64 {
+        let spc = self.soft_slots_per_chunk;
+        debug_assert!(spc > 0);
+        let chunk_idx = slot / spc;
+        let offset = slot % spc;
+        let base = *self.soft_chunks[chunk_idx].device_ptr();
+        base + (offset as u64 * self.soft_slot_size as u64)
     }
 
     /// Check if a specific (layer, expert) is cached in VRAM.
@@ -4053,15 +4075,39 @@ impl GpuDecodeStore {
             return Ok(format!("{} | soft: 0 experts (insufficient VRAM)", result));
         }
 
-        let soft_alloc_bytes = soft_num_slots * slot_size;
-        log::info!("HCS soft tier: allocating {:.1} MB ({} slots for {} available experts)",
-            soft_alloc_bytes as f64 / (1024.0 * 1024.0), soft_num_slots, soft_experts_available);
+        // Compute chunk size: proportional to total VRAM.
+        // ~1 GB on 32 GB, ~512 MB on 16 GB, scales linearly.
+        let chunk_target_bytes = {
+            let (_, total_vram) = cudarc::driver::result::mem_get_info()
+                .unwrap_or((0, 32 * 1024 * 1024 * 1024));
+            let target = total_vram / 32; // ~1 GB per 32 GB
+            // Clamp to [256 MB, 2 GB]
+            target.max(256 * 1024 * 1024).min(2048 * 1024 * 1024)
+        };
+        let slots_per_chunk = (chunk_target_bytes / slot_size).max(1);
+        let num_chunks = (soft_num_slots + slots_per_chunk - 1) / slots_per_chunk;
 
-        let soft_buf = self.device.alloc_zeros::<u8>(soft_alloc_bytes)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
-                format!("HCS soft pool alloc ({} MB): {:?}",
-                    soft_alloc_bytes / (1024 * 1024), e)))?;
-        let soft_base = *soft_buf.device_ptr();
+        let soft_alloc_bytes = soft_num_slots * slot_size;
+        log::info!("HCS soft tier: allocating {:.1} MB in {} chunks of {:.0} MB ({} slots/chunk, {} slots for {} available experts)",
+            soft_alloc_bytes as f64 / (1024.0 * 1024.0), num_chunks,
+            (slots_per_chunk * slot_size) as f64 / (1024.0 * 1024.0),
+            slots_per_chunk, soft_num_slots, soft_experts_available);
+
+        // Allocate chunks
+        let mut soft_chunks: Vec<cudarc::driver::CudaSlice<u8>> = Vec::with_capacity(num_chunks);
+        for c in 0..num_chunks {
+            let slots_this_chunk = if c == num_chunks - 1 {
+                soft_num_slots - c * slots_per_chunk
+            } else {
+                slots_per_chunk
+            };
+            let chunk_bytes = slots_this_chunk * slot_size;
+            let chunk_buf = self.device.alloc_zeros::<u8>(chunk_bytes)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("HCS soft chunk {} alloc ({} MB): {:?}",
+                        c, chunk_bytes / (1024 * 1024), e)))?;
+            soft_chunks.push(chunk_buf);
+        }
 
         let mut soft_slot_to_expert: Vec<Option<(usize, usize)>> = vec![None; soft_num_slots];
         let mut soft_ranking: Vec<(usize, usize)> = Vec::new();
@@ -4088,7 +4134,11 @@ impl GpuDecodeStore {
             }
 
             let expert = &moe.experts[expert_idx];
-            let dst = soft_base + (soft_slot as u64 * slot_size as u64);
+            // Resolve chunk + offset for this slot
+            let chunk_idx = soft_slot / slots_per_chunk;
+            let offset_in_chunk = soft_slot % slots_per_chunk;
+            let dst = *soft_chunks[chunk_idx].device_ptr()
+                + (offset_in_chunk as u64 * slot_size as u64);
 
             let w13p_off = 0u64;
             let w13s_off = expert.w13_packed_bytes as u64;
@@ -4139,7 +4189,10 @@ impl GpuDecodeStore {
         }
         let load_elapsed = t0.elapsed().as_secs_f64();
 
-        hcs.soft_buf = Some(soft_buf);
+        hcs.soft_chunks = soft_chunks;
+        hcs.soft_slots_per_chunk = slots_per_chunk;
+        hcs.soft_total_chunks = num_chunks;
+        hcs.soft_chunks_loaded = num_chunks;
         hcs.soft_num_slots = soft_num_slots;
         hcs.soft_slot_size = slot_size;
         hcs.soft_slot_to_expert = soft_slot_to_expert;
@@ -12498,94 +12551,128 @@ impl GpuDecodeStore {
             }
         }
 
-        // Cancel any pending async reload
+        // Cancel any pending async reload — free the reload chunks,
+        // then fall through to normal eviction (current prompt may need more VRAM).
         if hcs.soft_reload_pending {
             hcs.soft_reload_pending = false;
             hcs.soft_reload_entries.clear();
-            // The soft_buf was already allocated by async reload; need to free it
-            if hcs.soft_buf.is_some() && !hcs.soft_loaded {
-                let freed_bytes = hcs.soft_num_slots * hcs.soft_slot_size;
-                hcs.soft_buf = None;
-                hcs.vram_bytes -= freed_bytes;
-                eprintln!("  \x1b[33mHCS soft: cancelled pending async reload ({:.1} MB freed)\x1b[0m",
-                    freed_bytes as f64 / (1024.0 * 1024.0));
+            if !hcs.soft_chunks.is_empty() {
+                let extra_chunks = hcs.soft_chunks.len().saturating_sub(hcs.soft_chunks_loaded);
+                if extra_chunks > 0 {
+                    let freed_bytes = extra_chunks * hcs.soft_slots_per_chunk * hcs.soft_slot_size;
+                    hcs.soft_chunks.truncate(hcs.soft_chunks_loaded);
+                    hcs.vram_bytes = hcs.vram_bytes.saturating_sub(freed_bytes);
+                    eprintln!("  \x1b[33mHCS soft: cancelled pending async reload ({:.1} MB freed)\x1b[0m",
+                        freed_bytes as f64 / (1024.0 * 1024.0));
+                }
             }
-            return (0, 0.0);
+            // Fall through — the current prompt may need further eviction
         }
 
-        if !hcs.soft_loaded || hcs.soft_buf.is_none() {
+        if hcs.soft_chunks.is_empty() {
             return (0, 0.0);
         }
-        // If soft buffer is allocated but empty (0 cached experts), still free it
+        // If soft chunks are allocated but empty (0 cached experts), still free them
         if hcs.soft_num_cached == 0 {
             let freed_bytes = hcs.soft_num_slots * hcs.soft_slot_size;
             if freed_bytes > 0 {
-                hcs.soft_buf = None;
+                hcs.soft_chunks.clear();
+                hcs.soft_chunks_loaded = 0;
                 hcs.soft_loaded = false;
-                hcs.vram_bytes -= freed_bytes;
-                log::info!("HCS soft evict: freed empty soft buffer ({:.1} MB)",
+                hcs.vram_bytes = hcs.vram_bytes.saturating_sub(freed_bytes);
+                log::info!("HCS soft evict: freed empty soft chunks ({:.1} MB)",
                     freed_bytes as f64 / (1024.0 * 1024.0));
                 return (0, freed_bytes as f64 / (1024.0 * 1024.0));
             }
             return (0, 0.0);
         }
 
-        // Check if scratch fits in free VRAM without eviction.
-        // Uses the same safety margin as prepare_for_prefill to ensure consistency.
-        if let Some((fixed_bytes, per_token_bytes)) = self.prefill_scratch_info {
-            let capped_tokens = estimated_tokens.min(50000); // same cap as prepare_for_prefill
-            let scratch_bytes = fixed_bytes + per_token_bytes * capped_tokens;
-            let scratch_mb = scratch_bytes / (1024 * 1024);
-            let safety_mb = crate::gpu_prefill::PREFILL_SAFETY_MARGIN_MB;
+        // Compute scratch needed for this prompt
+        let (scratch_bytes, safety_mb) = if let Some((fixed_bytes, per_token_bytes)) = self.prefill_scratch_info {
+            let capped_tokens = estimated_tokens.min(50000);
+            let scratch = fixed_bytes + per_token_bytes * capped_tokens;
+            (scratch, crate::gpu_prefill::PREFILL_SAFETY_MARGIN_MB)
+        } else {
+            // No scratch info — must evict everything to be safe
+            (usize::MAX, 0)
+        };
 
-            // Measure actual free VRAM
-            let free_mb = unsafe {
-                let mut free: usize = 0;
-                let mut total: usize = 0;
-                let err = cuda_sys::lib().cuMemGetInfo_v2(
-                    &mut free as *mut usize,
-                    &mut total as *mut usize);
-                if err == cuda_sys::CUresult::CUDA_SUCCESS {
-                    free / (1024 * 1024)
-                } else {
-                    0
-                }
-            };
+        // Measure actual free VRAM
+        let free_bytes = unsafe {
+            let mut free: usize = 0;
+            let mut total: usize = 0;
+            let err = cuda_sys::lib().cuMemGetInfo_v2(
+                &mut free as *mut usize,
+                &mut total as *mut usize);
+            if err == cuda_sys::CUresult::CUDA_SUCCESS { free } else { 0 }
+        };
+        let needed_bytes = scratch_bytes + safety_mb * 1024 * 1024;
 
-            if free_mb > scratch_mb + safety_mb {
-                eprintln!("  \x1b[32mHCS soft: skip eviction — {} MB free > {} MB scratch + {} MB safety\x1b[0m",
-                    free_mb, scratch_mb, safety_mb);
-                log::info!("HCS soft: skip eviction — {} MB free > {} MB scratch + {} MB safety",
-                    free_mb, scratch_mb, safety_mb);
-                return (0, 0.0);
-            }
+        if free_bytes >= needed_bytes {
+            eprintln!("  \x1b[32mHCS soft: skip eviction — {:.0} MB free >= {:.0} MB needed\x1b[0m",
+                free_bytes as f64 / (1024.0 * 1024.0), needed_bytes as f64 / (1024.0 * 1024.0));
+            log::info!("HCS soft: skip eviction — {:.0} MB free >= {:.0} MB needed",
+                free_bytes as f64 / (1024.0 * 1024.0), needed_bytes as f64 / (1024.0 * 1024.0));
+            return (0, 0.0);
         }
 
-        // Must evict soft tier — not enough free VRAM for scratch.
-        // Soft tier is reloaded asynchronously after prefill completes.
-
+        // Proportional eviction: drop chunks from the tail (coldest first)
+        // until we have enough free VRAM for scratch + safety.
         let t0 = std::time::Instant::now();
-
-        // Remove all soft-tier entries from cache
-        let evicted = hcs.soft_num_cached;
+        let deficit = needed_bytes - free_bytes;
+        let spc = hcs.soft_slots_per_chunk;
         let nep = hcs.num_experts_per_layer;
-        for &(layer_idx, expert_idx) in &hcs.soft_ranking {
-            // Inline cache_fast_clear to avoid borrow conflict
-            if nep > 0 {
-                let idx = layer_idx * nep + expert_idx;
-                if idx < hcs.cache_fast.len() {
-                    hcs.cache_fast[idx] = [0u64; 4];
+
+        let mut chunks_to_drop = 0usize;
+        let mut freed_bytes = 0usize;
+        let mut evicted = 0usize;
+
+        // Walk chunks from the tail (coldest experts)
+        let total_chunks = hcs.soft_chunks_loaded;
+        for drop_idx in (0..total_chunks).rev() {
+            if freed_bytes >= deficit {
+                break;
+            }
+            // Compute chunk size from slot layout
+            let slots_this = if drop_idx == hcs.soft_total_chunks - 1 {
+                hcs.soft_num_slots - drop_idx * spc
+            } else {
+                spc
+            };
+            let chunk_bytes = slots_this * hcs.soft_slot_size;
+
+            // Remove cache entries for experts in this chunk
+            let slot_start = drop_idx * spc;
+            let slot_end = std::cmp::min(slot_start + spc, hcs.soft_num_slots);
+            for slot in slot_start..slot_end {
+                if let Some((layer_idx, expert_idx)) = hcs.soft_slot_to_expert[slot] {
+                    if nep > 0 {
+                        let idx = layer_idx * nep + expert_idx;
+                        if idx < hcs.cache_fast.len() {
+                            hcs.cache_fast[idx] = [0u64; 4];
+                        }
+                    }
+                    hcs.cache.remove(&(layer_idx, expert_idx));
+                    evicted += 1;
                 }
             }
-            hcs.cache.remove(&(layer_idx, expert_idx));
-        }
-        hcs.num_cached -= evicted;
 
-        // Free the soft VRAM allocation
-        let freed_bytes = hcs.soft_num_slots * hcs.soft_slot_size;
-        hcs.soft_buf = None; // Drop frees VRAM
-        hcs.soft_loaded = false;
-        hcs.vram_bytes -= freed_bytes;
+            freed_bytes += chunk_bytes;
+            chunks_to_drop += 1;
+        }
+
+        // Actually drop the chunks (from the end)
+        let new_loaded = total_chunks - chunks_to_drop;
+        hcs.soft_chunks.truncate(new_loaded);
+        hcs.soft_chunks_loaded = new_loaded;
+        hcs.num_cached -= evicted;
+        hcs.soft_num_cached -= evicted;
+        hcs.vram_bytes = hcs.vram_bytes.saturating_sub(freed_bytes);
+
+        // Mark soft tier as not fully loaded so reload restores the dropped chunks
+        if chunks_to_drop > 0 {
+            hcs.soft_loaded = false;
+        }
 
         // NOTE: per-layer CUDA graphs remain valid across eviction/reload.
         // Expert kernels dereference through d_batch_upload (fixed address),
@@ -12594,16 +12681,16 @@ impl GpuDecodeStore {
 
         let freed_mb = freed_bytes as f64 / (1024.0 * 1024.0);
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        eprintln!("  \x1b[33mHCS soft: evicted {} experts ({:.1} MB freed) in {:.1}ms for prefill (~{} tokens)\x1b[0m",
-            evicted, freed_mb, elapsed_ms, estimated_tokens);
-        log::info!("HCS soft: evicted {} experts ({:.1} MB freed) in {:.1}ms for prefill (~{} tokens)",
-            evicted, freed_mb, elapsed_ms, estimated_tokens);
+        eprintln!("  \x1b[33mHCS soft: evicted {} experts ({:.1} MB, {} of {} chunks dropped) in {:.1}ms for prefill (~{} tokens)\x1b[0m",
+            evicted, freed_mb, chunks_to_drop, total_chunks, elapsed_ms, estimated_tokens);
+        log::info!("HCS soft: evicted {} experts ({:.1} MB, {} of {} chunks dropped) in {:.1}ms for prefill (~{} tokens)",
+            evicted, freed_mb, chunks_to_drop, total_chunks, elapsed_ms, estimated_tokens);
 
         (evicted, freed_mb)
     }
 
     /// Reload soft-tier HCS experts after prefill completes.
-    /// Allocates VRAM and DMA copies experts from host mmap.
+    /// Only reallocates and refills the chunks that were dropped during eviction.
     /// actual_tokens: prompt length for adaptive sizing (0 = use full soft budget).
     /// Returns (loaded_count, reload_ms).
     pub fn hcs_reload_after_prefill(&mut self, actual_tokens: usize) -> (usize, f64) {
@@ -12625,128 +12712,129 @@ impl GpuDecodeStore {
             return (0, 0.0);
         }
 
-        // Adaptive soft budget based on actual prompt length
-        let adaptive_soft_mb = if actual_tokens > 0 {
-            if let Some(ref cal) = self.vram_calibration {
-                let extra_tokens = actual_tokens.saturating_sub(cal.short_tokens);
-                let extra_mb = (extra_tokens as f64 * cal.decode_kb_per_tok() / 1024.0) as usize;
-                hcs.soft_max_mb.saturating_sub(extra_mb)
-            } else {
-                hcs.soft_max_mb
-            }
-        } else {
-            hcs.soft_max_mb
-        };
-        let num_slots = std::cmp::min(
-            adaptive_soft_mb * 1024 * 1024 / slot_size,
-            hcs.soft_ranking.len(),
-        );
-        if num_slots == 0 {
-            return (0, 0.0);
+        let spc = hcs.soft_slots_per_chunk;
+        let target_chunks = hcs.soft_total_chunks;
+        let already_loaded = hcs.soft_chunks_loaded;
+
+        if already_loaded >= target_chunks {
+            hcs.soft_loaded = true;
+            return (0, 0.0); // all chunks present
         }
 
         let t0 = std::time::Instant::now();
-        let alloc_bytes = num_slots * slot_size;
-
-        // Allocate fresh soft pool
-        let soft_buf = match self.device.alloc_zeros::<u8>(alloc_bytes) {
-            Ok(buf) => buf,
-            Err(e) => {
-                log::warn!("HCS soft reload: alloc failed ({:.1} MB): {:?}",
-                    alloc_bytes as f64 / (1024.0 * 1024.0), e);
-                return (0, 0.0);
-            }
-        };
-        let soft_base = *soft_buf.device_ptr();
-
-        // DMA each expert from host mmap
-        let ranking = hcs.soft_ranking.clone();
         let mut loaded = 0usize;
-        let mut slot = 0usize;
-        let mut slot_to_expert: Vec<Option<(usize, usize)>> = vec![None; num_slots];
+        let mut alloc_bytes = 0usize;
 
-        for &(layer_idx, expert_idx) in &ranking {
-            if slot >= num_slots {
-                break;
-            }
-            let moe = match graph.moe_layers.get(layer_idx).and_then(|m| m.as_ref()) {
-                Some(m) => m,
-                None => continue,
+        // Reallocate and fill only the missing chunks (already_loaded..target_chunks)
+        for c in already_loaded..target_chunks {
+            let slots_this_chunk = if c == target_chunks - 1 {
+                hcs.soft_num_slots - c * spc
+            } else {
+                spc
             };
-            if expert_idx >= moe.experts.len() {
-                continue;
-            }
+            let chunk_bytes = slots_this_chunk * slot_size;
 
-            let expert = &moe.experts[expert_idx];
-            let dst = soft_base + (slot as u64 * slot_size as u64);
+            let chunk_buf = match self.device.alloc_zeros::<u8>(chunk_bytes) {
+                Ok(buf) => buf,
+                Err(e) => {
+                    log::warn!("HCS soft reload: chunk {} alloc failed ({:.1} MB): {:?}",
+                        c, chunk_bytes as f64 / (1024.0 * 1024.0), e);
+                    break; // Stop here — we'll have partial reload
+                }
+            };
+            let chunk_base = *chunk_buf.device_ptr();
 
-            let w13p_off = 0u64;
-            let w13s_off = expert.w13_packed_bytes as u64;
-            let w2p_off = w13s_off + expert.w13_scales_bytes as u64;
-            let w2s_off = w2p_off + expert.w2_packed_bytes as u64;
+            // DMA experts for slots in this chunk
+            let slot_start = c * spc;
+            let slot_end = slot_start + slots_this_chunk;
+            for slot in slot_start..slot_end {
+                // Find the expert for this slot from soft_ranking
+                // soft_ranking is in the same order as slots were filled
+                if slot >= hcs.soft_ranking.len() {
+                    break;
+                }
+                let (layer_idx, expert_idx) = hcs.soft_ranking[slot];
+                let moe = match graph.moe_layers.get(layer_idx).and_then(|m| m.as_ref()) {
+                    Some(m) => m,
+                    None => continue,
+                };
+                if expert_idx >= moe.experts.len() {
+                    continue;
+                }
 
-            let mut ok = true;
-            unsafe {
-                for &(off, src_ptr, bytes) in &[
-                    (w13p_off, expert.w13_packed_ptr, expert.w13_packed_bytes),
-                    (w13s_off, expert.w13_scales_ptr, expert.w13_scales_bytes),
-                    (w2p_off, expert.w2_packed_ptr, expert.w2_packed_bytes),
-                    (w2s_off, expert.w2_scales_ptr, expert.w2_scales_bytes),
-                ] {
-                    let err = cuda_sys::lib().cuMemcpyHtoD_v2(
-                        dst + off,
-                        src_ptr as *const std::ffi::c_void,
-                        bytes,
-                    );
-                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                        ok = false;
-                        break;
+                let expert = &moe.experts[expert_idx];
+                let offset_in_chunk = slot - slot_start;
+                let dst = chunk_base + (offset_in_chunk as u64 * slot_size as u64);
+
+                let w13p_off = 0u64;
+                let w13s_off = expert.w13_packed_bytes as u64;
+                let w2p_off = w13s_off + expert.w13_scales_bytes as u64;
+                let w2s_off = w2p_off + expert.w2_packed_bytes as u64;
+
+                let mut ok = true;
+                unsafe {
+                    for &(off, src_ptr, bytes) in &[
+                        (w13p_off, expert.w13_packed_ptr, expert.w13_packed_bytes),
+                        (w13s_off, expert.w13_scales_ptr, expert.w13_scales_bytes),
+                        (w2p_off, expert.w2_packed_ptr, expert.w2_packed_bytes),
+                        (w2s_off, expert.w2_scales_ptr, expert.w2_scales_bytes),
+                    ] {
+                        let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                            dst + off,
+                            src_ptr as *const std::ffi::c_void,
+                            bytes,
+                        );
+                        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                            ok = false;
+                            break;
+                        }
                     }
                 }
-            }
-            if !ok {
-                continue;
+                if !ok {
+                    continue;
+                }
+
+                let entry = HcsCacheEntry {
+                    d_buf: None,
+                    w13_packed_offset: 0, w13_packed_size: 0,
+                    w13_scales_offset: 0, w13_scales_size: 0,
+                    w2_packed_offset: 0, w2_packed_size: 0,
+                    w2_scales_offset: 0, w2_scales_size: 0,
+                    ext_w13_packed: dst + w13p_off,
+                    ext_w13_scales: dst + w13s_off,
+                    ext_w2_packed: dst + w2p_off,
+                    ext_w2_scales: dst + w2s_off,
+                    pool_slot: None,
+                };
+                hcs.cache_fast_set(layer_idx, expert_idx, &entry);
+                hcs.cache.insert((layer_idx, expert_idx), entry);
+                hcs.soft_slot_to_expert[slot] = Some((layer_idx, expert_idx));
+                loaded += 1;
             }
 
-            let entry = HcsCacheEntry {
-                d_buf: None,
-                w13_packed_offset: 0, w13_packed_size: 0,
-                w13_scales_offset: 0, w13_scales_size: 0,
-                w2_packed_offset: 0, w2_packed_size: 0,
-                w2_scales_offset: 0, w2_scales_size: 0,
-                ext_w13_packed: dst + w13p_off,
-                ext_w13_scales: dst + w13s_off,
-                ext_w2_packed: dst + w2p_off,
-                ext_w2_scales: dst + w2s_off,
-                pool_slot: None,
-            };
-            hcs.cache_fast_set(layer_idx, expert_idx, &entry);
-            hcs.cache.insert((layer_idx, expert_idx), entry);
-            slot_to_expert[slot] = Some((layer_idx, expert_idx));
-            slot += 1;
-            loaded += 1;
+            alloc_bytes += chunk_bytes;
+            hcs.soft_chunks.push(chunk_buf);
+            hcs.soft_chunks_loaded += 1;
         }
 
-        hcs.soft_buf = Some(soft_buf);
-        hcs.soft_slot_to_expert = slot_to_expert;
-        hcs.soft_num_slots = num_slots;
-        hcs.soft_num_cached = loaded;
-        hcs.soft_loaded = true;
+        hcs.soft_num_cached += loaded;
+        hcs.soft_loaded = hcs.soft_chunks_loaded == target_chunks;
         hcs.num_cached += loaded;
         hcs.vram_bytes += alloc_bytes;
 
         let alloc_mb = alloc_bytes as f64 / (1024.0 * 1024.0);
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        eprintln!("  \x1b[32mHCS soft: reloaded {} experts ({:.1}/{} MB) in {:.1}ms\x1b[0m",
-            loaded, alloc_mb, hcs.soft_max_mb, elapsed_ms);
-        log::info!("HCS soft: reloaded {} experts ({:.1}/{} MB) in {:.1}ms",
-            loaded, alloc_mb, hcs.soft_max_mb, elapsed_ms);
+        let chunks_reloaded = hcs.soft_chunks_loaded - already_loaded;
+        eprintln!("  \x1b[32mHCS soft: reloaded {} experts ({:.1} MB, {}/{} chunks) in {:.1}ms\x1b[0m",
+            loaded, alloc_mb, chunks_reloaded, target_chunks, elapsed_ms);
+        log::info!("HCS soft: reloaded {} experts ({:.1} MB, {}/{} chunks) in {:.1}ms",
+            loaded, alloc_mb, chunks_reloaded, target_chunks, elapsed_ms);
 
         (loaded, elapsed_ms)
     }
 
     /// Async version of hcs_reload_after_prefill.
-    /// Queues all DMA on a dedicated CUDA stream and returns immediately.
+    /// Queues DMA only for dropped chunks on a dedicated CUDA stream and returns immediately.
     /// Call hcs_check_soft_reload_complete() each decode step to activate
     /// the soft tier once all DMA finishes.
     /// Returns (num_experts_queued, alloc_mb).
@@ -12769,42 +12857,16 @@ impl GpuDecodeStore {
             return (0, 0.0);
         }
 
-        // Compute adaptive soft budget based on actual prompt length.
-        // Short prompts → full soft tier. Long prompts → reduced soft tier.
-        // Uses relative delta from calibration: the additional VRAM consumed by
-        // extra tokens cancels out any absolute offset between calibration and runtime.
-        let adaptive_soft_mb = if let Some(ref cal) = self.vram_calibration {
-            let extra_tokens = actual_tokens.saturating_sub(cal.short_tokens);
-            let extra_mb = (extra_tokens as f64 * cal.decode_kb_per_tok() / 1024.0) as usize;
-            hcs.soft_max_mb.saturating_sub(extra_mb)
-        } else {
-            hcs.soft_max_mb
-        };
+        let spc = hcs.soft_slots_per_chunk;
+        let target_chunks = hcs.soft_total_chunks;
+        let already_loaded = hcs.soft_chunks_loaded;
 
-        let adaptive_slots = std::cmp::min(
-            adaptive_soft_mb * 1024 * 1024 / slot_size,
-            hcs.soft_ranking.len(),
-        );
-        if adaptive_slots == 0 {
-            log::info!("HCS soft: no reload — {} tokens uses all decode VRAM (adaptive_soft=0 MB, max={})",
-                actual_tokens, hcs.soft_max_mb);
+        if already_loaded >= target_chunks {
+            hcs.soft_loaded = true;
             return (0, 0.0);
         }
-        let num_slots = adaptive_slots;
 
         let t0 = std::time::Instant::now();
-        let alloc_bytes = num_slots * slot_size;
-
-        // Allocate fresh soft pool (no zeroing — we overwrite all data with DMA)
-        let soft_buf = match unsafe { self.device.alloc::<u8>(alloc_bytes) } {
-            Ok(buf) => buf,
-            Err(e) => {
-                log::warn!("HCS soft async reload: alloc failed ({:.1} MB): {:?}",
-                    alloc_bytes as f64 / (1024.0 * 1024.0), e);
-                return (0, 0.0);
-            }
-        };
-        let soft_base = *soft_buf.device_ptr();
 
         // Create or reuse the reload stream and event
         if hcs.soft_reload_stream.is_none() {
@@ -12838,73 +12900,97 @@ impl GpuDecodeStore {
         let reload_stream = hcs.soft_reload_stream.as_ref().unwrap().0;
         let reload_event = hcs.soft_reload_event.as_ref().unwrap().0;
 
-        // Queue async DMA for each expert on the reload stream
-        let ranking = hcs.soft_ranking.clone();
+        // Allocate and queue DMA only for missing chunks (already_loaded..target_chunks)
         let mut queued = 0usize;
-        let mut slot = 0usize;
-        let mut slot_to_expert: Vec<Option<(usize, usize)>> = vec![None; num_slots];
+        let mut alloc_bytes = 0usize;
         let mut pending_entries: Vec<(usize, usize, HcsCacheEntry)> = Vec::new();
 
-        for &(layer_idx, expert_idx) in &ranking {
-            if slot >= num_slots {
-                break;
-            }
-            let moe = match graph.moe_layers.get(layer_idx).and_then(|m| m.as_ref()) {
-                Some(m) => m,
-                None => continue,
+        for c in already_loaded..target_chunks {
+            let slots_this_chunk = if c == target_chunks - 1 {
+                hcs.soft_num_slots - c * spc
+            } else {
+                spc
             };
-            if expert_idx >= moe.experts.len() {
-                continue;
-            }
+            let chunk_bytes = slots_this_chunk * slot_size;
 
-            let expert = &moe.experts[expert_idx];
-            let dst = soft_base + (slot as u64 * slot_size as u64);
+            let chunk_buf = match unsafe { self.device.alloc::<u8>(chunk_bytes) } {
+                Ok(buf) => buf,
+                Err(e) => {
+                    log::warn!("HCS soft async reload: chunk {} alloc failed ({:.1} MB): {:?}",
+                        c, chunk_bytes as f64 / (1024.0 * 1024.0), e);
+                    break;
+                }
+            };
+            let chunk_base = *chunk_buf.device_ptr();
 
-            let w13p_off = 0u64;
-            let w13s_off = expert.w13_packed_bytes as u64;
-            let w2p_off = w13s_off + expert.w13_scales_bytes as u64;
-            let w2s_off = w2p_off + expert.w2_packed_bytes as u64;
+            // Queue async DMA for experts in this chunk
+            let slot_start = c * spc;
+            let slot_end = slot_start + slots_this_chunk;
+            for slot in slot_start..slot_end {
+                if slot >= hcs.soft_ranking.len() {
+                    break;
+                }
+                let (layer_idx, expert_idx) = hcs.soft_ranking[slot];
+                let moe = match graph.moe_layers.get(layer_idx).and_then(|m| m.as_ref()) {
+                    Some(m) => m,
+                    None => continue,
+                };
+                if expert_idx >= moe.experts.len() {
+                    continue;
+                }
 
-            let mut ok = true;
-            unsafe {
-                for &(off, src_ptr, bytes) in &[
-                    (w13p_off, expert.w13_packed_ptr, expert.w13_packed_bytes),
-                    (w13s_off, expert.w13_scales_ptr, expert.w13_scales_bytes),
-                    (w2p_off, expert.w2_packed_ptr, expert.w2_packed_bytes),
-                    (w2s_off, expert.w2_scales_ptr, expert.w2_scales_bytes),
-                ] {
-                    let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
-                        dst + off,
-                        src_ptr as *const std::ffi::c_void,
-                        bytes,
-                        reload_stream,
-                    );
-                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                        ok = false;
-                        break;
+                let expert = &moe.experts[expert_idx];
+                let offset_in_chunk = slot - slot_start;
+                let dst = chunk_base + (offset_in_chunk as u64 * slot_size as u64);
+
+                let w13p_off = 0u64;
+                let w13s_off = expert.w13_packed_bytes as u64;
+                let w2p_off = w13s_off + expert.w13_scales_bytes as u64;
+                let w2s_off = w2p_off + expert.w2_packed_bytes as u64;
+
+                let mut ok = true;
+                unsafe {
+                    for &(off, src_ptr, bytes) in &[
+                        (w13p_off, expert.w13_packed_ptr, expert.w13_packed_bytes),
+                        (w13s_off, expert.w13_scales_ptr, expert.w13_scales_bytes),
+                        (w2p_off, expert.w2_packed_ptr, expert.w2_packed_bytes),
+                        (w2s_off, expert.w2_scales_ptr, expert.w2_scales_bytes),
+                    ] {
+                        let err = cuda_sys::lib().cuMemcpyHtoDAsync_v2(
+                            dst + off,
+                            src_ptr as *const std::ffi::c_void,
+                            bytes,
+                            reload_stream,
+                        );
+                        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                            ok = false;
+                            break;
+                        }
                     }
                 }
-            }
-            if !ok {
-                continue;
+                if !ok {
+                    continue;
+                }
+
+                let entry = HcsCacheEntry {
+                    d_buf: None,
+                    w13_packed_offset: 0, w13_packed_size: 0,
+                    w13_scales_offset: 0, w13_scales_size: 0,
+                    w2_packed_offset: 0, w2_packed_size: 0,
+                    w2_scales_offset: 0, w2_scales_size: 0,
+                    ext_w13_packed: dst + w13p_off,
+                    ext_w13_scales: dst + w13s_off,
+                    ext_w2_packed: dst + w2p_off,
+                    ext_w2_scales: dst + w2s_off,
+                    pool_slot: None,
+                };
+                pending_entries.push((layer_idx, expert_idx, entry));
+                hcs.soft_slot_to_expert[slot] = Some((layer_idx, expert_idx));
+                queued += 1;
             }
 
-            let entry = HcsCacheEntry {
-                d_buf: None,
-                w13_packed_offset: 0, w13_packed_size: 0,
-                w13_scales_offset: 0, w13_scales_size: 0,
-                w2_packed_offset: 0, w2_packed_size: 0,
-                w2_scales_offset: 0, w2_scales_size: 0,
-                ext_w13_packed: dst + w13p_off,
-                ext_w13_scales: dst + w13s_off,
-                ext_w2_packed: dst + w2p_off,
-                ext_w2_scales: dst + w2s_off,
-                pool_slot: None,
-            };
-            pending_entries.push((layer_idx, expert_idx, entry));
-            slot_to_expert[slot] = Some((layer_idx, expert_idx));
-            slot += 1;
-            queued += 1;
+            alloc_bytes += chunk_bytes;
+            hcs.soft_chunks.push(chunk_buf);
         }
 
         // Record event after all DMA
@@ -12915,11 +13001,9 @@ impl GpuDecodeStore {
             }
         }
 
-        // Store the buffer and pending state (but don't activate cache entries yet)
-        hcs.soft_buf = Some(soft_buf);
-        hcs.soft_slot_to_expert = slot_to_expert;
-        hcs.soft_num_slots = num_slots;
-        hcs.soft_num_cached = queued;
+        // Store pending state (but don't activate cache entries yet)
+        // soft_chunks already has the new chunks appended above
+        hcs.soft_num_cached += queued;
         hcs.soft_loaded = false; // Not yet — DMA still in flight
         hcs.soft_reload_pending = true;
         hcs.soft_reload_entries = pending_entries;
@@ -12927,11 +13011,11 @@ impl GpuDecodeStore {
 
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let alloc_mb = alloc_bytes as f64 / (1024.0 * 1024.0);
-        let max_mb = hcs.soft_max_mb;
-        eprintln!("  \x1b[36mHCS soft: async reload queued {} experts ({:.1}/{} MB, {} tokens) in {:.1}ms\x1b[0m",
-            queued, alloc_mb, max_mb, actual_tokens, elapsed_ms);
-        log::info!("HCS soft: async reload queued {} experts ({:.1}/{} MB, {} tokens) in {:.1}ms",
-            queued, alloc_mb, max_mb, actual_tokens, elapsed_ms);
+        let chunks_queued = hcs.soft_chunks.len() - already_loaded;
+        eprintln!("  \x1b[36mHCS soft: async reload queued {} experts ({:.1} MB, {}/{} chunks) in {:.1}ms\x1b[0m",
+            queued, alloc_mb, chunks_queued, target_chunks, elapsed_ms);
+        log::info!("HCS soft: async reload queued {} experts ({:.1} MB, {}/{} chunks) in {:.1}ms",
+            queued, alloc_mb, chunks_queued, target_chunks, elapsed_ms);
 
         (queued, alloc_mb)
     }
@@ -12972,12 +13056,15 @@ impl GpuDecodeStore {
             hcs.cache_fast_set(layer_idx, expert_idx, &entry);
             hcs.cache.insert((layer_idx, expert_idx), entry);
         }
+        hcs.soft_chunks_loaded = hcs.soft_chunks.len();
         hcs.soft_loaded = true;
         hcs.soft_reload_pending = false;
         hcs.num_cached += activated;
 
-        eprintln!("  \x1b[32mHCS soft: async reload complete — {} experts activated\x1b[0m", activated);
-        log::info!("HCS soft: async reload complete — {} experts activated", activated);
+        eprintln!("  \x1b[32mHCS soft: async reload complete — {} experts activated ({}/{} chunks)\x1b[0m",
+            activated, hcs.soft_chunks_loaded, hcs.soft_total_chunks);
+        log::info!("HCS soft: async reload complete — {} experts activated ({}/{} chunks)",
+            activated, hcs.soft_chunks_loaded, hcs.soft_total_chunks);
 
         true
     }
@@ -13022,14 +13109,15 @@ impl GpuDecodeStore {
             hcs.cache_fast_set(layer_idx, expert_idx, &entry);
             hcs.cache.insert((layer_idx, expert_idx), entry);
         }
+        hcs.soft_chunks_loaded = hcs.soft_chunks.len();
         hcs.soft_loaded = true;
         hcs.soft_reload_pending = false;
         hcs.num_cached += activated;
 
-        eprintln!("  \x1b[32mHCS soft: sync reload complete — {} experts in {:.1}ms real DMA\x1b[0m",
-            activated, real_dma_ms);
-        log::info!("HCS soft: sync reload complete — {} experts in {:.1}ms real DMA",
-            activated, real_dma_ms);
+        eprintln!("  \x1b[32mHCS soft: sync reload complete — {} experts ({}/{} chunks) in {:.1}ms real DMA\x1b[0m",
+            activated, hcs.soft_chunks_loaded, hcs.soft_total_chunks, real_dma_ms);
+        log::info!("HCS soft: sync reload complete — {} experts ({}/{} chunks) in {:.1}ms real DMA",
+            activated, hcs.soft_chunks_loaded, hcs.soft_total_chunks, real_dma_ms);
 
         (activated, real_dma_ms)
     }
