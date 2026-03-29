@@ -38,6 +38,15 @@ jobs:
               ls -la /usr/local/cuda-12.6/bin/nvcc 2>/dev/null && echo "nvcc installed OK" || echo "WARNING: nvcc install failed"
             fi
 
+      - name: Inject vendored sidecars into wheels
+        run: |
+          MARLIN_SO=$(find target/release/build -path '*/out/libkrasis_marlin.so' | head -n 1)
+          FLASH_ATTN_SO=$(find target/release/build -path '*/out/libkrasis_flash_attn.so' | head -n 1)
+          python3 scripts/inject_wheel_sidecars.py \
+            --wheel-dir dist \
+            --marlin "$MARLIN_SO" \
+            --flash-attn "$FLASH_ATTN_SO"
+
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
