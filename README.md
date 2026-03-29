@@ -104,11 +104,11 @@ huggingface-cli download deepseek-ai/DeepSeek-V2-Lite \
 Krasis needs the BF16 safetensors model from HuggingFace. Put it under `~/.krasis/models/`. Some other models you can download:
 
 ```bash
-# Qwen3-Coder-Next (80B params, 148 GB, fastest on consumer hardware)
+# Qwen3-Coder-Next (80B params, ~148 GB)
 huggingface-cli download Qwen/Qwen3-Coder-Next \
     --local-dir ~/.krasis/models/Qwen3-Coder-Next
 
-# Qwen3-235B (235B params, 438 GB, needs ~500 GB RAM)
+# Qwen3-235B (235B params, ~438 GB)
 huggingface-cli download Qwen/Qwen3-235B-A22B \
     --local-dir ~/.krasis/models/Qwen3-235B-A22B
 ```
