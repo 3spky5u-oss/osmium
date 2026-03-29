@@ -284,10 +284,15 @@ impl VramCalibration {
     /// within the currently available idle free VRAM.
     fn max_safe_prefill_tokens(&self, free_mb: u64, prompt_tokens: usize) -> usize {
         let max_tokens = prompt_tokens.clamp(128, 50_000);
-        if self.required_prefill_idle_free_mb(128) > free_mb {
+        let fits = |tokens: usize| {
+            self.required_prefill_idle_free_mb(tokens) <= free_mb
+                && self.prefill_free_mb(tokens) >= self.safety_margin_mb
+        };
+
+        if !fits(128) {
             return 128;
         }
-        if self.required_prefill_idle_free_mb(max_tokens) <= free_mb {
+        if fits(max_tokens) {
             return max_tokens;
         }
 
@@ -295,7 +300,7 @@ impl VramCalibration {
         let mut hi = max_tokens;
         while lo + 1 < hi {
             let mid = lo + (hi - lo) / 2;
-            if self.required_prefill_idle_free_mb(mid) <= free_mb {
+            if fits(mid) {
                 lo = mid;
             } else {
                 hi = mid;

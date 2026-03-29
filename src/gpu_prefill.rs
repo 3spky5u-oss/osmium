@@ -1097,60 +1097,125 @@ impl PrefillEngine {
             }
         }
 
-        // 5. Allocate prefill-only GPU buffers: cold staging + shared expert scratch.
-        //    These are freed in release_scratch to maximize VRAM for HCS during decode.
-        let n_routed = self.config.n_routed_experts;
-        if n_routed > 0 {
-            let total_cold = n_routed * self.cold_expert_bytes;
-            let buf = self.device.alloc_zeros::<u8>(total_cold)
-                .map_err(|e| format!("alloc cold_staging: {e}"))?;
-            if stderr_debug_enabled() {
-                eprintln!("[PREFILL] Cold staging: {} MB ({} experts)", total_cold / (1024 * 1024), n_routed);
+        // 5. Allocate prefill-only GPU buffers and scratch. If live post-allocation
+        //    free VRAM still lands below the configured floor, shrink the chunk and
+        //    retry instead of trusting the linear model right at the boundary.
+        let mut attempt = 0usize;
+        let mut post_alloc_free_bytes = free_bytes;
+        loop {
+            attempt += 1;
+
+            let n_routed = self.config.n_routed_experts;
+            if n_routed > 0 {
+                let total_cold = n_routed * self.cold_expert_bytes;
+                let buf = self.device.alloc_zeros::<u8>(total_cold)
+                    .map_err(|e| format!("alloc cold_staging: {e}"))?;
+                if stderr_debug_enabled() && attempt == 1 {
+                    eprintln!("[PREFILL] Cold staging: {} MB ({} experts)", total_cold / (1024 * 1024), n_routed);
+                }
+                self.d_cold_staging = Some(buf);
+                self.max_cold_experts = n_routed;
             }
-            self.d_cold_staging = Some(buf);
-            self.max_cold_experts = n_routed;
-        }
 
-        if self.fla.is_some() && self.config.layer_types.iter().any(|&t| t == 3) {
-            let nv = self.config.la_num_v_heads;
-            let dk = self.config.la_k_head_dim;
-            let dv = self.config.la_v_head_dim;
-            let fla_bt = 64usize;
-            let fla_total = ((scratch_tokens + fla_bt - 1) / fla_bt) * fla_bt;
-            let fla_nt = fla_total / fla_bt;
-            self.d_fla_g_cumsum = Some(self.device.alloc_zeros::<f32>(fla_total * nv)
-                .map_err(|e| format!("alloc fla_g_cumsum: {e}"))?);
-            self.d_fla_a = Some(self.device.alloc_zeros::<f32>(fla_total * nv * fla_bt)
-                .map_err(|e| format!("alloc fla_a: {e}"))?);
-            self.d_fla_ai = Some(self.device.alloc_zeros::<u16>(fla_total * nv * fla_bt)
-                .map_err(|e| format!("alloc fla_ai: {e}"))?);
-            self.d_fla_w = Some(self.device.alloc_zeros::<u16>(fla_total * nv * dk)
-                .map_err(|e| format!("alloc fla_w: {e}"))?);
-            self.d_fla_u = Some(self.device.alloc_zeros::<u16>(fla_total * nv * dv)
-                .map_err(|e| format!("alloc fla_u: {e}"))?);
-            self.d_fla_h = Some(self.device.alloc_zeros::<u16>(fla_nt * nv * dk * dv)
-                .map_err(|e| format!("alloc fla_h: {e}"))?);
-            self.d_fla_final_state = Some(self.device.alloc_zeros::<f32>(nv * dk * dv)
-                .map_err(|e| format!("alloc fla_final_state: {e}"))?);
-            self.d_fla_v_new = Some(self.device.alloc_zeros::<u16>(fla_total * nv * dv)
-                .map_err(|e| format!("alloc fla_v_new: {e}"))?);
-            self.d_fla_o = Some(self.device.alloc_zeros::<u16>(fla_total * nv * dv)
-                .map_err(|e| format!("alloc fla_o: {e}"))?);
-        }
+            if self.fla.is_some() && self.config.layer_types.iter().any(|&t| t == 3) {
+                let nv = self.config.la_num_v_heads;
+                let dk = self.config.la_k_head_dim;
+                let dv = self.config.la_v_head_dim;
+                let fla_bt = 64usize;
+                let fla_total = ((scratch_tokens + fla_bt - 1) / fla_bt) * fla_bt;
+                let fla_nt = fla_total / fla_bt;
+                self.d_fla_g_cumsum = Some(self.device.alloc_zeros::<f32>(fla_total * nv)
+                    .map_err(|e| format!("alloc fla_g_cumsum: {e}"))?);
+                self.d_fla_a = Some(self.device.alloc_zeros::<f32>(fla_total * nv * fla_bt)
+                    .map_err(|e| format!("alloc fla_a: {e}"))?);
+                self.d_fla_ai = Some(self.device.alloc_zeros::<u16>(fla_total * nv * fla_bt)
+                    .map_err(|e| format!("alloc fla_ai: {e}"))?);
+                self.d_fla_w = Some(self.device.alloc_zeros::<u16>(fla_total * nv * dk)
+                    .map_err(|e| format!("alloc fla_w: {e}"))?);
+                self.d_fla_u = Some(self.device.alloc_zeros::<u16>(fla_total * nv * dv)
+                    .map_err(|e| format!("alloc fla_u: {e}"))?);
+                self.d_fla_h = Some(self.device.alloc_zeros::<u16>(fla_nt * nv * dk * dv)
+                    .map_err(|e| format!("alloc fla_h: {e}"))?);
+                self.d_fla_final_state = Some(self.device.alloc_zeros::<f32>(nv * dk * dv)
+                    .map_err(|e| format!("alloc fla_final_state: {e}"))?);
+                self.d_fla_v_new = Some(self.device.alloc_zeros::<u16>(fla_total * nv * dv)
+                    .map_err(|e| format!("alloc fla_v_new: {e}"))?);
+                self.d_fla_o = Some(self.device.alloc_zeros::<u16>(fla_total * nv * dv)
+                    .map_err(|e| format!("alloc fla_o: {e}"))?);
+            }
 
-        // Shared expert Marlin workspace: sized for actual chunk, not max possible.
-        let shared_scratch_n = std::cmp::max(self.config.hidden_size, self.config.moe_intermediate_size);
-        let shared_scratch_elems = scratch_tokens * shared_scratch_n;
-        if shared_scratch_elems > 0 {
-            self.d_shared_fp32_scratch = Some(self.device.alloc_zeros::<f32>(shared_scratch_elems)
-                .map_err(|e| format!("alloc shared_fp32_scratch: {e}"))?);
-            self.d_shared_workspace = Some(self.device.alloc_zeros::<i32>(self.config.sms * 4)
-                .map_err(|e| format!("alloc shared_workspace: {e}"))?);
-        }
+            // Shared expert Marlin workspace: sized for actual chunk, not max possible.
+            let shared_scratch_n = std::cmp::max(self.config.hidden_size, self.config.moe_intermediate_size);
+            let shared_scratch_elems = scratch_tokens * shared_scratch_n;
+            if shared_scratch_elems > 0 {
+                self.d_shared_fp32_scratch = Some(self.device.alloc_zeros::<f32>(shared_scratch_elems)
+                    .map_err(|e| format!("alloc shared_fp32_scratch: {e}"))?);
+                self.d_shared_workspace = Some(self.device.alloc_zeros::<i32>(self.config.sms * 4)
+                    .map_err(|e| format!("alloc shared_workspace: {e}"))?);
+            }
 
-        // 6. Allocate new scratch sized for this prompt.
-        self.scratch = allocate_scratch(&self.device, &self.config, scratch_tokens)?;
-        self.config.prefill_chunk_size = scratch_tokens;
+            self.scratch = allocate_scratch(&self.device, &self.config, scratch_tokens)?;
+
+            unsafe { cuda_sys::lib().cuCtxSynchronize(); }
+            unsafe { cuda_sys::lib().cuMemGetInfo_v2(&mut post_alloc_free_bytes, &mut total_bytes); }
+            if post_alloc_free_bytes >= safety_bytes || scratch_tokens <= 128 {
+                self.config.prefill_chunk_size = scratch_tokens;
+                break;
+            }
+
+            let deficit_bytes = safety_bytes - post_alloc_free_bytes;
+            let deficit_tokens = if per_token_bytes > 0 {
+                (deficit_bytes + per_token_bytes - 1) / per_token_bytes
+            } else {
+                0
+            };
+            let shrink_tokens = deficit_tokens
+                .saturating_mul(2)
+                .max((scratch_tokens / 8).max(64));
+            let next_tokens = scratch_tokens.saturating_sub(shrink_tokens).max(128);
+
+            if stderr_debug_enabled() {
+                eprintln!(
+                    "[PREFILL] Retry chunk size {} -> {} after post-alloc free {} MB fell below {} MB floor (attempt {})",
+                    scratch_tokens,
+                    next_tokens,
+                    post_alloc_free_bytes / (1024 * 1024),
+                    safety_margin_mb,
+                    attempt,
+                );
+            }
+
+            self.scratch = allocate_scratch(&self.device, &self.config, 0)
+                .map_err(|e| format!("alloc empty scratch: {e}"))?;
+            self.d_cold_staging = None;
+            self.d_shared_fp32_scratch = None;
+            self.d_shared_workspace = None;
+            self.d_fla_g_cumsum = None;
+            self.d_fla_a = None;
+            self.d_fla_ai = None;
+            self.d_fla_w = None;
+            self.d_fla_u = None;
+            self.d_fla_h = None;
+            self.d_fla_final_state = None;
+            self.d_fla_v_new = None;
+            self.d_fla_o = None;
+            unsafe { cuda_sys::lib().cuCtxSynchronize(); }
+            unsafe {
+                let mut pool: cuda_sys::CUmemoryPool = std::ptr::null_mut();
+                let mut dev: i32 = 0;
+                cuda_sys::lib().cuCtxGetDevice(&mut dev);
+                let err = cuda_sys::lib().cuDeviceGetDefaultMemPool(&mut pool, dev);
+                if err == cuda_sys::CUresult::CUDA_SUCCESS && !pool.is_null() {
+                    let _ = cuda_sys::lib().cuMemPoolTrimTo(pool, 0);
+                }
+            }
+
+            if next_tokens >= scratch_tokens {
+                self.config.prefill_chunk_size = scratch_tokens;
+                break;
+            }
+            scratch_tokens = next_tokens;
+        }
 
         let scratch_mb = (fixed_bytes + per_token_bytes * scratch_tokens) as f64 / (1024.0 * 1024.0);
         if scratch_tokens != old_tokens {
@@ -1159,6 +1224,13 @@ impl PrefillEngine {
                     scratch_tokens, scratch_mb, prompt_tokens, safety_margin_mb,
                     free_bytes as f64 / (1024.0 * 1024.0));
             }
+        }
+        if stderr_debug_enabled() && post_alloc_free_bytes < safety_bytes {
+            eprintln!(
+                "[PREFILL] Post-alloc free still below floor at min chunk: {} MB free vs {} MB target",
+                post_alloc_free_bytes / (1024 * 1024),
+                safety_margin_mb,
+            );
         }
 
         Ok(())
