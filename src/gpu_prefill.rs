@@ -1081,7 +1081,21 @@ impl PrefillEngine {
         // Minimum 128: fused MoE Marlin kernels use block_size_m=64, need enough
         // tokens for stable sorted dispatch. 128 adds ~57 MB scratch overhead.
         let target = prompt_tokens.min(50000);
-        let scratch_tokens = max_by_vram.min(target).max(128);
+        let mut scratch_tokens = max_by_vram.min(target).max(128);
+
+        // If decode store calibration is available for this live request, further cap
+        // scratch/chunk size using the measured no-HCS prefill model. This handles
+        // model/GPU-specific VRAM consumers that the static scratch estimator misses.
+        if self.prefill_hcs_store_addr != 0 {
+            let free_mb = (free_bytes / (1024 * 1024)) as u64;
+            let measured_cap = unsafe {
+                let store = &*(self.prefill_hcs_store_addr as *const crate::gpu_decode::GpuDecodeStore);
+                store.max_safe_prefill_chunk_tokens(target, free_mb)
+            };
+            if let Some(measured_cap) = measured_cap {
+                scratch_tokens = scratch_tokens.min(measured_cap.max(128));
+            }
+        }
 
         // 5. Allocate prefill-only GPU buffers: cold staging + shared expert scratch.
         //    These are freed in release_scratch to maximize VRAM for HCS during decode.

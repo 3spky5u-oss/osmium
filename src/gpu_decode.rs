@@ -279,6 +279,30 @@ impl VramCalibration {
             0.0
         }
     }
+
+    /// Largest prefill chunk length whose measured idle-floor requirement fits
+    /// within the currently available idle free VRAM.
+    fn max_safe_prefill_tokens(&self, free_mb: u64, prompt_tokens: usize) -> usize {
+        let max_tokens = prompt_tokens.clamp(128, 50_000);
+        if self.required_prefill_idle_free_mb(128) > free_mb {
+            return 128;
+        }
+        if self.required_prefill_idle_free_mb(max_tokens) <= free_mb {
+            return max_tokens;
+        }
+
+        let mut lo = 128usize;
+        let mut hi = max_tokens;
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.required_prefill_idle_free_mb(mid) <= free_mb {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
 }
 
 /// Per-layer APFL statistics.
@@ -1890,6 +1914,11 @@ pub struct GpuDecodeStore {
 
 #[pymethods]
 impl GpuDecodeStore {
+    pub fn max_safe_prefill_chunk_tokens(&self, prompt_tokens: usize, free_mb: u64) -> Option<usize> {
+        self.vram_calibration
+            .map(|cal| cal.max_safe_prefill_tokens(free_mb, prompt_tokens))
+    }
+
     #[new]
     #[pyo3(signature = (device_ordinal=0))]
     fn new(device_ordinal: usize) -> PyResult<Self> {
@@ -14336,15 +14365,17 @@ impl GpuDecodeStore {
             }
         }
 
-        // Snapshot VRAM before decode loop
-        {
+        let sample_min_vram = |min_vram_free_bytes: &mut usize| {
             let mut free: usize = 0;
             let mut _total: usize = 0;
             unsafe { let _ = cuda_sys::lib().cuMemGetInfo_v2(&mut free, &mut _total); }
-            if free < min_vram_free_bytes {
-                min_vram_free_bytes = free;
+            if free < *min_vram_free_bytes {
+                *min_vram_free_bytes = free;
             }
-        }
+        };
+
+        // Snapshot VRAM before decode loop
+        sample_min_vram(&mut min_vram_free_bytes);
 
         let mut step = 0usize;
         while step < max_tokens {
@@ -14727,6 +14758,7 @@ impl GpuDecodeStore {
                         graph.t_total += t_step.elapsed().as_secs_f64();
                         graph.timing_step_count += 1;
                     }
+                    sample_min_vram(&mut min_vram_free_bytes);
                     // logits already D2H'd inside replay_per_layer_graphs
                 } else {
                     if let Some(ref mut g) = self.graph {
@@ -14737,6 +14769,7 @@ impl GpuDecodeStore {
                         log::error!("gpu_generate_stream: decode_step error: {}", e);
                         break;
                     }
+                    sample_min_vram(&mut min_vram_free_bytes);
 
                     // Try to capture per-layer CUDA graphs after first token
                     let _has_graph_bufs = self.graph.as_ref()
@@ -14750,6 +14783,7 @@ impl GpuDecodeStore {
                         match self.capture_per_layer_graphs(None, true, true, 0) {
                             Ok(()) => {
                                 if stderr_debug_enabled() { eprintln!("[krasis] Per-layer CUDA graphs captured after token 0"); }
+                                sample_min_vram(&mut min_vram_free_bytes);
                             }
                             Err(e) => eprintln!("[krasis] Per-layer graph capture failed: {}, continuing ungraphed", e),
                         }
