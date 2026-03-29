@@ -6061,7 +6061,9 @@ impl GpuDecodeStore {
         // Before each prefill, prepare_for_prefill() reallocates to the actual prompt size.
         // After each prefill, release_scratch() shrinks back and frees VRAM for decode HCS.
         config.prefill_chunk_size = 0; // Set dynamically per prompt
-        eprintln!("[PREFILL] Dynamic scratch allocation enabled (per-prompt sizing)");
+        if stderr_debug_enabled() {
+            eprintln!("[PREFILL] Dynamic scratch allocation enabled (per-prompt sizing)");
+        }
 
         // Build per-layer weights
         let mut layer_weights = Vec::with_capacity(num_layers);
@@ -6384,7 +6386,9 @@ impl GpuDecodeStore {
         // synchronous and deterministic — no pool interaction with HCS.
         let scratch = allocate_scratch(&self.device, &config, 0)?;
         config.prefill_chunk_size = 0;
-        eprintln!("[PREFILL] Dynamic scratch: allocated minimal at init (sized per-prompt)");
+        if stderr_debug_enabled() {
+            eprintln!("[PREFILL] Dynamic scratch: allocated minimal at init (sized per-prompt)");
+        }
 
         // Create CUDA events for double-buffer synchronization
         let dma_event = unsafe {
