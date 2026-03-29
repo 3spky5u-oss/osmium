@@ -4088,6 +4088,24 @@ impl GpuDecodeStore {
         self.init_hcs_internal(budget_mb, headroom_mb)
     }
 
+    /// Initialize a lightweight HCS state for heatmap collection only.
+    /// No VRAM is allocated for expert caching — only the flat heatmap array.
+    /// Call hcs_start_collecting() after this, run inference, then hcs_export_heatmap().
+    fn hcs_init_collection(&mut self, num_layers: usize, num_experts_per_layer: usize) -> PyResult<()> {
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let mut hcs = HcsState::new();
+        hcs.num_experts_per_layer = num_experts_per_layer;
+        let total = num_layers * num_experts_per_layer;
+        hcs.cache_fast = vec![[0u64; 4]; total];
+        hcs.cache_fast_num_layers = num_layers;
+        hcs.heatmap_flat = vec![0u64; total];
+        graph.hcs = Some(hcs);
+        log::info!("HCS collection-only init: {} layers × {} experts = {} slots",
+            num_layers, num_experts_per_layer, total);
+        Ok(())
+    }
+
     /// Start collecting activation heatmap data for HCS.
     fn hcs_start_collecting(&mut self) -> PyResult<()> {
         let graph = self.graph.as_mut()
@@ -4098,6 +4116,36 @@ impl GpuDecodeStore {
         hcs.heatmap.clear();
         // Clear flat heatmap too
         for v in hcs.heatmap_flat.iter_mut() { *v = 0; }
+        Ok(())
+    }
+
+    /// Export the collected heatmap as a Python dict {"layer,expert": count}.
+    fn hcs_export_heatmap(&self, py: pyo3::Python<'_>) -> PyResult<PyObject> {
+        let graph = self.graph.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let hcs = graph.hcs.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("No HCS state"))?;
+        let nep = hcs.num_experts_per_layer;
+        if nep == 0 || hcs.heatmap_flat.is_empty() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err("Heatmap is empty"));
+        }
+        let dict = pyo3::types::PyDict::new(py);
+        for (idx, &count) in hcs.heatmap_flat.iter().enumerate() {
+            if count > 0 {
+                let layer = idx / nep;
+                let expert = idx % nep;
+                dict.set_item(format!("{},{}", layer, expert), count)?;
+            }
+        }
+        Ok(dict.into())
+    }
+
+    /// Destroy HCS state so it can be re-initialized with a real budget.
+    fn hcs_reset(&mut self) -> PyResult<()> {
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        graph.hcs = None;
+        log::info!("HCS state reset");
         Ok(())
     }
 
@@ -16159,6 +16207,11 @@ impl GpuDecodeStore {
             if eid < 0 { continue; }
             let eid = eid as usize;
             let weight = graph.h_topk_weights[i];
+
+            // Record activation for heatmap collection (no-op when not collecting)
+            if let Some(ref mut hcs) = graph.hcs {
+                hcs.record_activation(layer_idx, eid);
+            }
 
             // Check HCS cache (fast flat array lookup)
             let hcs_ptrs = if let Some(ref hcs) = graph.hcs {

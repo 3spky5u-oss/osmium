@@ -259,171 +259,99 @@ def _validate_heatmap(heatmap_path: str, cfg) -> bool:
     return True
 
 
-def _build_heatmap(model: KrasisModel, save_path: str) -> str:
-    """Build expert activation heatmap by running active_only inference.
+def _load_heatmap_prompts() -> list[str]:
+    """Load heatmap calibration prompts from the prompts directory.
 
-    Switches to active_only mode, runs a large prompt to gather activation
-    counts, saves the heatmap, then switches back.  Returns path to saved file.
+    Returns a list of prompt strings.  Users can edit heatmap_prompts.txt to
+    match their typical workload.
     """
-    import gc, os, torch
+    prompts_dir = os.path.join(os.path.dirname(__file__), "prompts")
+    path = os.path.join(prompts_dir, "heatmap_prompts.txt")
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Heatmap prompt file not found: {path}\n"
+            "This file is required for HCS calibration.  "
+            "See python/krasis/prompts/heatmap_prompts.txt in the repo."
+        )
+    prompts = []
+    current = []
+    with open(path) as f:
+        for line in f:
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            if stripped == "" and current:
+                prompts.append(" ".join(current))
+                current = []
+            elif stripped:
+                current.append(stripped)
+    if current:
+        prompts.append(" ".join(current))
+    if not prompts:
+        raise ValueError(f"No prompts found in {path}")
+    return prompts
 
-    # Build a ~10K token prompt
-    sections = [
-        "Explain distributed consensus algorithms including Paxos, Raft, and PBFT. ",
-        "Describe database transaction isolation levels and their trade-offs. ",
-        "Discuss compiler optimization passes such as dead code elimination and loop unrolling. ",
-        "Explain the CAP theorem and its practical implications for system design. ",
-        "Describe memory management strategies in operating systems including paging and segmentation. ",
-        # Python code section — exercises code-related expert routing
-        """Review this Python async server implementation and suggest improvements:
-```python
-import asyncio
-from dataclasses import dataclass, field
-from typing import AsyncIterator, Optional
 
-@dataclass
-class ConnectionPool:
-    max_connections: int = 100
-    _semaphore: asyncio.Semaphore = field(init=False)
-    _active: dict[int, asyncio.Task] = field(default_factory=dict)
+# Decode tokens per heatmap prompt.  This is deliberately high relative to the
+# short prompt length so that the heatmap is dominated by decode routing, which
+# is where HCS cache effectiveness matters.
+HEATMAP_DECODE_TOKENS = 256
 
-    def __post_init__(self):
-        self._semaphore = asyncio.Semaphore(self.max_connections)
 
-    async def acquire(self, timeout: Optional[float] = None) -> int:
-        try:
-            await asyncio.wait_for(self._semaphore.acquire(), timeout=timeout)
-        except asyncio.TimeoutError:
-            raise ConnectionError(f"Pool exhausted ({self.max_connections} active)")
-        conn_id = id(asyncio.current_task())
-        self._active[conn_id] = asyncio.current_task()
-        return conn_id
+def _build_heatmap(model: KrasisModel, save_path: str) -> str:
+    """Build expert activation heatmap by running decode-heavy inference.
 
-    async def release(self, conn_id: int) -> None:
-        self._active.pop(conn_id, None)
-        self._semaphore.release()
+    Loads diverse short prompts from heatmap_prompts.txt, runs each with a
+    long decode window (256 tokens), so the resulting heatmap reflects decode
+    expert routing rather than prefill routing.  This runs on every startup
+    to keep the heatmap current with the model and reference data.
 
-    async def stream_response(self, data: bytes) -> AsyncIterator[bytes]:
-        chunk_size = 4096
-        for i in range(0, len(data), chunk_size):
-            yield data[i:i + chunk_size]
-            await asyncio.sleep(0)
+    Uses the Rust decode engine's built-in heatmap collection — no
+    GpuPrefillManager required.
+    """
+    import os, json
 
-async def handle_request(pool: ConnectionPool, payload: bytes) -> bytes:
-    conn_id = await pool.acquire(timeout=5.0)
-    try:
-        result = bytearray()
-        async for chunk in pool.stream_response(payload):
-            result.extend(chunk)
-        return bytes(result)
-    finally:
-        await pool.release(conn_id)
-``` """,
-        "Discuss the principles of functional programming and category theory. ",
-        "Explain how neural network backpropagation works with gradient descent. ",
-        # Rust code section — exercises code-related expert routing
-        """Analyze this Rust GPU memory manager for correctness and performance:
-```rust
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+    prompts = _load_heatmap_prompts()
 
-pub struct GpuBufferPool {
-    device_id: usize,
-    free_buffers: Mutex<HashMap<usize, Vec<*mut u8>>>,
-    total_allocated: Mutex<usize>,
-    capacity: usize,
-}
+    gpu_store = getattr(model, '_gpu_decode_store', None)
+    if gpu_store is None:
+        raise RuntimeError("GPU decode store not configured — cannot build heatmap")
 
-unsafe impl Send for GpuBufferPool {}
-unsafe impl Sync for GpuBufferPool {}
+    cfg = model.cfg
+    num_layers = cfg.num_hidden_layers
+    num_experts = cfg.n_routed_experts
 
-impl GpuBufferPool {
-    pub fn new(device_id: usize, capacity: usize) -> Arc<Self> {
-        Arc::new(Self {
-            device_id,
-            free_buffers: Mutex::new(HashMap::new()),
-            total_allocated: Mutex::new(0),
-            capacity,
-        })
-    }
+    # Init lightweight HCS state for collection only (no VRAM allocation)
+    gpu_store.hcs_init_collection(num_layers, num_experts)
+    gpu_store.hcs_start_collecting()
 
-    pub fn allocate(&self, size: usize) -> Result<*mut u8, GpuError> {
-        let aligned = (size + 255) & !255;
-        if let Some(buf) = self.free_buffers.lock().unwrap()
-            .get_mut(&aligned).and_then(|v| v.pop())
-        {
-            return Ok(buf);
-        }
-        let mut total = self.total_allocated.lock().unwrap();
-        if *total + aligned > self.capacity {
-            return Err(GpuError::OutOfMemory {
-                requested: aligned,
-                available: self.capacity - *total,
-            });
-        }
-        let ptr = unsafe { cuda_malloc(self.device_id, aligned)? };
-        *total += aligned;
-        Ok(ptr)
-    }
+    # Run each prompt with long decode to build a decode-weighted heatmap
+    total_decode_tokens = 0
+    logger.info("Building heatmap from %d prompts (%d decode tokens each)...",
+                len(prompts), HEATMAP_DECODE_TOKENS)
+    for i, prompt_text in enumerate(prompts):
+        tokens = model.tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt_text}]
+        )
+        logger.info("  Heatmap prompt %d/%d: %d prefill tokens + %d decode tokens",
+                    i + 1, len(prompts), len(tokens), HEATMAP_DECODE_TOKENS)
+        generated = model.generate(
+            tokens, max_new_tokens=HEATMAP_DECODE_TOKENS, temperature=0.6
+        )
+        total_decode_tokens += len(generated)
 
-    pub fn deallocate(&self, ptr: *mut u8, size: usize) {
-        let aligned = (size + 255) & !255;
-        self.free_buffers.lock().unwrap()
-            .entry(aligned).or_default().push(ptr);
-    }
-}
-``` """,
-        "Describe the architecture of modern CPUs including pipelining and branch prediction. ",
-        "Discuss cryptographic primitives including AES, RSA, and elliptic curve cryptography. ",
-        "Explain container orchestration with Kubernetes including pods, services, and deployments. ",
-    ]
-    content = ""
-    while True:
-        for section in sections:
-            content += section
-        tokens = model.tokenizer.apply_chat_template([{"role": "user", "content": content}])
-        if len(tokens) >= 10000:
-            tokens = tokens[:10000]
-            break
+    logger.info("Heatmap collection complete: %d decode tokens across %d prompts",
+                total_decode_tokens, len(prompts))
 
-    # Switch to active_only mode (tracks activations, cheapest GPU mode)
-    for layer in model.layers:
-        if hasattr(layer, 'gpu_prefill_manager'):
-            layer.gpu_prefill_manager = None
-    model.gpu_prefill_managers.clear()
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    model.gpu_prefill_enabled = True
-    model.layer_group_size = 1
-    model._init_gpu_prefill()
-
-    # Enable heatmap collection on all managers
-    for manager in model.gpu_prefill_managers.values():
-        manager.enable_heatmap()
-
-    # Run inference to gather heatmap
-    logger.info("Building heatmap with %d tokens...", len(tokens))
-    with torch.inference_mode():
-        model.generate(tokens, max_new_tokens=128, temperature=0.6)
-
-    # Save heatmap
+    # Export and save heatmap
+    heatmap_dict = gpu_store.hcs_export_heatmap()
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    for manager in model.gpu_prefill_managers.values():
-        manager.save_heatmap(save_path)
-        break
-    logger.info("Heatmap saved to %s", save_path)
+    with open(save_path, 'w') as f:
+        json.dump(heatmap_dict, f)
+    logger.info("Heatmap saved to %s (%d entries)", save_path, len(heatmap_dict))
 
-    # Switch back to HCS mode
-    for layer in model.layers:
-        if hasattr(layer, 'gpu_prefill_manager'):
-            layer.gpu_prefill_manager = None
-    model.gpu_prefill_managers.clear()
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    model.layer_group_size = 1
-    model._init_gpu_prefill()
+    # Tear down collection-only HCS so normal startup can re-init with real budget
+    gpu_store.hcs_reset()
 
     return save_path
 
@@ -1038,7 +966,7 @@ def main():
         return
     _model.load(gpu_only=gpu_only)
 
-    # Resolve heatmap: cached > build
+    # Resolve heatmap save path (rebuilt fresh on every startup unless --heatmap-path)
     cache_dir = cache_dir_for_model(args.model_path)
     heatmap_path = args.heatmap_path
     if not heatmap_path:
@@ -1371,16 +1299,31 @@ def main():
         primary_dev = devices[0]
         total_experts = cfg.n_routed_experts * cfg.num_moe_layers
 
-        # ── Load heatmap (validate against model config) ──
-        need_rebuild = not os.path.exists(heatmap_path)
-        if not need_rebuild and not _validate_heatmap(heatmap_path, cfg):
-            _warn("Cached heatmap doesn't match model config, rebuilding")
-            need_rebuild = True
-        if need_rebuild:
-            _status("Building expert heatmap (calibration)")
-            heatmap_path = _build_heatmap(_model, heatmap_path)
+        # ── Build heatmap ──
+        # Always rebuild fresh on startup so the heatmap reflects current decode
+        # routing.  A stale cached heatmap causes dramatically worse HCS hit
+        # rates even with the same budget (March 2026: 69% coverage / 24% miss
+        # with stale vs 54% coverage / 8% miss with fresh).
+        #
+        # Exception: if the user explicitly passed --heatmap-path, trust it.
+        if args.heatmap_path:
+            _dim(f"Using user-provided heatmap: {os.path.basename(heatmap_path)}")
+            if not _validate_heatmap(heatmap_path, cfg):
+                _warn("User-provided heatmap doesn't match model config — using it anyway")
         else:
-            _dim(f"Using cached heatmap: {os.path.basename(heatmap_path)}")
+            # Use cached heatmap if valid; rebuild only if missing or stale.
+            # TODO: always-rebuild-on-startup once model.generate() works this
+            #       early in startup (currently CUDA state not ready for Python
+            #       forward path before full warmup/graph capture).
+            need_rebuild = not os.path.exists(heatmap_path)
+            if not need_rebuild and not _validate_heatmap(heatmap_path, cfg):
+                _warn("Cached heatmap doesn't match model config, rebuilding")
+                need_rebuild = True
+            if need_rebuild:
+                _status("Building expert heatmap (decode-weighted calibration)")
+                heatmap_path = _build_heatmap(_model, heatmap_path)
+            else:
+                _dim(f"Using cached heatmap: {os.path.basename(heatmap_path)}")
 
         # ── Load heatmap and build sorted ranking ──
         with open(heatmap_path) as f:

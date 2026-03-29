@@ -1,0 +1,26 @@
+# Heatmap calibration prompts
+# Each prompt is separated by a blank line.  These are used to build the expert
+# activation heatmap at startup.  The model generates ~512 decode tokens per
+# prompt so that the heatmap is weighted toward decode routing, which is where
+# HCS cache effectiveness matters most.
+#
+# Edit or replace these prompts to match your typical workload.  Prompts should
+# be short (the model will do most of its work in decode, not prefill) and
+# diverse (cover different domains so the heatmap captures a broad routing
+# profile).
+#
+# These prompts must NOT overlap with the benchmark prompts in benchmarks/prompts/
+# or the decode prompts in this directory (decode_prompt_*), so that benchmark
+# results remain honest measures of unseen-prompt performance.
+
+Write a short story about a woman who discovers an old letter hidden inside the wall of a house she just bought.
+
+Write a Python function that implements a basic LRU cache with O(1) get and put operations, then explain how it works and discuss edge cases.
+
+What were the main causes and consequences of the fall of the Roman Empire? Discuss both the Western and Eastern halves.
+
+Describe how a hospital emergency department triages and treats patients during a mass casualty event.
+
+Explain how modern CPUs use branch prediction, speculative execution, and out-of-order pipelines to achieve high throughput, and what happens when speculation fails.
+
+Write a Rust program that reads a CSV file, groups rows by a key column, computes per-group statistics, and outputs the results as JSON. Explain your design choices.
