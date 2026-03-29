@@ -817,20 +817,13 @@ fn handle_chat_completion(
                 request_id, queued, prompt_len);
         }
     }
-    // Sync mode: wait for reload DMA to complete before decode starts.
-    // Gives clean decode measurement (no PCIe contention from reload).
-    // Toggle via KRASIS_SYNC_HCS_RELOAD=1 env var.
-    let sync_reload = std::env::var("KRASIS_SYNC_HCS_RELOAD").is_ok();
-    let real_reload_ms;
-    if sync_reload {
-        let (activated, dma_ms) = store.hcs_sync_soft_reload();
-        real_reload_ms = dma_ms;
-        if activated > 0 {
-            log::info!("Request {}: sync HCS reload: {} experts, {:.1}ms real DMA",
-                request_id, activated, dma_ms);
-        }
-    } else {
-        real_reload_ms = 0.0; // async — will be measured by hcs_check_soft_reload_complete
+    // Always sync: wait for reload DMA to complete before decode starts.
+    // Decode must never begin with an incomplete HCS — with dynamic chunking
+    // the entire soft tier is evicted for prefill and must be fully restored.
+    let (activated, real_reload_ms) = store.hcs_sync_soft_reload();
+    if activated > 0 {
+        log::info!("Request {}: HCS reload complete: {} experts, {:.1}ms DMA",
+            request_id, activated, real_reload_ms);
     }
     // NOTE: aux GPUs have no soft tier (100% hard), no eviction/reload needed
     // ── Multi-GPU: copy KV cache from primary to all aux GPUs after prefill ──
@@ -855,7 +848,7 @@ fn handle_chat_completion(
         parse_ms,
         evict_ms,
         prefill_ms: prefill_gil_ms,
-        reload_ms: if sync_reload { reload_ms } else { reload_ms }, // total elapsed either way
+        reload_ms, // includes sync wait
         real_reload_dma_ms: real_reload_ms, // actual DMA time (0 if async)
     };
 
@@ -1135,6 +1128,11 @@ fn handle_reference_test(
         if queued > 0 {
             log::info!("reference_test: HCS soft reload queued {} experts", queued);
         }
+    }
+    // Always sync: decode must not start with incomplete HCS
+    let (activated, dma_ms) = store.hcs_sync_soft_reload();
+    if activated > 0 {
+        log::info!("reference_test: HCS reload complete: {} experts, {:.1}ms DMA", activated, dma_ms);
     }
 
     // Disable thinking suppression for reference test (greedy, no thinking budget logic)
@@ -2170,19 +2168,13 @@ impl RustServer {
             log::info!("Benchmark: HCS soft async reload queued {} experts ({} tokens)",
                 queued, prompt_len);
         }
-        // Sync mode: wait for reload DMA to complete before decode starts
-        let sync_reload = std::env::var("KRASIS_SYNC_HCS_RELOAD").is_ok();
-        let real_reload_dma_ms;
-        if sync_reload {
-            let (activated, dma_ms) = store.hcs_sync_soft_reload();
-            real_reload_dma_ms = dma_ms;
-            if activated > 0 {
-                log::info!("Benchmark: sync HCS reload: {} experts, {:.1}ms real DMA",
-                    activated, dma_ms);
-            }
-        } else {
-            real_reload_dma_ms = 0.0;
+        // Always sync: decode must not start with incomplete HCS
+        let (activated, real_reload_dma_ms) = store.hcs_sync_soft_reload();
+        if activated > 0 {
+            log::info!("Benchmark: HCS reload complete: {} experts, {:.1}ms DMA",
+                activated, real_reload_dma_ms);
         }
+        let reload_pending_at_decode_start = store.hcs_soft_reload_pending();
         // NOTE: aux GPUs have no soft tier (100% hard), no eviction/reload needed
         let reload_ms = t_reload.elapsed().as_secs_f64() * 1000.0;
         crate::vram_monitor::report_event("hcs_soft_load_end");
@@ -2287,15 +2279,57 @@ impl RustServer {
             }
         }
         let hcs_pct = if hcs_total > 0 { hcs_loaded as f64 / hcs_total as f64 * 100.0 } else { 0.0 };
+        let state_validation_env = std::env::var("KRASIS_STATE_VALIDATION").ok();
+        let config_validation_env = std::env::var("KRASIS_CONFIG_VALIDATION").ok();
+        let state_validation_enabled = state_validation_env
+            .as_deref()
+            .map(|v| v != "0")
+            .unwrap_or(false)
+            || config_validation_env
+                .as_deref()
+                .map(|v| v != "0")
+                .unwrap_or(false);
+        let state_validation = if state_validation_enabled {
+            let raw = store.config_validation_snapshot_json(
+                prompt_len,
+                true, // sync is always on
+                reload_pending_at_decode_start,
+            );
+            match serde_json::from_str::<serde_json::Value>(&raw) {
+                Ok(v) => {
+                    log::info!("STATE_VALIDATION {}", v);
+                    Some(v)
+                }
+                Err(e) => {
+                    log::warn!("STATE_VALIDATION parse failed: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
-        Ok(format!(
-            r#"{{"prefill_ms":{:.1},"prefill_tok_s":{:.1},"prompt_tokens":{},"decode_ms":{:.1},"decode_tok_s":{:.2},"decode_tokens":{},"evict_ms":{:.1},"reload_ms":{:.1},"real_reload_dma_ms":{:.1},"min_free_vram_mb":{},"hcs_loaded":{},"hcs_total":{},"hcs_pct":{:.1},"safety_margin_mb":{}}}"#,
-            prefill_ms, prefill_tok_s, prompt_len,
-            decode_ms, decode_tok_s, decode_tokens,
-            evict_ms, reload_ms, real_reload_dma_ms,
-            min_free_vram_mb, hcs_loaded, hcs_total, hcs_pct,
-            safety_margin_mb
-        ))
+        let mut result = serde_json::json!({
+            "prefill_ms": prefill_ms,
+            "prefill_tok_s": prefill_tok_s,
+            "prompt_tokens": prompt_len,
+            "decode_ms": decode_ms,
+            "decode_tok_s": decode_tok_s,
+            "decode_tokens": decode_tokens,
+            "evict_ms": evict_ms,
+            "reload_ms": reload_ms,
+            "real_reload_dma_ms": real_reload_dma_ms,
+            "min_free_vram_mb": min_free_vram_mb,
+            "hcs_loaded": hcs_loaded,
+            "hcs_total": hcs_total,
+            "hcs_pct": hcs_pct,
+            "safety_margin_mb": safety_margin_mb,
+        });
+        if let Some(v) = state_validation {
+            result["state_validation"] = v;
+        }
+
+        Ok(result.to_string())
     }
 
     /// Signal the server to stop.

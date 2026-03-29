@@ -3,7 +3,7 @@
 # Krasis dev helper — single entry point for build, run, test, benchmark.
 #
 # Usage:
-#   ./dev build                     Rebuild Rust extension into the dev env
+#   ./dev build                     Rebuild Rust extension into this repo only
 #   ./dev run <config>              Launch server from a test config
 #   ./dev run <config> --benchmark  Launch with benchmark, then serve
 #   ./dev test <config>             Run short model test (benchmark + network tests)
@@ -26,8 +26,9 @@
 #   ./dev sanity                    Run sanity test prompts against running server
 #   ./dev kill                      Kill all krasis processes and free GPU memory
 #   ./dev install                   Sync krasis command to ~/.local/bin (uses source)
-#   ./dev shell                     Drop into a Python shell with the dev env
-#   ./dev python <args...>          Run arbitrary Python with the dev env
+#   ./dev shell                     Drop into a Python shell bound to this repo
+#   ./dev python <args...>          Run arbitrary Python bound to this repo
+#   ./dev verify-imports            Verify imports resolve inside this repo
 #
 # Timing / profiling:
 #   Add --timing to any command to enable per-component decode timing.
@@ -61,6 +62,9 @@ export PYTHONUNBUFFERED=1
 PIP="/home/main/miniconda3/envs/ktransformers/bin/pip"
 MATURIN="/home/main/.local/bin/maturin"
 SO_FILE="$SCRIPT_DIR/python/krasis/krasis.cpython-311-x86_64-linux-gnu.so"
+WHEEL_DIR="$SCRIPT_DIR/target/dev-wheels"
+REPO_PYTHONPATH="$SCRIPT_DIR/python"
+REPO_LIBPATH="$SCRIPT_DIR/python/krasis.libs"
 
 RED="\033[0;31m"
 GREEN="\033[0;32m"
@@ -152,6 +156,60 @@ auto_rebuild() {
         warn "Rust source is newer than compiled extension. Rebuilding..."
         do_build
     fi
+}
+
+run_repo_python() {
+    local ld_path="${LD_LIBRARY_PATH:-}"
+    if [[ -d "$REPO_LIBPATH" ]]; then
+        ld_path="$REPO_LIBPATH${ld_path:+:$ld_path}"
+    fi
+    PYTHONNOUSERSITE=1 PYTHONPATH="$REPO_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}" LD_LIBRARY_PATH="$ld_path" "$PYTHON" "$@"
+}
+
+exec_repo_python() {
+    local ld_path="${LD_LIBRARY_PATH:-}"
+    if [[ -d "$REPO_LIBPATH" ]]; then
+        ld_path="$REPO_LIBPATH${ld_path:+:$ld_path}"
+    fi
+    exec env PYTHONNOUSERSITE=1 PYTHONPATH="$REPO_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}" LD_LIBRARY_PATH="$ld_path" "$PYTHON" "$@"
+}
+
+verify_repo_imports() {
+    local output
+    local ld_path="${LD_LIBRARY_PATH:-}"
+    if [[ -d "$REPO_LIBPATH" ]]; then
+        ld_path="$REPO_LIBPATH${ld_path:+:$ld_path}"
+    fi
+    output=$(PYTHONNOUSERSITE=1 PYTHONPATH="$REPO_PYTHONPATH" LD_LIBRARY_PATH="$ld_path" SCRIPT_DIR="$SCRIPT_DIR" "$PYTHON" - <<'PY'
+import importlib
+import os
+import pathlib
+import sys
+
+repo = pathlib.Path(os.environ["SCRIPT_DIR"]).resolve()
+pkg = importlib.import_module("krasis")
+ext = importlib.import_module("krasis.krasis")
+pkg_path = pathlib.Path(pkg.__file__).resolve()
+ext_path = pathlib.Path(ext.__file__).resolve()
+
+def inside_repo(path: pathlib.Path) -> bool:
+    try:
+        path.relative_to(repo)
+        return True
+    except ValueError:
+        return False
+
+print(f"krasis: {pkg_path}")
+print(f"krasis.krasis: {ext_path}")
+if not inside_repo(pkg_path) or not inside_repo(ext_path):
+    sys.exit(1)
+PY
+) || {
+        echo "$output"
+        err "Import verification failed: dev runtime is not bound to this repo."
+    }
+    info "Import origin check:"
+    echo "$output"
 }
 
 # ── GPU cleanup ─────────────────────────────────────────────────────
@@ -262,11 +320,56 @@ cleanup_gpu() {
 # ── Commands ─────────────────────────────────────────────────────────
 
 do_build() {
-    info "Building Rust extension (maturin develop --release)..."
+    info "Building Rust extension (repo-local maturin build --release)..."
     cd "$SCRIPT_DIR"
-    VIRTUAL_ENV="$(dirname "$(dirname "$PYTHON")")" PATH="$HOME/.cargo/bin:$(dirname "$PYTHON"):$PATH" \
-        "$MATURIN" develop --release 2>&1
+    mkdir -p "$WHEEL_DIR"
+    rm -f "$WHEEL_DIR"/krasis-*.whl
+    PATH="$HOME/.cargo/bin:$(dirname "$PYTHON"):$PATH" \
+        "$MATURIN" build --release --out "$WHEEL_DIR" 2>&1
+    local wheel
+    wheel=$(ls -t "$WHEEL_DIR"/krasis-*.whl 2>/dev/null | head -1)
+    [[ -n "$wheel" ]] || err "Build succeeded but no wheel was produced in $WHEEL_DIR"
+    "$PYTHON" - "$wheel" "$SCRIPT_DIR/python/krasis" "$SCRIPT_DIR/python/krasis.libs" <<'PY'
+import pathlib
+import shutil
+import sys
+import zipfile
+
+wheel = pathlib.Path(sys.argv[1])
+target = pathlib.Path(sys.argv[2])
+lib_target = pathlib.Path(sys.argv[3])
+target.mkdir(parents=True, exist_ok=True)
+lib_target.mkdir(parents=True, exist_ok=True)
+for pattern in ("krasis*.so", "krasis*.pyd", "lib*.so", "*.dylib", "*.dll"):
+    for path in target.glob(pattern):
+        path.unlink()
+for pattern in ("*.so", "*.so.*", "*.dylib", "*.dll"):
+    for path in lib_target.glob(pattern):
+        path.unlink()
+with zipfile.ZipFile(wheel) as zf:
+    ext_members = [
+        name for name in zf.namelist()
+        if name.startswith("krasis/") and name.endswith((".so", ".pyd", ".dll", ".dylib"))
+    ]
+    lib_members = [
+        name for name in zf.namelist()
+        if name.startswith("krasis.libs/")
+    ]
+    if not ext_members:
+        raise SystemExit("No compiled artifacts found in wheel")
+    for member in ext_members:
+        dest = target / pathlib.Path(member).name
+        with zf.open(member) as src, open(dest, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        print(dest)
+    for member in lib_members:
+        dest = lib_target / pathlib.Path(member).name
+        with zf.open(member) as src, open(dest, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        print(dest)
+PY
     ok "Build complete. Extension at: $SO_FILE"
+    verify_repo_imports
 }
 
 do_run() {
@@ -277,7 +380,8 @@ do_run() {
     cleanup_gpu "$conf"
     auto_rebuild
     info "Launching from: $conf"
-    exec "$PYTHON" -m krasis.server --config "$conf" "$@"
+    verify_repo_imports
+    exec_repo_python -m krasis.server --config "$conf" "$@"
 }
 
 do_test() {
@@ -304,7 +408,8 @@ do_test() {
     logfile="$SCRIPT_DIR/logs/tests/krasis_test_$(basename "$conf" .conf)_$(date +%Y%m%d_%H%M%S).log"
     info "Log: $logfile"
 
-    "$PYTHON" -m krasis.server --config "$conf" --benchmark > >(tee "$logfile") 2>&1 &
+    verify_repo_imports
+    run_repo_python -m krasis.server --config "$conf" --benchmark > >(tee "$logfile") 2>&1 &
     local pid=$!
 
     # Wait for benchmark to complete AND server to be ready.
@@ -338,9 +443,9 @@ do_test() {
     # Step 2: Run network multi-prompt tests
     info "Step 2: Running network multi-prompt tests..."
     if $thorough; then
-        "$PYTHON" "$SCRIPT_DIR/tests/test_network.py" --port "$port" --large 2>&1 | tee -a "$logfile"
+        run_repo_python "$SCRIPT_DIR/tests/test_network.py" --port "$port" --large 2>&1 | tee -a "$logfile"
     else
-        "$PYTHON" "$SCRIPT_DIR/tests/test_network.py" --port "$port" 2>&1 | tee -a "$logfile"
+        run_repo_python "$SCRIPT_DIR/tests/test_network.py" --port "$port" 2>&1 | tee -a "$logfile"
     fi
 
     local net_result=$?
@@ -369,7 +474,8 @@ do_release_test() {
     shift
     cleanup_gpu
     info "Starting release test for model: $model"
-    KRASIS_DEV_SCRIPT=1 "$PYTHON" "$SCRIPT_DIR/tests/release_test.py" "$model" "$@"
+    verify_repo_imports
+    KRASIS_DEV_SCRIPT=1 run_repo_python "$SCRIPT_DIR/tests/release_test.py" "$model" "$@"
 }
 
 do_release_test_all() {
@@ -615,7 +721,8 @@ do_benchmark() {
     mkdir -p "$SCRIPT_DIR/logs/benchmarks"
     info "Running standard benchmark: $conf"
     info "Log: $logfile"
-    "$PYTHON" -m krasis.server --config "$conf" --benchmark-only "$@" 2>&1 | tee "$logfile"
+    verify_repo_imports
+    cd "$SCRIPT_DIR" && run_repo_python -m krasis.server --config "$conf" --benchmark-only "$@" 2>&1 | tee "$logfile"
     info "Benchmark log saved: $logfile"
 }
 
@@ -631,7 +738,8 @@ do_perplexity() {
     mkdir -p "$SCRIPT_DIR/logs/perplexity"
     info "Running perplexity: $conf"
     info "Log: $logfile"
-    cd "$SCRIPT_DIR" && "$PYTHON" -m perplexity.measure_ppl --config "$conf" "$@" 2>&1 | tee "$logfile"
+    verify_repo_imports
+    cd "$SCRIPT_DIR" && run_repo_python -m perplexity.measure_ppl --config "$conf" "$@" 2>&1 | tee "$logfile"
     info "Perplexity log saved: $logfile"
 }
 
@@ -643,14 +751,15 @@ do_awq_calibrate() {
     cleanup_gpu "$conf"
     auto_rebuild
     info "Running AWQ calibration: $conf"
-    cd "$SCRIPT_DIR" && "$PYTHON" -m krasis.awq_calibrate --config "$conf" "$@"
+    verify_repo_imports
+    cd "$SCRIPT_DIR" && run_repo_python -m krasis.awq_calibrate --config "$conf" "$@"
 }
 
 do_network() {
     [[ $# -lt 1 ]] && err "Usage: ./dev network <port> [--large] [--quick]"
     local port="$1"
     shift
-    exec "$PYTHON" "$SCRIPT_DIR/tests/test_network.py" --port "$port" "$@"
+    exec_repo_python "$SCRIPT_DIR/tests/test_network.py" --port "$port" "$@"
 }
 
 do_test_kernels() {
@@ -659,7 +768,7 @@ do_test_kernels() {
     local test_data_dir="$SCRIPT_DIR/tests/kernel_test_data"
     if [[ ! -d "$test_data_dir" ]] || [[ -z "$(ls -A "$test_data_dir" 2>/dev/null)" ]]; then
         info "Generating kernel test data..."
-        cd "$SCRIPT_DIR" && "$PYTHON" tests/generate_kernel_test_data.py
+        cd "$SCRIPT_DIR" && run_repo_python tests/generate_kernel_test_data.py
     fi
 
     # PyO3 extension modules need Python library for test linking.
@@ -694,7 +803,8 @@ do_validate() {
     fi
     do_build
     info "Running model validation: $conf_path"
-    exec "$PYTHON" "$SCRIPT_DIR/tests/validate_model.py" "$conf_path" "$@"
+    verify_repo_imports
+    exec_repo_python "$SCRIPT_DIR/tests/validate_model.py" "$conf_path" "$@"
 }
 
 do_reference_test() {
@@ -714,7 +824,8 @@ do_reference_test() {
         cleanup_gpu
         auto_rebuild
         info "Running comparative reference test: $model"
-        KRASIS_DEV_SCRIPT=1 "$PYTHON" "$SCRIPT_DIR/tests/reference_test.py" --compare "$model" "$@"
+        verify_repo_imports
+        KRASIS_DEV_SCRIPT=1 run_repo_python "$SCRIPT_DIR/tests/reference_test.py" --compare "$model" "$@"
     else
         local conf
         conf=$(resolve_config "$1")
@@ -722,7 +833,8 @@ do_reference_test() {
         cleanup_gpu "$conf"
         auto_rebuild
         info "Running reference test: $conf"
-        KRASIS_DEV_SCRIPT=1 "$PYTHON" "$SCRIPT_DIR/tests/reference_test.py" "$conf" "$@"
+        verify_repo_imports
+        KRASIS_DEV_SCRIPT=1 run_repo_python "$SCRIPT_DIR/tests/reference_test.py" "$conf" "$@"
     fi
 }
 
@@ -793,11 +905,15 @@ do_kill() {
 }
 
 do_shell() {
-    exec "$PYTHON" "$@"
+    exec_repo_python "$@"
 }
 
 do_python() {
-    exec "$PYTHON" "$@"
+    exec_repo_python "$@"
+}
+
+do_verify_imports() {
+    verify_repo_imports
 }
 
 # ── Extract --timing flag ────────────────────────────────────────
@@ -837,13 +953,14 @@ case "$cmd" in
     validate)       do_validate "$@" ;;
     shell)          do_shell "$@" ;;
     python)         do_python "$@" ;;
+    verify-imports) do_verify_imports ;;
     help|-h|--help)
         echo "Krasis dev helper"
         echo ""
         echo "Usage: ./dev <command> [args...]"
         echo ""
         echo "Commands:"
-        echo "  build                     Rebuild Rust extension"
+        echo "  build                     Rebuild Rust extension into this repo only"
         echo "  run <config> [flags]      Launch server (add --benchmark for benchmarks)"
         echo "  benchmark <config>        Run standard benchmark and exit"
         echo "  release-test <model>      Run full release test (5 configs, report)"
@@ -866,8 +983,9 @@ case "$cmd" in
         echo "  sanity                    Run sanity test prompts against running server"
         echo "  kill                      Kill all krasis/GPU processes, reset if needed"
         echo "  install                   Sync krasis command to ~/.local/bin (uses source)"
-        echo "  shell                     Python shell with dev env"
-        echo "  python <args>             Run Python with dev env"
+        echo "  shell                     Python shell bound to this repo"
+        echo "  python <args>             Run Python bound to this repo"
+        echo "  verify-imports            Verify imports resolve inside this repo"
         echo ""
         echo "Global flags:"
         echo "  --timing    Enable per-component decode timing (adds ~30-50% overhead)"
@@ -893,8 +1011,8 @@ case "$cmd" in
         echo "  ./dev python -m krasis.launcher"
         ;;
     kill)       do_kill ;;
-    chat)       exec "$PYTHON" -m krasis.chat "$@" ;;
-    sanity)     exec "$PYTHON" -m krasis.chat --sanitytest "$@" ;;
+    chat)       verify_repo_imports; exec_repo_python -m krasis.chat "$@" ;;
+    sanity)     verify_repo_imports; exec_repo_python -m krasis.chat --sanitytest "$@" ;;
     install)
         info "Installing krasis command to ~/.local/bin/krasis..."
         mkdir -p "$HOME/.local/bin"

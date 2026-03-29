@@ -13,6 +13,7 @@
 //! into the CUDA module at init time.
 
 use pyo3::prelude::*;
+use std::io::Write;
 use std::sync::Arc;
 
 use cudarc::cublas::{CudaBlas, sys as cublas_sys};
@@ -788,6 +789,120 @@ impl HcsState {
         let total = self.total_hits + self.total_misses;
         if total == 0 { 0.0 } else { self.total_hits as f64 / total as f64 }
     }
+
+    fn validation_counts(&self) -> (usize, usize, usize, usize) {
+        let cf_nonzero = self.cache_fast.iter()
+            .filter(|p| p[0] != 0 || p[1] != 0 || p[2] != 0 || p[3] != 0)
+            .count();
+
+        let mut soft_seen: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        let mut soft_dupes = 0usize;
+        for slot_opt in &self.soft_slot_to_expert {
+            if let Some((l, e)) = slot_opt {
+                if !soft_seen.insert((*l, *e)) {
+                    soft_dupes += 1;
+                }
+            }
+        }
+
+        (cf_nonzero, self.cache.len(), 0, soft_dupes)
+    }
+
+    fn validation_sorted_resident_experts(&self) -> Vec<(usize, usize)> {
+        let mut resident: Vec<(usize, usize)> = self.cache.keys().copied().collect();
+        resident.sort_unstable();
+        resident
+    }
+
+    fn validation_slot_entries(&self) -> Vec<(&'static str, usize, usize, usize)> {
+        let mut entries = Vec::with_capacity(self.pool_slot_to_expert.len() + self.soft_slot_to_expert.len());
+        for (slot_idx, slot_opt) in self.pool_slot_to_expert.iter().enumerate() {
+            if let Some((layer_idx, expert_idx)) = slot_opt {
+                entries.push(("hard", slot_idx, *layer_idx, *expert_idx));
+            }
+        }
+        for (slot_idx, slot_opt) in self.soft_slot_to_expert.iter().enumerate() {
+            if let Some((layer_idx, expert_idx)) = slot_opt {
+                entries.push(("soft", slot_idx, *layer_idx, *expert_idx));
+            }
+        }
+        entries
+    }
+}
+
+fn validation_fnv1a_u64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn validation_hash_pairs(pairs: &[(usize, usize)]) -> String {
+    let mut buf = Vec::with_capacity(pairs.len() * 16);
+    for &(layer, expert) in pairs {
+        buf.extend_from_slice(&(layer as u64).to_le_bytes());
+        buf.extend_from_slice(&(expert as u64).to_le_bytes());
+    }
+    format!("{:016x}", validation_fnv1a_u64(&buf))
+}
+
+fn validation_artifact_paths(prompt_len: usize) -> (String, String, String, String) {
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let base = format!("logs/state-validation/prompt{}_{}", prompt_len, ts_ms);
+    (
+        format!("{}_decode_start_hcs.txt", base),
+        format!("{}_decode_start_slots.txt", base),
+        format!("{}_decode_cold_experts.txt", base),
+        format!("{}_decode_cold_loads.txt", base),
+    )
+}
+
+fn write_validation_text_file(path: &str, body: &str) {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            log::warn!("STATE_VALIDATION failed to create {}: {}", parent.display(), e);
+            return;
+        }
+    }
+    match std::fs::File::create(path) {
+        Ok(mut file) => {
+            if let Err(e) = file.write_all(body.as_bytes()) {
+                log::warn!("STATE_VALIDATION failed to write {}: {}", path, e);
+            }
+        }
+        Err(e) => {
+            log::warn!("STATE_VALIDATION failed to create {}: {}", path, e);
+        }
+    }
+}
+
+fn validation_record_cold_hist(
+    hist: &mut std::collections::BTreeMap<(usize, usize), (u64, usize)>,
+    layer_idx: usize,
+    expert_idx: usize,
+    token_idx: usize,
+) {
+    let entry = hist.entry((layer_idx, expert_idx)).or_insert((0, token_idx));
+    entry.0 += 1;
+    if token_idx < entry.1 {
+        entry.1 = token_idx;
+    }
+}
+
+fn validation_record_cold_load(
+    hist: &mut std::collections::BTreeMap<(usize, usize), (u64, usize)>,
+    events: &mut Vec<(usize, usize, usize)>,
+    layer_idx: usize,
+    expert_idx: usize,
+    token_idx: usize,
+) {
+    validation_record_cold_hist(hist, layer_idx, expert_idx, token_idx);
+    events.push((token_idx, layer_idx, expert_idx));
 }
 
 // ── Expert data descriptor (system RAM, Marlin format) ─────────────────
@@ -1436,6 +1551,23 @@ struct GpuDecodeGraph {
     dma_call_count: u64,     // number of cuMemcpyHtoDAsync calls
     dma_cold_experts: u64,   // number of cold (DMA'd) experts
     dma_hcs_experts: u64,    // number of HCS-hit experts
+    validation_decode_steps: u64,
+    validation_per_layer_steps: u64,
+    validation_ungraphed_steps: u64,
+    validation_decode_start_num_cached: usize,
+    validation_decode_start_soft_num_cached: usize,
+    validation_decode_start_hard_num_cached: usize,
+    validation_decode_start_dupes: usize,
+    validation_decode_start_soft_dupes: usize,
+    validation_decode_start_hash: String,
+    validation_decode_start_resident: Vec<(usize, usize)>,
+    validation_decode_start_hcs_file: String,
+    validation_decode_start_slots: Vec<(&'static str, usize, usize, usize)>,
+    validation_decode_start_slots_file: String,
+    validation_decode_cold_hist: std::collections::BTreeMap<(usize, usize), (u64, usize)>,
+    validation_decode_cold_events: Vec<(usize, usize, usize)>,
+    validation_decode_cold_file: String,
+    validation_decode_cold_events_file: String,
 
     // ── Speculative decode batch buffers (allocated when draft model loaded) ──
     /// Max batch size for speculative decode (draft_k + 1).
@@ -1633,6 +1765,11 @@ pub struct GpuDecodeStore {
     spec_jaccard_threshold: f32,
     /// Min free VRAM (MB) observed during the most recent decode run.
     last_min_free_vram_mb: usize,
+    last_soft_evict_experts: usize,
+    last_soft_evict_freed_mb: f64,
+    last_soft_reload_queued: usize,
+    last_soft_reload_alloc_mb: f64,
+    last_soft_reload_activated: usize,
     /// Four-point VRAM calibration data for runtime budget decisions.
     vram_calibration: Option<VramCalibration>,
     /// Token IDs to suppress during sampling (logit set to -inf).
@@ -1905,6 +2042,11 @@ impl GpuDecodeStore {
             draft_context_window: 512,
             spec_jaccard_threshold: 0.15,
             last_min_free_vram_mb: 0,
+            last_soft_evict_experts: 0,
+            last_soft_evict_freed_mb: 0.0,
+            last_soft_reload_queued: 0,
+            last_soft_reload_alloc_mb: 0.0,
+            last_soft_reload_activated: 0,
             vram_calibration: None,
             suppress_tokens: Vec::new(),
             min_new_tokens: 0,
@@ -2257,6 +2399,23 @@ impl GpuDecodeStore {
             dma_call_count: 0,
             dma_cold_experts: 0,
             dma_hcs_experts: 0,
+            validation_decode_steps: 0,
+            validation_per_layer_steps: 0,
+            validation_ungraphed_steps: 0,
+            validation_decode_start_num_cached: 0,
+            validation_decode_start_soft_num_cached: 0,
+            validation_decode_start_hard_num_cached: 0,
+            validation_decode_start_dupes: 0,
+            validation_decode_start_soft_dupes: 0,
+            validation_decode_start_hash: String::new(),
+            validation_decode_start_resident: Vec::new(),
+            validation_decode_start_hcs_file: String::new(),
+            validation_decode_start_slots: Vec::new(),
+            validation_decode_start_slots_file: String::new(),
+            validation_decode_cold_hist: std::collections::BTreeMap::new(),
+            validation_decode_cold_events: Vec::new(),
+            validation_decode_cold_file: String::new(),
+            validation_decode_cold_events_file: String::new(),
             batch_max: 0,
             d_batch_hidden: None,
             d_batch_residual: None,
@@ -6448,12 +6607,182 @@ impl GpuDecodeStore {
         (min_free, loaded, total, pct)
     }
 
+    pub fn hcs_soft_reload_pending(&self) -> bool {
+        self.graph.as_ref()
+            .and_then(|g| g.hcs.as_ref())
+            .map(|h| h.soft_reload_pending)
+            .unwrap_or(false)
+    }
+
     /// Return HCS safety margin in MB (0 if HCS not configured).
     pub fn hcs_safety_margin_mb(&self) -> usize {
         self.graph.as_ref()
             .and_then(|g| g.hcs.as_ref())
             .map(|hcs| hcs.safety_margin_mb)
             .unwrap_or(0)
+    }
+
+    fn validation_capture_decode_start(&mut self, prompt_len: usize) {
+        let Some(graph) = self.graph.as_mut() else { return; };
+        graph.validation_decode_start_num_cached = 0;
+        graph.validation_decode_start_soft_num_cached = 0;
+        graph.validation_decode_start_hard_num_cached = 0;
+        graph.validation_decode_start_dupes = 0;
+        graph.validation_decode_start_soft_dupes = 0;
+        graph.validation_decode_start_hash.clear();
+        graph.validation_decode_start_resident.clear();
+        graph.validation_decode_start_slots.clear();
+        graph.validation_decode_cold_hist.clear();
+        graph.validation_decode_cold_events.clear();
+
+        let (hcs_file, slots_file, cold_file, cold_events_file) = validation_artifact_paths(prompt_len);
+        graph.validation_decode_start_hcs_file = hcs_file;
+        graph.validation_decode_start_slots_file = slots_file;
+        graph.validation_decode_cold_file = cold_file;
+        graph.validation_decode_cold_events_file = cold_events_file;
+
+        if let Some(hcs) = graph.hcs.as_ref() {
+            let resident = hcs.validation_sorted_resident_experts();
+            let (_, _, dupes, soft_dupes) = hcs.validation_counts();
+            graph.validation_decode_start_num_cached = hcs.num_cached;
+            graph.validation_decode_start_soft_num_cached = hcs.soft_num_cached;
+            graph.validation_decode_start_hard_num_cached = hcs.num_cached.saturating_sub(hcs.soft_num_cached);
+            graph.validation_decode_start_dupes = dupes;
+            graph.validation_decode_start_soft_dupes = soft_dupes;
+            graph.validation_decode_start_hash = validation_hash_pairs(&resident);
+            graph.validation_decode_start_resident = resident;
+            graph.validation_decode_start_slots = hcs.validation_slot_entries();
+        }
+    }
+
+    pub fn config_validation_snapshot_json(
+        &self,
+        prompt_len: usize,
+        sync_reload: bool,
+        reload_pending_at_decode_start: bool,
+    ) -> String {
+        let mut payload = serde_json::json!({
+            "prompt_len": prompt_len,
+            "sync_reload": sync_reload,
+            "soft_evict_experts": self.last_soft_evict_experts,
+            "soft_evict_freed_mb": self.last_soft_evict_freed_mb,
+            "soft_reload_queued": self.last_soft_reload_queued,
+            "soft_reload_alloc_mb": self.last_soft_reload_alloc_mb,
+            "soft_reload_activated": self.last_soft_reload_activated,
+            "reload_pending_at_decode_start": reload_pending_at_decode_start,
+        });
+
+        if let Some(graph) = self.graph.as_ref() {
+            let resident_body = {
+                let mut s = String::new();
+                for (layer_idx, expert_idx) in &graph.validation_decode_start_resident {
+                    s.push_str(&format!("{},{}\n", layer_idx, expert_idx));
+                }
+                s
+            };
+            if !graph.validation_decode_start_hcs_file.is_empty() {
+                write_validation_text_file(&graph.validation_decode_start_hcs_file, &resident_body);
+            }
+
+            let slots_body = {
+                let mut s = String::new();
+                for (tier, slot_idx, layer_idx, expert_idx) in &graph.validation_decode_start_slots {
+                    s.push_str(&format!("{},{},{},{}\n", tier, slot_idx, layer_idx, expert_idx));
+                }
+                s
+            };
+            if !graph.validation_decode_start_slots_file.is_empty() {
+                write_validation_text_file(&graph.validation_decode_start_slots_file, &slots_body);
+            }
+
+            let cold_body = {
+                let mut s = String::new();
+                for (&(layer_idx, expert_idx), &(count, first_token)) in &graph.validation_decode_cold_hist {
+                    s.push_str(&format!("{},{},{},{}\n", layer_idx, expert_idx, count, first_token));
+                }
+                s
+            };
+            if !graph.validation_decode_cold_file.is_empty() {
+                write_validation_text_file(&graph.validation_decode_cold_file, &cold_body);
+            }
+
+            let cold_events_body = {
+                let mut s = String::new();
+                for (token_idx, layer_idx, expert_idx) in &graph.validation_decode_cold_events {
+                    s.push_str(&format!("{},{},{}\n", token_idx, layer_idx, expert_idx));
+                }
+                s
+            };
+            if !graph.validation_decode_cold_events_file.is_empty() {
+                write_validation_text_file(&graph.validation_decode_cold_events_file, &cold_events_body);
+            }
+
+            payload["decode_path"] = serde_json::json!({
+                "per_layer_graphs_valid_end": graph.per_layer_graphs_valid,
+                "per_layer_steps": graph.validation_per_layer_steps,
+                "ungraphed_steps": graph.validation_ungraphed_steps,
+                "timing_enabled": graph.timing_enabled,
+                "gpu_route_sync": graph.gpu_route_sync,
+            });
+            payload["decode_experts"] = serde_json::json!({
+                "cold_total": graph.dma_cold_experts,
+                "hcs_total": graph.dma_hcs_experts,
+                "total_per_token": if graph.validation_decode_steps > 0 {
+                    (graph.dma_cold_experts + graph.dma_hcs_experts) as f64 / graph.validation_decode_steps as f64
+                } else { 0.0 },
+                "cold_per_token": if graph.validation_decode_steps > 0 {
+                    graph.dma_cold_experts as f64 / graph.validation_decode_steps as f64
+                } else { 0.0 },
+                "hcs_per_token": if graph.validation_decode_steps > 0 {
+                    graph.dma_hcs_experts as f64 / graph.validation_decode_steps as f64
+                } else { 0.0 },
+                "dma_bytes_total": graph.dma_bytes_total,
+                "dma_calls_total": graph.dma_call_count,
+                "tokens_timed": graph.validation_decode_steps,
+            });
+            payload["decode_start_hcs"] = serde_json::json!({
+                "num_cached": graph.validation_decode_start_num_cached,
+                "soft_num_cached": graph.validation_decode_start_soft_num_cached,
+                "hard_num_cached": graph.validation_decode_start_hard_num_cached,
+                "dupes": graph.validation_decode_start_dupes,
+                "soft_dupes": graph.validation_decode_start_soft_dupes,
+                "resident_hash": graph.validation_decode_start_hash,
+                "resident_count": graph.validation_decode_start_resident.len(),
+                "resident_file": graph.validation_decode_start_hcs_file,
+                "slot_count": graph.validation_decode_start_slots.len(),
+                "slots_file": graph.validation_decode_start_slots_file,
+            });
+            payload["decode_cold_experts"] = serde_json::json!({
+                "unique_cold_experts": graph.validation_decode_cold_hist.len(),
+                "cold_histogram_file": graph.validation_decode_cold_file,
+                "cold_load_count": graph.validation_decode_cold_events.len(),
+                "cold_loads_file": graph.validation_decode_cold_events_file,
+            });
+
+            if let Some(hcs) = graph.hcs.as_ref() {
+                let (cache_fast_nonzero, hashmap_count, dupes, soft_dupes) = hcs.validation_counts();
+                payload["hcs"] = serde_json::json!({
+                    "num_cached": hcs.num_cached,
+                    "soft_num_cached": hcs.soft_num_cached,
+                    "hard_num_cached": hcs.num_cached.saturating_sub(hcs.soft_num_cached),
+                    "cache_fast_nonzero": cache_fast_nonzero,
+                    "hashmap_count": hashmap_count,
+                    "dupes": dupes,
+                    "soft_dupes": soft_dupes,
+                    "soft_loaded": hcs.soft_loaded,
+                    "soft_reload_pending": hcs.soft_reload_pending,
+                    "soft_slots": hcs.soft_num_slots,
+                    "soft_slot_size_mb": hcs.soft_slot_size as f64 / (1024.0 * 1024.0),
+                    "soft_ranking_len": hcs.soft_ranking.len(),
+                    "mapped_reads_available": hcs.mapped_reads_available,
+                    "hit_rate": hcs.hit_rate(),
+                    "total_hits": hcs.total_hits,
+                    "total_misses": hcs.total_misses,
+                });
+            }
+        }
+
+        payload.to_string()
     }
 
     /// Allocate batch buffers for speculative decode batched verification.
@@ -8660,6 +8989,14 @@ impl GpuDecodeStore {
                         for ci in 0..cold_count {
                             let eid = unsafe { std::ptr::read_volatile(cold_ptr.add(2 + ci)) } as usize;
                             let batch_slot = unsafe { std::ptr::read_volatile(cold_ptr.add(2 + topk + ci)) } as usize;
+                            let token_idx = graph.validation_decode_steps as usize + 1;
+                            validation_record_cold_load(
+                                &mut graph.validation_decode_cold_hist,
+                                &mut graph.validation_decode_cold_events,
+                                moe_layer_idx,
+                                eid,
+                                token_idx,
+                            );
                             let expert = &moe_data.experts[eid];
 
                             let (w13p, w13s, w2p, w2s) = if ci < 2 {
@@ -8793,6 +9130,14 @@ impl GpuDecodeStore {
                                 graph.dma_hcs_experts += 1;
                             }
                         } else {
+                            let token_idx = graph.validation_decode_steps as usize + 1;
+                            validation_record_cold_load(
+                                &mut graph.validation_decode_cold_hist,
+                                &mut graph.validation_decode_cold_events,
+                                moe_layer_idx,
+                                eid,
+                                token_idx,
+                            );
                             cold_experts.push((i, eid, weight));
                         }
                     }
@@ -12650,6 +12995,11 @@ impl GpuDecodeStore {
     /// based on the estimated prompt length.
     /// Returns (evicted_count, freed_mb).
     pub fn hcs_evict_for_prefill(&mut self, estimated_tokens: usize) -> (usize, f64) {
+        self.last_soft_evict_experts = 0;
+        self.last_soft_evict_freed_mb = 0.0;
+        self.last_soft_reload_queued = 0;
+        self.last_soft_reload_alloc_mb = 0.0;
+        self.last_soft_reload_activated = 0;
         let graph = match self.graph.as_mut() {
             Some(g) => g,
             None => return (0, 0.0),
@@ -12805,6 +13155,8 @@ impl GpuDecodeStore {
         // Eviction changes where experts live, but not the graph structure.
 
         let freed_mb = freed_bytes as f64 / (1024.0 * 1024.0);
+        self.last_soft_evict_experts = evicted;
+        self.last_soft_evict_freed_mb = freed_mb;
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         eprintln!("  \x1b[33mHCS soft: evicted {} experts ({:.1} MB, {} of {} chunks dropped) in {:.1}ms for prefill (~{} tokens)\x1b[0m",
             evicted, freed_mb, chunks_to_drop, total_chunks, elapsed_ms, estimated_tokens);
@@ -12938,6 +13290,9 @@ impl GpuDecodeStore {
         hcs.vram_bytes += alloc_bytes;
 
         let alloc_mb = alloc_bytes as f64 / (1024.0 * 1024.0);
+        self.last_soft_reload_queued = loaded;
+        self.last_soft_reload_alloc_mb = alloc_mb;
+        self.last_soft_reload_activated = loaded;
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let chunks_reloaded = hcs.soft_chunks_loaded - already_loaded;
         eprintln!("  \x1b[32mHCS soft: reloaded {} experts ({:.1} MB, {}/{} chunks, batch DMA) in {:.1}ms\x1b[0m",
@@ -13121,6 +13476,9 @@ impl GpuDecodeStore {
 
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let alloc_mb = alloc_bytes as f64 / (1024.0 * 1024.0);
+        self.last_soft_reload_queued = queued;
+        self.last_soft_reload_alloc_mb = alloc_mb;
+        self.last_soft_reload_activated = 0;
         let chunks_queued = hcs.soft_chunks.len() - already_loaded;
         eprintln!("  \x1b[36mHCS soft: async reload queued {} experts ({:.1} MB, {}/{} chunks, batch DMA) in {:.1}ms\x1b[0m",
             queued, alloc_mb, chunks_queued, target_chunks, elapsed_ms);
@@ -13170,6 +13528,7 @@ impl GpuDecodeStore {
         hcs.soft_loaded = true;
         hcs.soft_reload_pending = false;
         hcs.num_cached += activated;
+        self.last_soft_reload_activated = activated;
 
         eprintln!("  \x1b[32mHCS soft: async reload complete — {} experts activated ({}/{} chunks)\x1b[0m",
             activated, hcs.soft_chunks_loaded, hcs.soft_total_chunks);
@@ -13225,6 +13584,7 @@ impl GpuDecodeStore {
         hcs.soft_loaded = true;
         hcs.soft_reload_pending = false;
         hcs.num_cached += activated;
+        self.last_soft_reload_activated = activated;
 
         eprintln!("  \x1b[32mHCS soft: sync reload complete — {} experts ({}/{} chunks) in {:.1}ms real DMA\x1b[0m",
             activated, hcs.soft_chunks_loaded, hcs.soft_total_chunks, real_dma_ms);
@@ -13346,6 +13706,27 @@ impl GpuDecodeStore {
         // Reset per-prompt timing accumulators
         {
             let g = self.graph.as_mut().unwrap();
+            g.validation_decode_steps = 0;
+            g.validation_per_layer_steps = 0;
+            g.validation_ungraphed_steps = 0;
+            g.dma_bytes_total = 0;
+            g.dma_call_count = 0;
+            g.dma_cold_experts = 0;
+            g.dma_hcs_experts = 0;
+            g.validation_decode_start_num_cached = 0;
+            g.validation_decode_start_soft_num_cached = 0;
+            g.validation_decode_start_hard_num_cached = 0;
+            g.validation_decode_start_dupes = 0;
+            g.validation_decode_start_soft_dupes = 0;
+            g.validation_decode_start_hash.clear();
+            g.validation_decode_start_resident.clear();
+            g.validation_decode_start_hcs_file.clear();
+            g.validation_decode_start_slots.clear();
+            g.validation_decode_start_slots_file.clear();
+            g.validation_decode_cold_hist.clear();
+            g.validation_decode_cold_events.clear();
+            g.validation_decode_cold_file.clear();
+            g.validation_decode_cold_events_file.clear();
             if g.timing_enabled {
                 g.timing_step_count = 0;
                 g.t_total = 0.0; g.t_norm = 0.0; g.t_attn = 0.0;
@@ -13362,9 +13743,13 @@ impl GpuDecodeStore {
                 g.t_gqa_proj = 0.0; g.t_gqa_attn = 0.0; g.t_gqa_out = 0.0;
                 g.t_expert_w13 = 0.0; g.t_expert_silu_w2 = 0.0;
                 g.t_dma_expert_wait = 0.0; g.t_dma_expert_compute = 0.0;
-                g.dma_bytes_total = 0; g.dma_call_count = 0;
-                g.dma_cold_experts = 0; g.dma_hcs_experts = 0;
             }
+        }
+
+        if std::env::var("KRASIS_STATE_VALIDATION").map(|v| v != "0").unwrap_or(false)
+            || std::env::var("KRASIS_CONFIG_VALIDATION").map(|v| v != "0").unwrap_or(false)
+        {
+            self.validation_capture_decode_start(start_position);
         }
 
         let decode_start = Instant::now();
@@ -13795,6 +14180,9 @@ impl GpuDecodeStore {
                     .map(|g| g.per_layer_graphs_valid).unwrap_or(false);
 
                 if use_per_layer {
+                    if let Some(ref mut g) = self.graph {
+                        g.validation_per_layer_steps += 1;
+                    }
                     // Per-layer graph replay: handles sync/routing/DMA between graphs internally
                     let t_step = if timing_enabled { std::time::Instant::now() } else { std::time::Instant::now() };
                     if let Err(e) = self.replay_per_layer_graphs(next_token, pos, true) {
@@ -13815,6 +14203,9 @@ impl GpuDecodeStore {
                     }
                     // logits already D2H'd inside replay_per_layer_graphs
                 } else {
+                    if let Some(ref mut g) = self.graph {
+                        g.validation_ungraphed_steps += 1;
+                    }
                     // First token (or after invalidation): run ungraphed, then capture per-layer graphs
                     if let Err(e) = self.gpu_decode_step(next_token, pos) {
                         log::error!("gpu_generate_stream: decode_step error: {}", e);
@@ -13906,6 +14297,9 @@ impl GpuDecodeStore {
                 seen_tokens.insert(target_pred);
                 generated += 1;
                 step += 1;
+                if let Some(ref mut g) = self.graph {
+                    g.validation_decode_steps += 1;
+                }
                 next_token = target_pred;
 
                 // Lightweight profiling checkpoint
@@ -15829,6 +16223,14 @@ impl GpuDecodeStore {
                 } else {
                     // Cold expert: needs DMA from CPU RAM
                     if dma_count < 10 {
+                        let token_idx = graph.validation_decode_steps as usize + 1;
+                        validation_record_cold_load(
+                            &mut graph.validation_decode_cold_hist,
+                            &mut graph.validation_decode_cold_events,
+                            layer_idx,
+                            eid,
+                            token_idx,
+                        );
                         dma_experts[dma_count] = (i, weight);
                         dma_count += 1;
                     }
