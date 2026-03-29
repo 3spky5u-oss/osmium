@@ -1642,7 +1642,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--benchmark-suite", nargs="?", const="", default=None,
                         help="Run benchmark suite (optional: path to TOML config)")
     parser.add_argument("--vram-report", action="store_true",
-                        help="Generate VRAM report CSV to logs/vram_report.csv")
+                        help="Generate VRAM report CSV in the current run directory")
     parser.add_argument("--skip-setup", action="store_true",
                         help="(ignored — handled by bash wrapper)")
     parser.add_argument("--venv", default=None,

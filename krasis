@@ -13,18 +13,31 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_PYTHONPATH="$SCRIPT_DIR/python"
+REPO_LIBPATH="$SCRIPT_DIR/python/krasis.libs"
+
+exec_repo_launcher() {
+    local python_bin="$1"
+    shift
+    local ld_path="${LD_LIBRARY_PATH:-}"
+    if [[ -d "$REPO_LIBPATH" ]]; then
+        ld_path="$REPO_LIBPATH${ld_path:+:$ld_path}"
+    fi
+    exec env PYTHONNOUSERSITE=1 PYTHONPATH="$REPO_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}" \
+        LD_LIBRARY_PATH="$ld_path" "$python_bin" -m krasis.launcher "$@"
+}
 
 # Use conda env if available (dev machines), else system python
 CONDA_PY="$HOME/miniconda3/envs/ktransformers/bin/python"
 if [[ -x "$CONDA_PY" ]]; then
-    exec "$CONDA_PY" -m krasis.launcher "$@"
+    exec_repo_launcher "$CONDA_PY" "$@"
 fi
 
 # Installed venv (end-user path)
 VENV_PY="$HOME/.krasis/venv/bin/python"
 if [[ -x "$VENV_PY" ]]; then
-    exec "$VENV_PY" -m krasis.launcher "$@"
+    exec_repo_launcher "$VENV_PY" "$@"
 fi
 
 # Fallback to system python
-exec python3 -m krasis.launcher "$@"
+exec_repo_launcher python3 "$@"

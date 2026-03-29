@@ -561,7 +561,7 @@ def main():
     )
     parser.add_argument(
         "--output-dir", default="",
-        help="Directory for logs and summary (default: logs/benchmarks/)",
+        help="Directory for logs and summary (default: a new per-run folder under logs/)",
     )
     parser.add_argument(
         "--reparse", action="store_true",

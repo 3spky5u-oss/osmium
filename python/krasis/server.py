@@ -671,7 +671,7 @@ def main():
     parser.add_argument("--timing", action="store_true",
                         help="Enable decode timing instrumentation (per-layer breakdown)")
     parser.add_argument("--vram-report", action="store_true",
-                        help="Generate VRAM report CSV (periodic readings + events) to logs/vram_report.csv")
+                        help="Generate VRAM report CSV (periodic readings + events) in the current run directory")
     parser.add_argument("--stress-test", action="store_true",
                         help="Run stress test (diverse prompts) and exit")
     parser.add_argument("--perplexity", action="store_true",
