@@ -6,8 +6,6 @@ Usage:
     python tests/test_gpu_decode_sanitizer.py
     compute-sanitizer --tool memcheck python tests/test_gpu_decode_sanitizer.py
 """
-
-import json
 import os
 import sys
 import time
@@ -55,30 +53,30 @@ def main():
 
     # Prefill
     print("\n=== Prefill ===")
-    messages = [{"role": "user", "content": "What is the capital of France? Answer in one sentence."}]
-    result = model.server_prefill(
-        json.dumps(messages),
-        max_new_tokens=30,
-        temperature=0.0,
-        top_k=1,
-        top_p=1.0,
-        presence_penalty=0.0,
-        enable_thinking=False,
-        extra_stop_tokens=[],
+    prompt_tokens = model.tokenizer.apply_chat_template(
+        [{"role": "user", "content": "What is the capital of France? Answer in one sentence."}],
+        add_generation_prompt=True,
     )
+    first_token, prompt_len, kv_overflow = store.rust_prefill_tokens(
+        prompt_tokens,
+        temperature=0.0,
+    )
+    if kv_overflow:
+        raise RuntimeError(f"Prompt length {prompt_len} exceeded Rust KV capacity")
+    stop_ids = [model.cfg.eos_token_id] + list(model.cfg.extra_stop_token_ids)
 
-    print(f"Prefill: prompt_len={result.prompt_len}, first_token={result.first_token}")
+    print(f"Prefill: prompt_len={prompt_len}, first_token={first_token}")
 
     # Decode
     print("\n=== GPU Decode (15 tokens) ===")
     tokens = store.gpu_generate_batch(
-        first_token=result.first_token,
-        start_position=result.prompt_len,
+        first_token=first_token,
+        start_position=prompt_len,
         max_tokens=15,
         temperature=0.0,
         top_k=1,
         top_p=1.0,
-        stop_ids=list(result.stop_ids),
+        stop_ids=stop_ids,
         presence_penalty=0.0,
     )
     print(f"Token IDs: {tokens}")
@@ -86,7 +84,7 @@ def main():
     # Decode to text
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    all_tokens = [result.first_token] + tokens
+    all_tokens = [first_token] + tokens
     text = tokenizer.decode(all_tokens, skip_special_tokens=True)
     print(f"Text: {repr(text)}")
 

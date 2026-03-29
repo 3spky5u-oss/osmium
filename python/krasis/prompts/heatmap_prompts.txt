@@ -1,6 +1,6 @@
 # Heatmap calibration prompts
 # Each prompt is separated by a blank line.  These are used to build the expert
-# activation heatmap at startup.  The model generates ~512 decode tokens per
+# activation heatmap at startup.  The model generates ~256 decode tokens per
 # prompt so that the heatmap is weighted toward decode routing, which is where
 # HCS cache effectiveness matters most.
 #

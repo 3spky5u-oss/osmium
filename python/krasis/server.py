@@ -1,4 +1,4 @@
-"""Krasis LLM server — Rust HTTP server with Python GPU prefill.
+"""Krasis LLM server — Rust HTTP server with Rust prefill/decode.
 
 Usage:
     python -m krasis.server --model-path /path/to/model
@@ -298,6 +298,17 @@ def _load_heatmap_prompts() -> list[str]:
 HEATMAP_DECODE_TOKENS = 256
 
 
+def _chat_prompt_tokens(model: KrasisModel, prompt_text: str) -> list[int]:
+    return model.tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt_text}],
+        add_generation_prompt=True,
+    )
+
+
+def _default_stop_ids(model: KrasisModel) -> list[int]:
+    return [model.cfg.eos_token_id] + list(model.cfg.extra_stop_token_ids)
+
+
 def _build_heatmap(model: KrasisModel, save_path: str) -> str:
     """Build expert activation heatmap by running decode-heavy inference.
 
@@ -329,16 +340,26 @@ def _build_heatmap(model: KrasisModel, save_path: str) -> str:
     total_decode_tokens = 0
     logger.info("Building heatmap from %d prompts (%d decode tokens each)...",
                 len(prompts), HEATMAP_DECODE_TOKENS)
+    stop_ids = _default_stop_ids(model)
     for i, prompt_text in enumerate(prompts):
-        tokens = model.tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt_text}]
-        )
+        tokens = _chat_prompt_tokens(model, prompt_text)
         logger.info("  Heatmap prompt %d/%d: %d prefill tokens + %d decode tokens",
                     i + 1, len(prompts), len(tokens), HEATMAP_DECODE_TOKENS)
-        generated = model.generate(
-            tokens, max_new_tokens=HEATMAP_DECODE_TOKENS, temperature=0.6
-        )
-        total_decode_tokens += len(generated)
+        first_token, prompt_len, kv_overflow = gpu_store.rust_prefill_tokens(tokens, temperature=0.6)
+        if not kv_overflow and first_token not in stop_ids:
+            generated = gpu_store.gpu_generate_batch(
+                first_token=first_token,
+                start_position=prompt_len,
+                max_tokens=HEATMAP_DECODE_TOKENS,
+                temperature=0.6,
+                top_k=50,
+                top_p=0.95,
+                stop_ids=stop_ids,
+                presence_penalty=0.0,
+            )
+            total_decode_tokens += 1 + len(generated)
+        else:
+            total_decode_tokens += 1
 
     logger.info("Heatmap collection complete: %d decode tokens across %d prompts",
                 total_decode_tokens, len(prompts))
@@ -354,193 +375,6 @@ def _build_heatmap(model: KrasisModel, save_path: str) -> str:
     gpu_store.hcs_reset()
 
     return save_path
-
-
-def _vram_snap(label: str):
-    """Quick VRAM snapshot for server diagnostics."""
-    import torch
-    for i in range(torch.cuda.device_count()):
-        dev = torch.device(f"cuda:{i}")
-        alloc = torch.cuda.memory_allocated(dev) >> 20
-        reserved = torch.cuda.memory_reserved(dev) >> 20
-        free, total = torch.cuda.mem_get_info(dev)
-        free_mb, total_mb = free >> 20, total >> 20
-        used_mb = total_mb - free_mb
-        print(
-            f"  \033[33m[VRAM {label}]\033[0m cuda:{i}: "
-            f"alloc={alloc} MB, reserved={reserved} MB, "
-            f"used={used_mb} MB, free={free_mb} MB",
-            flush=True,
-        )
-        logger.info(
-            "VRAM_SNAP [%s] cuda:%d: alloc=%d MB, reserved=%d MB, used=%d MB, free=%d MB, total=%d MB",
-            label, i, alloc, reserved, used_mb, free_mb, total_mb,
-        )
-
-
-
-
-
-
-def _warmup_prefill(model: KrasisModel):
-    """Run a 50K-token prefill to warm up GPU kernels, CUDA caches, and lazy allocations.
-
-    Uses a large prompt to trigger peak VRAM usage (all layer group buffers,
-    Rust prefill scratch, KV cache pages). This is called BEFORE HCS allocation
-    so the VRAM monitor captures realistic peak usage.
-    """
-    import json as _json
-
-    _vram_snap("before-prefill-warmup")
-    logger.info("Warming up prefill (50K tokens, GPU kernels + CUDA caches)...")
-    t0 = time.time()
-
-    try:
-        # Build a ~50K token prompt by repeating text
-        base_text = (
-            "Explain the architecture of modern mixture-of-experts models "
-            "including their routing mechanisms, load balancing strategies, "
-            "and computational efficiency trade-offs in detail. "
-        )
-        # Keep very short to avoid layer-grouped DMA path (broken on this system)
-        warmup_text = base_text  # ~30 tokens
-        messages_json = _json.dumps([{"role": "user", "content": warmup_text}])
-
-        # Use GPU decode mode for prefill so it doesn't try to set up CPU decoder
-        result = model.server_prefill(
-            messages_json, max_new_tokens=5, temperature=0.6, top_k=50,
-            top_p=0.95, presence_penalty=0.0,
-            enable_thinking=False, extra_stop_tokens=[],
-            decode_mode="gpu",
-        )
-        _vram_snap("after-prefill-warmup-before-cleanup")
-        logger.info("Prefill warmup: %d tokens processed", result.prompt_len)
-        model.server_cleanup()
-        _vram_snap("after-prefill-warmup-after-cleanup")
-
-        elapsed = time.time() - t0
-        logger.info("Prefill warmup complete (%.1fs, %d tokens)", elapsed, result.prompt_len)
-    except Exception as e:
-        try:
-            model.server_cleanup()
-        except Exception:
-            pass
-        raise RuntimeError(
-            f"Prefill warmup failed: {e}\n"
-            "This means prefill is broken and the server cannot serve requests. "
-            "Fix the underlying issue before starting."
-        ) from e
-
-
-def _capture_prefill(model: KrasisModel, num_repeats: int):
-    """Run a prefill and return (prompt_len, prefill_result), WITHOUT cleanup.
-    Leaves the model in prefilled state so decode can follow.
-    Returns (None, None) on failure.
-    """
-    import json as _json
-    base_text = (
-        "Explain the architecture of modern mixture-of-experts models "
-        "including their routing mechanisms, load balancing strategies, "
-        "and computational efficiency trade-offs in detail. "
-    )
-    warmup_text = base_text * num_repeats
-    messages_json = _json.dumps([{"role": "user", "content": warmup_text}])
-    try:
-        result = model.server_prefill(
-            messages_json, max_new_tokens=10, temperature=0.6, top_k=50,
-            top_p=0.95, presence_penalty=0.0,
-            enable_thinking=False, extra_stop_tokens=[],
-            decode_mode="gpu",
-        )
-        return result.prompt_len, result
-    except Exception as e:
-        logger.warning("Capture prefill failed: %s", e)
-        try:
-            model.server_cleanup()
-        except Exception:
-            pass
-        return None, None
-
-
-def _capture_decode_only(model: KrasisModel, prefill_result, num_steps: int = 4):
-    """Run decode steps using an existing prefill result, then cleanup.
-    The prefill must already have been done (model is in prefilled state).
-    """
-    try:
-        gpu_store = getattr(model, '_gpu_decode_store', None)
-        if gpu_store is None:
-            raise RuntimeError("GPU decode store not configured")
-        if prefill_result.first_token not in prefill_result.stop_ids:
-            gpu_store.gpu_generate_batch(
-                first_token=prefill_result.first_token,
-                start_position=prefill_result.prompt_len,
-                max_tokens=num_steps,
-                temperature=0.6,
-                top_k=50,
-                top_p=0.95,
-                stop_ids=prefill_result.stop_ids,
-                presence_penalty=0.0,
-            )
-        model.server_cleanup()
-    except Exception as e:
-        logger.warning("Capture decode failed: %s", e)
-        try:
-            model.server_cleanup()
-        except Exception:
-            pass
-
-
-def _warmup_decode(model: KrasisModel, num_steps: int = 4):
-    """Run a short GPU decode warmup.
-
-    Validates that GPU decode (with or without HCS) works correctly.
-    Uses Rust GpuDecodeStore — zero Python in the decode loop.
-    """
-    import json as _json
-
-    logger.info("Warming up GPU decode (%d steps)...", num_steps)
-    _vram_snap("before-decode-warmup")
-    t0 = time.time()
-
-    try:
-        messages_json = _json.dumps([{"role": "user", "content": "Hi"}])
-        result = model.server_prefill(
-            messages_json, max_new_tokens=num_steps + 1, temperature=0.6, top_k=50,
-            top_p=0.95, presence_penalty=0.0,
-            enable_thinking=False, extra_stop_tokens=[],
-            decode_mode="gpu",
-        )
-        _vram_snap("decode-warmup-after-prefill")
-        if result.first_token not in result.stop_ids:
-            gpu_store = getattr(model, '_gpu_decode_store', None)
-            if gpu_store is None:
-                raise RuntimeError("GPU decode store not configured for warmup")
-            gpu_store.gpu_generate_batch(
-                first_token=result.first_token,
-                start_position=result.prompt_len,
-                max_tokens=num_steps,
-                temperature=0.6,
-                top_k=50,
-                top_p=0.95,
-                stop_ids=result.stop_ids,
-                presence_penalty=0.0,
-            )
-            _vram_snap("decode-warmup-after-gpu-decode")
-        model.server_cleanup()
-        _vram_snap("decode-warmup-after-cleanup")
-
-        elapsed = time.time() - t0
-        logger.info("Decode warmup complete (%.1fs)", elapsed)
-    except Exception as e:
-        try:
-            model.server_cleanup()
-        except Exception:
-            pass
-        raise RuntimeError(
-            f"Decode warmup failed: {e}\n"
-            "This means decode is broken and the server cannot generate tokens. "
-            "Fix the underlying issue before starting."
-        ) from e
 
 
 _registry_file: Optional[Path] = None
@@ -1311,19 +1145,8 @@ def main():
             if not _validate_heatmap(heatmap_path, cfg):
                 _warn("User-provided heatmap doesn't match model config — using it anyway")
         else:
-            # Use cached heatmap if valid; rebuild only if missing or stale.
-            # TODO: always-rebuild-on-startup once model.generate() works this
-            #       early in startup (currently CUDA state not ready for Python
-            #       forward path before full warmup/graph capture).
-            need_rebuild = not os.path.exists(heatmap_path)
-            if not need_rebuild and not _validate_heatmap(heatmap_path, cfg):
-                _warn("Cached heatmap doesn't match model config, rebuilding")
-                need_rebuild = True
-            if need_rebuild:
-                _status("Building expert heatmap (decode-weighted calibration)")
-                heatmap_path = _build_heatmap(_model, heatmap_path)
-            else:
-                _dim(f"Using cached heatmap: {os.path.basename(heatmap_path)}")
+            _status("Building expert heatmap (decode-weighted calibration)")
+            heatmap_path = _build_heatmap(_model, heatmap_path)
 
         # ── Load heatmap and build sorted ranking ──
         with open(heatmap_path) as f:
@@ -1595,18 +1418,15 @@ def main():
         _status("Validating multi-GPU decode")
         vram_monitor.reset_min_free()
         try:
-            import json as _json
             gpu_store = _model._gpu_decode_store
             evicted0, freed0 = gpu_store.py_hcs_evict_for_prefill(500)
             if evicted0 > 0:
                 _dim(f"  Evicted {evicted0} soft experts for validation prefill")
 
-            messages_json = _json.dumps([{"role": "user", "content": "Hi"}])
-            result = _model.server_prefill(
-                messages_json, max_new_tokens=5, temperature=0.6, top_k=50,
-                top_p=0.95, presence_penalty=0.0,
-                enable_thinking=False, extra_stop_tokens=[],
-                decode_mode="gpu",
+            prompt_tokens = _chat_prompt_tokens(_model, "Hi")
+            stop_ids = _default_stop_ids(_model)
+            first_token, prompt_len, _kv_overflow = gpu_store.rust_prefill_tokens(
+                prompt_tokens, temperature=0.6
             )
 
             # Copy KV cache to each aux store
@@ -1615,7 +1435,7 @@ def main():
                 seg_end = boundaries[i + 2]
                 gpu_store.py_copy_kv_to_aux(
                     all_aux_gpu_store_addrs[i], seg_start, seg_end,
-                    _multi_gpu_gqa_offsets[i], result.prompt_len)
+                    _multi_gpu_gqa_offsets[i], prompt_len)
 
             # Reload soft HCS on GPU0 only (aux GPUs have no soft tier)
             r0, _ = gpu_store.py_hcs_reload_after_prefill()
@@ -1623,25 +1443,23 @@ def main():
                 _dim(f"  Reloaded {r0} soft experts after validation prefill")
 
             # Run multi-GPU decode
-            if result.first_token not in result.stop_ids:
+            if first_token not in stop_ids:
                 tokens = gpu_store.gpu_generate_batch_multi(
                     aux_store_addrs=all_aux_gpu_store_addrs,
                     split_layers=all_multi_gpu_split_layers,
                     gqa_cache_offsets=all_multi_gpu_gqa_offsets,
-                    first_token=result.first_token,
-                    start_position=result.prompt_len,
+                    first_token=first_token,
+                    start_position=prompt_len,
                     max_tokens=4,
                     temperature=0.6,
                     top_k=50,
                     top_p=0.95,
-                    stop_ids=result.stop_ids,
+                    stop_ids=stop_ids,
                     presence_penalty=0.0,
                 )
                 _detail(f"Multi-GPU decode validation: {len(tokens)} tokens generated OK")
             else:
                 _detail("Multi-GPU decode validation: prefill hit stop token (OK)")
-
-            _model.server_cleanup()
 
             # Log VRAM stats from all GPUs during multi-GPU decode
             torch.cuda.synchronize()
@@ -1668,10 +1486,6 @@ def main():
                          f"current_free={aux_current:.0f} MB (budget safe)")
 
         except Exception as e:
-            try:
-                _model.server_cleanup()
-            except Exception:
-                pass
             raise RuntimeError(
                 f"Multi-GPU decode validation failed: {e}\n"
                 "Cannot start server with broken multi-GPU decode. "

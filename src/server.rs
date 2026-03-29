@@ -1,8 +1,8 @@
 //! Rust HTTP server for Krasis — replaces Python FastAPI/uvicorn.
 //!
 //! Handles tokenization, HTTP parsing, and SSE streaming entirely in Rust.
-//! Python is called only for GPU prefill (unavoidable — PyTorch/CUDA).
-//! The decode loop runs GIL-free with zero Python involvement.
+//! Prefill and decode run in Rust on the production request path.
+//! Python remains for startup/orchestration and model ownership.
 //!
 //! Single-request at a time (matches our hardware constraint).
 
@@ -2056,7 +2056,7 @@ impl RustServer {
 
         // Estimate tokens by applying actual chat template and tokenizing
         let estimated_tokens = {
-            let rendered = chat_template.apply(&messages_json, true)
+            let rendered = chat_template.apply(&messages_json, enable_thinking)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("Chat template failed: {}", e)))?;
             tokenizer.encode(rendered.as_str(), false)
@@ -2092,7 +2092,7 @@ impl RustServer {
 
         // Tokenize using Rust tokenizer
         let token_ids: Vec<u32> = {
-            let rendered = chat_template.apply(&messages_json, true)
+            let rendered = chat_template.apply(&messages_json, enable_thinking)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("Chat template failed: {}", e)))?;
             let encoding = tokenizer.encode(rendered.as_str(), true)
@@ -2178,6 +2178,20 @@ impl RustServer {
         // NOTE: aux GPUs have no soft tier (100% hard), no eviction/reload needed
         let reload_ms = t_reload.elapsed().as_secs_f64() * 1000.0;
         crate::vram_monitor::report_event("hcs_soft_load_end");
+
+        // Match the live request path's per-request decode suppression setup.
+        if enable_thinking {
+            if self.thinking_end_token_id > 0 {
+                store.set_think_end_suppress(Some(self.thinking_end_token_id), 4096);
+                store.set_min_new_tokens_ext(0, stop_ids.clone());
+            } else {
+                store.set_think_end_suppress(None, 0);
+                store.set_min_new_tokens_ext(0, vec![]);
+            }
+        } else {
+            store.set_think_end_suppress(None, 0);
+            store.set_min_new_tokens_ext(0, vec![]);
+        }
 
         // Copy KV cache to aux stores (multi-GPU) — after async reload starts
         if !self.aux_gpu_store_addrs.is_empty() {

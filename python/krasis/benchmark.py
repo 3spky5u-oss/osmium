@@ -44,6 +44,7 @@ class KrasisBenchmark:
     PREFILL_LENGTHS = [1000, 5000, 10000, 20000, 35000, 50000]
     DECODE_LENGTHS = [50, 100, 250]
     WARMUP_MAX_CHARS = 125000  # ~25K tokens
+    BENCHMARK_TEMPERATURE = 0.0
 
     def __init__(self, model, rust_server=None, host: str = "127.0.0.1",
                  port: int = 8012, timing: bool = False):
@@ -347,7 +348,7 @@ class KrasisBenchmark:
     # ──────────────────────────────────────────────────────────
 
     def _engine_request(self, content_text: str, max_new_tokens: int,
-                        temperature: float = 0.6) -> Dict:
+                        temperature: float = BENCHMARK_TEMPERATURE) -> Dict:
         """Single request through the Rust engine (no HTTP/SSE).
 
         Calls RustServer.benchmark_request() which runs the full
@@ -373,7 +374,7 @@ class KrasisBenchmark:
         req_body = {
             "messages": [{"role": "user", "content": content_text}],
             "max_tokens": max_tokens,
-            "temperature": 0.6,
+            "temperature": self.BENCHMARK_TEMPERATURE,
             "stream": True,
             "enable_thinking": False,
         }

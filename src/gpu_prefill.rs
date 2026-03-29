@@ -19,6 +19,12 @@ use std::time::Instant;
 use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, DevicePtr};
 use cudarc::driver::sys as cuda_sys;
 
+fn stderr_debug_enabled() -> bool {
+    std::env::var("KRASIS_DEBUG_STDERR")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 // ════════════════════════════════════════════════════════════════════════
 //  GpuBuf: raw synchronous GPU allocation (bypasses cudarc pool)
 // ════════════════════════════════════════════════════════════════════════
@@ -983,8 +989,10 @@ impl PrefillEngine {
                 let mut free_after: usize = 0;
                 let mut total_after: usize = 0;
                 cuda_sys::lib().cuMemGetInfo_v2(&mut free_after, &mut total_after);
-                eprintln!("[SCRATCH] Pool trim: {:?}, freed {} MB",
-                    trim_err, (free_after - free_before) / (1024 * 1024));
+                if stderr_debug_enabled() {
+                    eprintln!("[SCRATCH] Pool trim: {:?}, freed {} MB",
+                        trim_err, (free_after - free_before) / (1024 * 1024));
+                }
             }
         }
 
@@ -1023,7 +1031,9 @@ impl PrefillEngine {
             let total_cold = n_routed * self.cold_expert_bytes;
             let buf = self.device.alloc_zeros::<u8>(total_cold)
                 .map_err(|e| format!("alloc cold_staging: {e}"))?;
-            eprintln!("[PREFILL] Cold staging: {} MB ({} experts)", total_cold / (1024 * 1024), n_routed);
+            if stderr_debug_enabled() {
+                eprintln!("[PREFILL] Cold staging: {} MB ({} experts)", total_cold / (1024 * 1024), n_routed);
+            }
             self.d_cold_staging = Some(buf);
             self.max_cold_experts = n_routed;
         }
@@ -1044,9 +1054,11 @@ impl PrefillEngine {
 
         let scratch_mb = (fixed_bytes + per_token_bytes * scratch_tokens) as f64 / (1024.0 * 1024.0);
         if scratch_tokens != old_tokens {
-            eprintln!("[PREFILL] Dynamic scratch: {} tokens ({:.0} MB) for {}-token prompt ({} MB safety, {:.0} MB free)",
-                scratch_tokens, scratch_mb, prompt_tokens, PREFILL_SAFETY_MARGIN_MB,
-                free_bytes as f64 / (1024.0 * 1024.0));
+            if stderr_debug_enabled() {
+                eprintln!("[PREFILL] Dynamic scratch: {} tokens ({:.0} MB) for {}-token prompt ({} MB safety, {:.0} MB free)",
+                    scratch_tokens, scratch_mb, prompt_tokens, PREFILL_SAFETY_MARGIN_MB,
+                    free_bytes as f64 / (1024.0 * 1024.0));
+            }
         }
 
         Ok(())
@@ -1126,8 +1138,10 @@ impl PrefillEngine {
             (cs, n)
         };
         if num_chunks > 1 {
-            eprintln!("[PREFILL] Dynamic chunking: {} tokens -> {} chunks of {} (max_chunk={})",
-                total_m, num_chunks, chunk_size, max_chunk);
+            if stderr_debug_enabled() {
+                eprintln!("[PREFILL] Dynamic chunking: {} tokens -> {} chunks of {} (max_chunk={})",
+                    total_m, num_chunks, chunk_size, max_chunk);
+            }
         }
 
         // Zero LA recurrent + conv state for fresh prefill (each prefill processes full prompt)
@@ -1195,7 +1209,9 @@ impl PrefillEngine {
                     // all expert DMA (HCS zero-copy + cold H2D staging).
                 }
                 Err(e) => {
-                    eprintln!("[PREFILL] Gate pre-scan failed (non-fatal): {}", e);
+                    if stderr_debug_enabled() {
+                        eprintln!("[PREFILL] Gate pre-scan failed (non-fatal): {}", e);
+                    }
                 }
             }
         }
@@ -1235,14 +1251,18 @@ impl PrefillEngine {
                                         moe_data, i, mi,
                                         w1_base, w1s_base, w2_base, w2s_base,
                                         &active)?;
-                                    eprintln!("[PREFILL] First MoE layer {} selective DMA: {} hcs + {} pinned + {} cold",
-                                        i, h, p, c);
+                                    if stderr_debug_enabled() {
+                                        eprintln!("[PREFILL] First MoE layer {} selective DMA: {} hcs + {} pinned + {} cold",
+                                            i, h, p, c);
+                                    }
                                 } else {
                                     self.bulk_dma_layer(moe_data, w1_base, w1s_base, w2_base, w2s_base)?;
                                     let mb = (moe_data.bulk_w13p.1 + moe_data.bulk_w13s.1
                                         + moe_data.bulk_w2p.1 + moe_data.bulk_w2s.1) as f64 / 1e6;
-                                    eprintln!("[PREFILL] Preloading first MoE layer {} ({:.1} MB) on copy_stream",
-                                        i, mb);
+                                    if stderr_debug_enabled() {
+                                        eprintln!("[PREFILL] Preloading first MoE layer {} ({:.1} MB) on copy_stream",
+                                            i, mb);
+                                    }
                                 }
                             } else {
                                 self.bulk_dma_layer(moe_data, w1_base, w1s_base, w2_base, w2s_base)?;
@@ -3827,12 +3847,16 @@ impl PrefillEngine {
             && std::env::var("KRASIS_SEQUENTIAL_MOE").is_err();
         if use_fused {
             if layer_idx == 0 {
-                eprintln!("[PREFILL] Using FUSED MoE path (bulk layer DMA)");
+                if stderr_debug_enabled() {
+                    eprintln!("[PREFILL] Using FUSED MoE path (bulk layer DMA)");
+                }
             }
             return self.forward_moe_fused(layer_idx, m);
         }
         if layer_idx == 0 {
-            eprintln!("[PREFILL] Using SEQUENTIAL MoE path");
+            if stderr_debug_enabled() {
+                eprintln!("[PREFILL] Using SEQUENTIAL MoE path");
+            }
         }
         // Per-expert sequential dispatch
         self.forward_moe_sequential(layer_idx, m)
@@ -4231,15 +4255,17 @@ impl PrefillEngine {
             if layer_idx == 0 {
                 // Dump host-side pointer table to verify correctness
                 let first_active = active.first().copied().unwrap_or(0);
-                eprintln!("[PTR-TABLE] layer0: {} hcs (zero-copy) + {} cold (H2D staged), active={}/{}",
-                    hcs_count, cold_count, active.len(), n_experts);
-                eprintln!("[PTR-TABLE] host ptrs[0..4] = [{:#x}, {:#x}, {:#x}, {:#x}]",
-                    self.h_expert_w1_ptrs[0], self.h_expert_w1_ptrs[1],
-                    self.h_expert_w1_ptrs[2], self.h_expert_w1_ptrs[3]);
-                eprintln!("[PTR-TABLE] host ptrs first_active[{}] = {:#x}",
-                    first_active, self.h_expert_w1_ptrs[first_active]);
-                eprintln!("[PTR-TABLE] gpu buf addr={:#x}, n_experts={}, upload_bytes={}",
-                    w1_ptrs_gpu, n_experts, n_experts * 8);
+                if stderr_debug_enabled() {
+                    eprintln!("[PTR-TABLE] layer0: {} hcs (zero-copy) + {} cold (H2D staged), active={}/{}",
+                        hcs_count, cold_count, active.len(), n_experts);
+                    eprintln!("[PTR-TABLE] host ptrs[0..4] = [{:#x}, {:#x}, {:#x}, {:#x}]",
+                        self.h_expert_w1_ptrs[0], self.h_expert_w1_ptrs[1],
+                        self.h_expert_w1_ptrs[2], self.h_expert_w1_ptrs[3]);
+                    eprintln!("[PTR-TABLE] host ptrs first_active[{}] = {:#x}",
+                        first_active, self.h_expert_w1_ptrs[first_active]);
+                    eprintln!("[PTR-TABLE] gpu buf addr={:#x}, n_experts={}, upload_bytes={}",
+                        w1_ptrs_gpu, n_experts, n_experts * 8);
+                }
             }
         } else {
             // Legacy path: contiguous fused buffer DMA
@@ -6308,8 +6334,10 @@ impl PrefillEngine {
         self.prescan_active_experts = per_chunk;
         let ms = t_prescan.elapsed().as_secs_f64() * 1000.0;
         let total_active: usize = counts.iter().map(|c| c.iter().filter(|&&v| v > 0).count()).sum();
-        eprintln!("[PREFILL] Gate pre-scan: {} MoE layers in {:.1}ms, avg {:.0} active experts/layer",
-            num_moe_layers, ms, total_active as f64 / num_moe_layers as f64);
+        if stderr_debug_enabled() {
+            eprintln!("[PREFILL] Gate pre-scan: {} MoE layers in {:.1}ms, avg {:.0} active experts/layer",
+                num_moe_layers, ms, total_active as f64 / num_moe_layers as f64);
+        }
 
         Ok(counts)
     }
@@ -6344,16 +6372,20 @@ impl PrefillEngine {
         let experts_per_layer = std::cmp::min(max_total_experts / num_moe_layers, n_experts);
 
         if experts_per_layer == 0 {
-            eprintln!("[PREFILL] Pinning pool: insufficient VRAM ({:.0} MB free, {:.1} MB safety), skipping",
-                free as f64 / 1e6, safety as f64 / 1e6);
+            if stderr_debug_enabled() {
+                eprintln!("[PREFILL] Pinning pool: insufficient VRAM ({:.0} MB free, {:.1} MB safety), skipping",
+                    free as f64 / 1e6, safety as f64 / 1e6);
+            }
             return Ok(0);
         }
 
         let total_pinned = experts_per_layer * num_moe_layers;
         let pool_bytes = total_pinned * expert_bytes;
 
-        eprintln!("[PREFILL] Pinning pool: {:.0} MB free, pinning {}/{} experts/layer ({} total, {:.0} MB)",
-            free as f64 / 1e6, experts_per_layer, n_experts, total_pinned, pool_bytes as f64 / 1e6);
+        if stderr_debug_enabled() {
+            eprintln!("[PREFILL] Pinning pool: {:.0} MB free, pinning {}/{} experts/layer ({} total, {:.0} MB)",
+                free as f64 / 1e6, experts_per_layer, n_experts, total_pinned, pool_bytes as f64 / 1e6);
+        }
 
         // Allocate the pool using raw CUDA driver API
         let pool_base: u64 = unsafe {
@@ -6427,10 +6459,12 @@ impl PrefillEngine {
         }
 
         let pin_ms = t_pin.elapsed().as_secs_f64() * 1000.0;
-        eprintln!("[PREFILL] Pinned {} experts/layer across {} layers in {:.0}ms ({:.0} MB @ {:.1} GB/s)",
-            experts_per_layer, num_moe_layers, pin_ms,
-            pool_bytes as f64 / 1e6,
-            pool_bytes as f64 / 1e9 / (pin_ms / 1000.0));
+        if stderr_debug_enabled() {
+            eprintln!("[PREFILL] Pinned {} experts/layer across {} layers in {:.0}ms ({:.0} MB @ {:.1} GB/s)",
+                experts_per_layer, num_moe_layers, pin_ms,
+                pool_bytes as f64 / 1e6,
+                pool_bytes as f64 / 1e9 / (pin_ms / 1000.0));
+        }
 
         self.pinning_pool_ptr = pool_base;
         self.pinning_pool_bytes = pool_bytes;
@@ -7713,7 +7747,7 @@ fn load_fused_moe() -> Option<FusedMoeFn> {
     let path = match find_marlin_so() {
         Some(p) => p,
         None => {
-            eprintln!("[FUSED-MOE] find_marlin_so() returned None — fused MoE unavailable");
+            log::debug!("Fused MoE unavailable: libkrasis_marlin.so not found");
             return None;
         }
     };
@@ -7723,16 +7757,16 @@ fn load_fused_moe() -> Option<FusedMoeFn> {
             libc::RTLD_NOW | libc::RTLD_LOCAL,
         );
         if lib.is_null() {
-            eprintln!("[FUSED-MOE] dlopen({}) failed", path);
+            log::warn!("Fused MoE dlopen({}) failed", path);
             return None;
         }
 
         let sym = libc::dlsym(lib, b"krasis_marlin_moe_mm_bf16\0".as_ptr() as *const _);
         if !sym.is_null() {
-            eprintln!("[FUSED-MOE] Loaded krasis_marlin_moe_mm_bf16 from {}", path);
+            log::info!("Loaded fused MoE from {}", path);
             return Some(std::mem::transmute(sym));
         }
-        eprintln!("[FUSED-MOE] krasis_marlin_moe_mm_bf16 symbol not found in {}", path);
+        log::warn!("Fused MoE symbol not found in {}", path);
     }
     None
 }
@@ -7889,7 +7923,6 @@ pub fn load_fla() -> Option<FlaKernels> {
         };
 
         log::info!("Loaded FLA (Flash Linear Attention) kernels from {}", path);
-        eprintln!("[FLA] Loaded Flash Linear Attention kernels from {}", path);
         Some(kernels)
     }
 }

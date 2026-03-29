@@ -1711,11 +1711,6 @@ class KrasisModel:
     def _init_gpu_prefill(self):
         """No-op: Python GPU prefill has been replaced by Rust prefill engine."""
         pass
-
-        engine_ref = getattr(self, 'krasis_engine', None)
-        num_moe_layers = self.cfg.num_moe_layers
-        # Only create prefill manager for primary GPU — aux GPUs are decode-only
-        prefill_devices = [self.all_devices[0]]
         num_ranks = 1
 
         for i, dev in enumerate(prefill_devices):
@@ -3741,157 +3736,6 @@ class KrasisModel:
     # Rust server interface
     # ──────────────────────────────────────────────────────
 
-    @torch.inference_mode()
-    def server_prefill(
-        self,
-        messages_json: str,
-        max_new_tokens: int,
-        temperature: float,
-        top_k: int,
-        top_p: float,
-        presence_penalty: float,
-        enable_thinking: bool,
-        extra_stop_tokens: List[str],
-        decode_mode: str = "gpu",
-        tools_json: str = "",
-    ):
-        """GPU prefill for Rust server. Returns result object with first_token, etc.
-
-        Called by the Rust HTTP server (with GIL) before decode.
-        Exports KV cache + LA state to Rust GpuDecodeStore for GPU decode.
-        """
-        import json
-
-        parsed = json.loads(messages_json)
-
-        # Tool use: parse tools and preprocess messages
-        template_kwargs = {"enable_thinking": enable_thinking}
-        if tools_json:
-            tools = json.loads(tools_json)
-            template_kwargs["tools"] = tools
-            # Convert string arguments to dicts for the Jinja2 template
-            for msg in parsed:
-                if msg.get("role") == "assistant" and "tool_calls" in msg:
-                    for tc in msg["tool_calls"]:
-                        fn_obj = tc.get("function", tc)
-                        if isinstance(fn_obj.get("arguments"), str):
-                            try:
-                                fn_obj["arguments"] = json.loads(fn_obj["arguments"])
-                            except (json.JSONDecodeError, TypeError):
-                                pass
-
-        prompt_tokens = self.tokenizer.apply_chat_template(
-            parsed, add_generation_prompt=True, **template_kwargs
-        )
-
-        stop_ids = [self.cfg.eos_token_id] + list(self.cfg.extra_stop_token_ids)
-        for s in extra_stop_tokens:
-            ids = self.tokenizer.encode(s, add_special_tokens=False)
-            stop_ids.extend(ids)
-
-        # Create KV states
-        seq_states = [
-            SequenceKVState(c, seq_id=0) if c is not None else None
-            for c in self.kv_caches
-        ]
-        self._server_seq_states = seq_states
-
-        # Reset linear attention states
-        if self.cfg.is_hybrid:
-            for layer in self.layers:
-                if layer.layer_type == "linear_attention":
-                    layer.attention.reset_state()
-
-        # Reset Mamba2 SSM states for new sequence
-        decode_states = getattr(self, '_mamba2_decode_states', None)
-        if decode_states:
-            for buffers in decode_states.values():
-                buffers['conv_state'].zero_()
-                buffers['ssm_state'].zero_()
-
-        device = torch.device(self.ranks[0].device)
-
-        # Multi-GPU: re-upload prefill-only attention (freed after last decode)
-        self._upload_prefill_only_attention()
-
-        # Prefill — Single-slot AWQ: Marlin already in GPU slots
-        prompt_tensor = torch.tensor(prompt_tokens, dtype=torch.long, device=device)
-        positions = torch.arange(len(prompt_tokens), dtype=torch.int32, device=device)
-
-        # Drain any pending CUDA ops from previous request so timing is accurate
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        logits = self.forward(prompt_tensor, positions, seq_states)
-        next_logits = logits[-1:, :]
-        torch.cuda.synchronize()
-        prefill_time = time.perf_counter() - t0
-
-        # Suppress turn-boundary tokens (e.g. <|im_start|>) before sampling first token.
-        # Prevents the model from generating phantom new turns in multi-turn chat.
-        suppress = getattr(self, '_suppress_tokens', None)
-        if suppress:
-            for tok_id in suppress:
-                if tok_id < next_logits.shape[-1]:
-                    next_logits[..., tok_id] = float('-inf')
-
-        # First-token suppression: suppress newline and stop tokens for the first
-        # generated token. Without this, quantized models (AWQ INT4) can generate
-        # \n → EOS on short prompts, producing empty responses. This is standard
-        # practice — vLLM applies the same first-token degenerate suppression.
-        # Safe for all modes: when thinking is ON the model's top prediction is
-        # <think>/<\/think>, not newline, so this doesn't interfere.
-        newline_ids = self.tokenizer.encode("\n", add_special_tokens=False)
-        for nid in newline_ids:
-            if nid < next_logits.shape[-1]:
-                next_logits[..., nid] = float('-inf')
-        for tok_id in stop_ids:
-            if tok_id < next_logits.shape[-1]:
-                next_logits[..., tok_id] = float('-inf')
-
-        # Sample first token
-        first_token = sample(
-            next_logits, temperature, top_k, top_p,
-            presence_penalty=presence_penalty,
-        ).item()
-
-        logger.info(
-            "server_prefill: %d tokens in %.2fs (%.0f tok/s), decode_mode=%s",
-            len(prompt_tokens), prefill_time,
-            len(prompt_tokens) / prefill_time if prefill_time > 0 else 0,
-            decode_mode,
-        )
-
-        # GPU decode: export state to Rust GpuDecodeStore
-        gpu_store = getattr(self, '_gpu_decode_store', None)
-        if gpu_store is None:
-            raise RuntimeError("GpuDecodeStore not configured. Call setup_gpu_decode_store() first.")
-        self._export_kv_to_rust(seq_states, len(prompt_tokens))
-        self._transfer_mamba2_states()
-        self._update_la_state_ptrs()
-        self._update_la_state_ptrs_aux()
-
-        # Multi-GPU: free prefill-only attention (layers outside decode segment)
-        self._free_prefill_only_attention()
-
-        # Single-slot AWQ: swap simple INT4 into GPU slots for decode
-        gpu_store.swap_to_simple_int4()
-
-        store_addr = gpu_store.gpu_store_addr()
-
-        class _Result:
-            pass
-        r = _Result()
-        r.first_token = first_token
-        r.prompt_len = len(prompt_tokens)
-        r.prefill_time = prefill_time
-        r.stop_ids = stop_ids
-        r.store_addr = store_addr
-        r.decode_mode = decode_mode
-        # Flag: if prompt exceeded Rust KV capacity, skip decode
-        rust_max_seq = getattr(gpu_store, 'kv_max_seq', 0)
-        r.kv_overflow = (rust_max_seq > 0 and len(prompt_tokens) > rust_max_seq)
-        return r
-
     @staticmethod
     def _dense_mlp_tensor(w) -> torch.Tensor:
         """Extract a BF16 tensor from a dense MLP weight value.
@@ -4202,8 +4046,10 @@ class KrasisModel:
             inp_norm = layer.input_norm_weight
             post_norm = layer.post_attn_norm_weight
 
+            py_diag = os.environ.get("KRASIS_PY_DIAG") == "1"
+
             # DIAG: check raw norm values BEFORE AWQ fold
-            if layer_idx == 0:
+            if py_diag and layer_idx == 0:
                 import sys
                 _rv = inp_norm.data.cpu().float()[:10].tolist()
                 _rl2 = inp_norm.data.cpu().float().norm().item()
@@ -4293,7 +4139,7 @@ class KrasisModel:
                                  "(mean_scale=%.4f)", layer_idx, s.mean().item())
 
                 # DIAG: trace input_norm pointer and values at registration time
-                if layer_idx == 0:
+                if py_diag and layer_idx == 0:
                     import sys
                     _nv = inp_norm.data.cpu().float()[:10].tolist()
                     _nl2 = inp_norm.data.cpu().float().norm().item()

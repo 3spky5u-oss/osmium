@@ -21,6 +21,12 @@ use cudarc::cublas::result as cublas_result;
 use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, LaunchAsync, LaunchConfig};
 use cudarc::driver::sys as cuda_sys;
 
+fn stderr_debug_enabled() -> bool {
+    std::env::var("KRASIS_DEBUG_STDERR")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 // PTX compiled from src/cuda/decode_kernels.cu at build time.
 #[cfg(has_decode_kernels)]
 const DECODE_KERNELS_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/decode_kernels.ptx"));
@@ -751,26 +757,36 @@ impl HcsState {
         let total_possible = num_layers * nep;
         let pct = if total_possible > 0 { cf_nonzero as f64 / total_possible as f64 * 100.0 } else { 0.0 };
 
-        eprintln!("  \x1b[35mHCS post-reload: cache_fast={} ({:.1}%), hashmap={}, num_cached={}, soft_num_cached={}, dupes={}, soft_dupes={}\x1b[0m",
-            cf_nonzero, pct, hm_count, self.num_cached, self.soft_num_cached, duplicates, soft_dupes);
+        if stderr_debug_enabled() {
+            eprintln!("  \x1b[35mHCS post-reload: cache_fast={} ({:.1}%), hashmap={}, num_cached={}, soft_num_cached={}, dupes={}, soft_dupes={}\x1b[0m",
+                cf_nonzero, pct, hm_count, self.num_cached, self.soft_num_cached, duplicates, soft_dupes);
+        }
         log::info!("HCS post-reload: cache_fast={} ({:.1}%), hashmap={}, num_cached={}, soft_num_cached={}, dupes={}, soft_dupes={}",
             cf_nonzero, pct, hm_count, self.num_cached, self.soft_num_cached, duplicates, soft_dupes);
 
         // Warn if counters are inconsistent
         if cf_nonzero != hm_count {
-            eprintln!("  \x1b[31mHCS WARNING: cache_fast count ({}) != hashmap count ({})\x1b[0m", cf_nonzero, hm_count);
+            if stderr_debug_enabled() {
+                eprintln!("  \x1b[31mHCS WARNING: cache_fast count ({}) != hashmap count ({})\x1b[0m", cf_nonzero, hm_count);
+            }
             log::warn!("HCS post-reload: cache_fast count ({}) != hashmap count ({})", cf_nonzero, hm_count);
         }
         if cf_nonzero != self.num_cached {
-            eprintln!("  \x1b[31mHCS WARNING: cache_fast count ({}) != num_cached counter ({})\x1b[0m", cf_nonzero, self.num_cached);
+            if stderr_debug_enabled() {
+                eprintln!("  \x1b[31mHCS WARNING: cache_fast count ({}) != num_cached counter ({})\x1b[0m", cf_nonzero, self.num_cached);
+            }
             log::warn!("HCS post-reload: cache_fast count ({}) != num_cached counter ({})", cf_nonzero, self.num_cached);
         }
         if duplicates > 0 {
-            eprintln!("  \x1b[31mHCS WARNING: {} duplicate entries in cache_fast!\x1b[0m", duplicates);
+            if stderr_debug_enabled() {
+                eprintln!("  \x1b[31mHCS WARNING: {} duplicate entries in cache_fast!\x1b[0m", duplicates);
+            }
             log::warn!("HCS post-reload: {} duplicate entries in cache_fast!", duplicates);
         }
         if soft_dupes > 0 {
-            eprintln!("  \x1b[31mHCS WARNING: {} duplicate entries in soft_slot_to_expert!\x1b[0m", soft_dupes);
+            if stderr_debug_enabled() {
+                eprintln!("  \x1b[31mHCS WARNING: {} duplicate entries in soft_slot_to_expert!\x1b[0m", soft_dupes);
+            }
             log::warn!("HCS post-reload: {} duplicate entries in soft_slot_to_expert!", soft_dupes);
         }
     }
@@ -2098,6 +2114,61 @@ impl GpuDecodeStore {
         let (fixed_bytes, per_token_bytes) = crate::gpu_prefill::compute_scratch_vram(&engine.config);
         let total_bytes = fixed_bytes + per_token_bytes * max_tokens;
         Ok(total_bytes / (1024 * 1024))
+    }
+
+    /// Run Rust prefill directly from token IDs and prepare the decode store
+    /// to continue generation from the returned first token.
+    #[pyo3(signature = (token_ids, temperature=0.6))]
+    fn rust_prefill_tokens(
+        &mut self,
+        token_ids: Vec<u32>,
+        temperature: f32,
+    ) -> PyResult<(usize, usize, bool)> {
+        let prompt_len = token_ids.len();
+        let (cache_fast_snapshot, ne) = {
+            let (cache_fast, ne) = self.export_hcs_snapshot();
+            (cache_fast.to_vec(), ne)
+        };
+        self.swap_to_marlin_rust().map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+
+        let (first_token, prompt_len, kv_overflow) = {
+            let engine = self.prefill_engine_slot.as_mut().ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "Rust prefill engine not allocated. Call allocate_prefill_engine() first."
+                )
+            })?;
+
+            let kv_overflow = prompt_len > engine.kv_max_seq;
+            engine.update_hcs_snapshot(&cache_fast_snapshot, ne);
+
+            engine
+                .prepare_for_prefill(prompt_len)
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+
+            let prefill_result = match engine.run_prefill(&token_ids, temperature, &[]) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = engine.release_scratch();
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(e));
+                }
+            };
+
+            if let Err(e) = engine.release_scratch() {
+                log::error!("rust_prefill_tokens: failed to release scratch: {}", e);
+            }
+
+            (
+                prefill_result.first_token as usize,
+                prefill_result.prompt_len,
+                kv_overflow,
+            )
+        };
+
+        self.set_kv_position_rust(prompt_len);
+        self.swap_to_simple_int4_rust()
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+
+        Ok((first_token, prompt_len, kv_overflow))
     }
 
     /// Initialize the decode graph with model dimensions.
@@ -5700,8 +5771,10 @@ impl GpuDecodeStore {
             }
             total_bytes += entry.simple_packed_host.len() + entry.simple_scales_host.len();
         }
-        eprintln!("[krasis] Swapped to simple INT4 for decode ({:.1} MB DMA, {} weights)",
-            total_bytes as f64 / 1024.0 / 1024.0, self.single_slot_swaps.len());
+        if stderr_debug_enabled() {
+            eprintln!("[krasis] Swapped to simple INT4 for decode ({:.1} MB DMA, {} weights)",
+                total_bytes as f64 / 1024.0 / 1024.0, self.single_slot_swaps.len());
+        }
         Ok(())
     }
 
@@ -5731,8 +5804,10 @@ impl GpuDecodeStore {
             }
             total_bytes += entry.marlin_packed_host.len() + entry.marlin_scales_host.len();
         }
-        eprintln!("[krasis] Swapped to Marlin for prefill ({:.1} MB DMA, {} weights)",
-            total_bytes as f64 / 1024.0 / 1024.0, self.single_slot_swaps.len());
+        if stderr_debug_enabled() {
+            eprintln!("[krasis] Swapped to Marlin for prefill ({:.1} MB DMA, {} weights)",
+                total_bytes as f64 / 1024.0 / 1024.0, self.single_slot_swaps.len());
+        }
         Ok(())
     }
 
@@ -6098,7 +6173,7 @@ impl GpuDecodeStore {
             }
 
             // MoE config
-            if i < 3 {
+            if i < 3 && stderr_debug_enabled() {
                 eprintln!("[PREFILL-INIT] layer {} mlp={}, moe_layers.len()={}, moe_layers[{}]={:?}",
                     i, match &l.mlp { GpuMlpConfig::MoE{..} => "MoE", GpuMlpConfig::Dense{..} => "Dense", GpuMlpConfig::None => "None" },
                     graph.moe_layers.len(), i,
@@ -6206,7 +6281,7 @@ impl GpuDecodeStore {
                 }
             }
 
-            if i < 3 {
+            if i < 3 && stderr_debug_enabled() {
                 eprintln!("[PREFILL-INIT] layer {} -> moe_gate_ptr={:#x}, shared_w1={}, shared_w2={}, moe_layer_idx={:?}",
                     i, lw.moe_gate_ptr, lw.shared_w1.is_some(), lw.shared_w2.is_some(), lw.moe_layer_idx);
             }
@@ -7317,8 +7392,10 @@ impl GpuDecodeStore {
         }
         graph.d_cublas_workspace = Some(d_workspace);
 
-        eprintln!("[krasis] CUDA graph infrastructure initialized (has_dummy={}, workspace=32KB)",
-            graph.d_dummy_expert.is_some());
+        if stderr_debug_enabled() {
+            eprintln!("[krasis] CUDA graph infrastructure initialized (has_dummy={}, workspace=32KB)",
+                graph.d_dummy_expert.is_some());
+        }
         Ok(())
     }
 
@@ -7347,21 +7424,27 @@ impl GpuDecodeStore {
         // Check LA state pointers
         for &(li, captured_conv, captured_recur) in &graph.captured_la_ptrs {
             if li >= graph.layers.len() {
-                eprintln!("[krasis] graph-reuse: LA layer {} out of range", li);
+                if stderr_debug_enabled() {
+                    eprintln!("[krasis] graph-reuse: LA layer {} out of range", li);
+                }
                 return false;
             }
             match &graph.layers[li].attn {
                 GpuAttnConfig::LinearAttention { conv_state_ptr, recur_state_ptr, .. } => {
                     if *conv_state_ptr != captured_conv || *recur_state_ptr != captured_recur {
-                        eprintln!("[krasis] graph-reuse: LA layer {} ptrs changed! \
-                            conv: 0x{:x}→0x{:x}, recur: 0x{:x}→0x{:x}",
-                            li, captured_conv, *conv_state_ptr,
-                            captured_recur, *recur_state_ptr);
+                        if stderr_debug_enabled() {
+                            eprintln!("[krasis] graph-reuse: LA layer {} ptrs changed! \
+                                conv: 0x{:x}→0x{:x}, recur: 0x{:x}→0x{:x}",
+                                li, captured_conv, *conv_state_ptr,
+                                captured_recur, *recur_state_ptr);
+                        }
                         return false;
                     }
                 }
                 _ => {
-                    eprintln!("[krasis] graph-reuse: layer {} no longer LA", li);
+                    if stderr_debug_enabled() {
+                        eprintln!("[krasis] graph-reuse: layer {} no longer LA", li);
+                    }
                     return false;
                 }
             }
@@ -7370,14 +7453,18 @@ impl GpuDecodeStore {
         // Check KV cache pointers
         for &(li, captured_k, captured_v) in &graph.captured_kv_ptrs {
             if li >= graph.kv_k_ptrs.len() {
-                eprintln!("[krasis] graph-reuse: KV layer {} out of range", li);
+                if stderr_debug_enabled() {
+                    eprintln!("[krasis] graph-reuse: KV layer {} out of range", li);
+                }
                 return false;
             }
             if graph.kv_k_ptrs[li] != captured_k || graph.kv_v_ptrs[li] != captured_v {
-                eprintln!("[krasis] graph-reuse: KV layer {} ptrs changed! \
-                    k: 0x{:x}→0x{:x}, v: 0x{:x}→0x{:x}",
-                    li, captured_k, graph.kv_k_ptrs[li],
-                    captured_v, graph.kv_v_ptrs[li]);
+                if stderr_debug_enabled() {
+                    eprintln!("[krasis] graph-reuse: KV layer {} ptrs changed! \
+                        k: 0x{:x}→0x{:x}, v: 0x{:x}→0x{:x}",
+                        li, captured_k, graph.kv_k_ptrs[li],
+                        captured_v, graph.kv_v_ptrs[li]);
+                }
                 return false;
             }
         }
@@ -7385,21 +7472,27 @@ impl GpuDecodeStore {
         // Check MLA cache pointers
         for &(li, captured_ckv, captured_kpe) in &graph.captured_mla_ptrs {
             if li >= graph.layers.len() {
-                eprintln!("[krasis] graph-reuse: MLA layer {} out of range", li);
+                if stderr_debug_enabled() {
+                    eprintln!("[krasis] graph-reuse: MLA layer {} out of range", li);
+                }
                 return false;
             }
             match &graph.layers[li].attn {
                 GpuAttnConfig::MLA { ckv_cache_ptr, kpe_cache_ptr, .. } => {
                     if *ckv_cache_ptr != captured_ckv || *kpe_cache_ptr != captured_kpe {
-                        eprintln!("[krasis] graph-reuse: MLA layer {} ptrs changed! \
-                            ckv: 0x{:x}→0x{:x}, kpe: 0x{:x}→0x{:x}",
-                            li, captured_ckv, *ckv_cache_ptr,
-                            captured_kpe, *kpe_cache_ptr);
+                        if stderr_debug_enabled() {
+                            eprintln!("[krasis] graph-reuse: MLA layer {} ptrs changed! \
+                                ckv: 0x{:x}→0x{:x}, kpe: 0x{:x}→0x{:x}",
+                                li, captured_ckv, *ckv_cache_ptr,
+                                captured_kpe, *kpe_cache_ptr);
+                        }
                         return false;
                     }
                 }
                 _ => {
-                    eprintln!("[krasis] graph-reuse: layer {} no longer MLA", li);
+                    if stderr_debug_enabled() {
+                        eprintln!("[krasis] graph-reuse: layer {} no longer MLA", li);
+                    }
                     return false;
                 }
             }
@@ -7470,8 +7563,10 @@ impl GpuDecodeStore {
         let num_moe = moe_indices.len();
         let num_graphs = num_moe + 1; // routing(0) + (num_moe-1) combined + final
 
-        eprintln!("[krasis] Capturing {} per-layer graphs ({} MoE layers, range {}-{}, emb={}, final={})",
-            num_graphs, num_moe, range_start, range_end, do_embedding, do_final);
+        if stderr_debug_enabled() {
+            eprintln!("[krasis] Capturing {} per-layer graphs ({} MoE layers, range {}-{}, emb={}, final={})",
+                num_graphs, num_moe, range_start, range_end, do_embedding, do_final);
+        }
 
         // Create capture stream
         let mut capture_stream: cuda_sys::CUstream = std::ptr::null_mut();
@@ -7619,7 +7714,9 @@ impl GpuDecodeStore {
             match end_capture_and_instantiate(capture_stream, &label) {
                 Ok(exec) => {
                     captured_graphs.push(exec);
-                    eprintln!("[krasis] Captured graph {} ({})", graph_idx, label);
+                    if stderr_debug_enabled() {
+                        eprintln!("[krasis] Captured graph {} ({})", graph_idx, label);
+                    }
                 }
                 Err(e) => {
                     capture_err = Some(e);
@@ -7675,11 +7772,15 @@ impl GpuDecodeStore {
                 }
             }
         }
-        eprintln!("[krasis] Pointer snapshot: {} LA ptrs, {} KV ptrs, {} MLA ptrs",
-            graph.captured_la_ptrs.len(), graph.captured_kv_ptrs.len(), graph.captured_mla_ptrs.len());
+        if stderr_debug_enabled() {
+            eprintln!("[krasis] Pointer snapshot: {} LA ptrs, {} KV ptrs, {} MLA ptrs",
+                graph.captured_la_ptrs.len(), graph.captured_kv_ptrs.len(), graph.captured_mla_ptrs.len());
+        }
 
         self.graph = Some(graph);
-        eprintln!("[krasis] Per-layer graphs captured: {} graphs", num_graphs);
+        if stderr_debug_enabled() {
+            eprintln!("[krasis] Per-layer graphs captured: {} graphs", num_graphs);
+        }
         Ok(())
     }
 
@@ -11139,18 +11240,20 @@ impl GpuDecodeStore {
             }
         }
         if all_reuse {
-            eprintln!("[krasis] CUDA graphs reused on all {} GPUs (ptrs verified stable)", num_gpus);
+            if stderr_debug_enabled() {
+                eprintln!("[krasis] CUDA graphs reused on all {} GPUs (ptrs verified stable)", num_gpus);
+            }
         } else {
             if !self.verify_graph_pointers() {
                 let was = self.graph.as_ref().map(|g| g.graphs_ever_captured).unwrap_or(false);
-                if was { eprintln!("[krasis] GPU0 graph ptrs changed — invalidating"); }
+                if was && stderr_debug_enabled() { eprintln!("[krasis] GPU0 graph ptrs changed — invalidating"); }
                 self.invalidate_cuda_graph();
             }
             for (i, &addr) in aux_store_addrs.iter().enumerate() {
                 let s = unsafe { &mut *(addr as *mut GpuDecodeStore) };
                 if !s.verify_graph_pointers() {
                     let was = s.graph.as_ref().map(|g| g.graphs_ever_captured).unwrap_or(false);
-                    if was { eprintln!("[krasis] GPU{} graph ptrs changed — invalidating", i + 1); }
+                    if was && stderr_debug_enabled() { eprintln!("[krasis] GPU{} graph ptrs changed — invalidating", i + 1); }
                     s.invalidate_cuda_graph();
                 }
             }
@@ -11193,7 +11296,9 @@ impl GpuDecodeStore {
                 let needs_init = self.graph.as_ref().map(|g| g.d_graph_token_id.is_none()).unwrap_or(false);
                 if needs_init {
                     match self.init_cuda_graph_buffers() {
-                        Ok(()) => eprintln!("[krasis] GPU0 CUDA graph buffers initialized"),
+                        Ok(()) => {
+                            if stderr_debug_enabled() { eprintln!("[krasis] GPU0 CUDA graph buffers initialized"); }
+                        }
                         Err(e) => eprintln!("[krasis] GPU0 graph init failed: {}", e),
                     }
                 }
@@ -11207,7 +11312,9 @@ impl GpuDecodeStore {
                     let needs_init = s.graph.as_ref().map(|g| g.d_graph_token_id.is_none()).unwrap_or(false);
                     if needs_init {
                         match s.init_cuda_graph_buffers() {
-                            Ok(()) => eprintln!("[krasis] GPU{} CUDA graph buffers initialized", i + 1),
+                            Ok(()) => {
+                                if stderr_debug_enabled() { eprintln!("[krasis] GPU{} CUDA graph buffers initialized", i + 1); }
+                            }
                             Err(e) => eprintln!("[krasis] GPU{} graph init failed: {}", i + 1, e),
                         }
                     }
@@ -11388,7 +11495,9 @@ impl GpuDecodeStore {
                             match self.capture_per_layer_graphs(
                                 Some((0, boundaries[1])), true, false, 0,
                             ) {
-                                Ok(()) => eprintln!("[krasis] GPU0 per-layer graphs captured"),
+                                Ok(()) => {
+                                    if stderr_debug_enabled() { eprintln!("[krasis] GPU0 per-layer graphs captured"); }
+                                }
                                 Err(e) => eprintln!("[krasis] GPU0 graph capture failed: {}", e),
                             }
                         }
@@ -11403,7 +11512,9 @@ impl GpuDecodeStore {
                                 match s.capture_per_layer_graphs(
                                     Some((boundaries[i + 1], boundaries[i + 2])), false, is_last, gqa_cache_offsets[i],
                                 ) {
-                                    Ok(()) => eprintln!("[krasis] GPU{} per-layer graphs captured", i + 1),
+                                    Ok(()) => {
+                                        if stderr_debug_enabled() { eprintln!("[krasis] GPU{} per-layer graphs captured", i + 1); }
+                                    }
                                     Err(e) => eprintln!("[krasis] GPU{} graph capture failed: {}", i + 1, e),
                                 }
                             }
@@ -13088,8 +13199,10 @@ impl GpuDecodeStore {
                     let freed_bytes = extra_chunks * hcs.soft_slots_per_chunk * hcs.soft_slot_size;
                     hcs.soft_chunks.truncate(hcs.soft_chunks_loaded);
                     hcs.vram_bytes = hcs.vram_bytes.saturating_sub(freed_bytes);
-                    eprintln!("  \x1b[33mHCS soft: cancelled pending async reload ({} unactivated experts, {:.1} MB freed)\x1b[0m",
-                        unactivated, freed_bytes as f64 / (1024.0 * 1024.0));
+                    if stderr_debug_enabled() {
+                        eprintln!("  \x1b[33mHCS soft: cancelled pending async reload ({} unactivated experts, {:.1} MB freed)\x1b[0m",
+                            unactivated, freed_bytes as f64 / (1024.0 * 1024.0));
+                    }
                 }
             }
             // Fall through — the current prompt may need further eviction
@@ -13135,8 +13248,10 @@ impl GpuDecodeStore {
         let needed_bytes = scratch_bytes + safety_mb * 1024 * 1024;
 
         if free_bytes >= needed_bytes {
-            eprintln!("  \x1b[32mHCS soft: skip eviction — {:.0} MB free >= {:.0} MB needed\x1b[0m",
-                free_bytes as f64 / (1024.0 * 1024.0), needed_bytes as f64 / (1024.0 * 1024.0));
+            if stderr_debug_enabled() {
+                eprintln!("  \x1b[32mHCS soft: skip eviction — {:.0} MB free >= {:.0} MB needed\x1b[0m",
+                    free_bytes as f64 / (1024.0 * 1024.0), needed_bytes as f64 / (1024.0 * 1024.0));
+            }
             log::info!("HCS soft: skip eviction — {:.0} MB free >= {:.0} MB needed",
                 free_bytes as f64 / (1024.0 * 1024.0), needed_bytes as f64 / (1024.0 * 1024.0));
             return (0, 0.0);
@@ -13206,8 +13321,10 @@ impl GpuDecodeStore {
         self.last_soft_evict_experts = evicted;
         self.last_soft_evict_freed_mb = freed_mb;
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        eprintln!("  \x1b[33mHCS soft: evicted {} experts ({:.1} MB, {} of {} chunks dropped) in {:.1}ms for prefill (~{} tokens)\x1b[0m",
-            evicted, freed_mb, chunks_to_drop, total_chunks, elapsed_ms, estimated_tokens);
+        if stderr_debug_enabled() {
+            eprintln!("  \x1b[33mHCS soft: evicted {} experts ({:.1} MB, {} of {} chunks dropped) in {:.1}ms for prefill (~{} tokens)\x1b[0m",
+                evicted, freed_mb, chunks_to_drop, total_chunks, elapsed_ms, estimated_tokens);
+        }
         log::info!("HCS soft: evicted {} experts ({:.1} MB, {} of {} chunks dropped) in {:.1}ms for prefill (~{} tokens)",
             evicted, freed_mb, chunks_to_drop, total_chunks, elapsed_ms, estimated_tokens);
 
@@ -13528,8 +13645,10 @@ impl GpuDecodeStore {
         self.last_soft_reload_alloc_mb = alloc_mb;
         self.last_soft_reload_activated = 0;
         let chunks_queued = hcs.soft_chunks.len() - already_loaded;
-        eprintln!("  \x1b[36mHCS soft: async reload queued {} experts ({:.1} MB, {}/{} chunks, batch DMA) in {:.1}ms\x1b[0m",
-            queued, alloc_mb, chunks_queued, target_chunks, elapsed_ms);
+        if stderr_debug_enabled() {
+            eprintln!("  \x1b[36mHCS soft: async reload queued {} experts ({:.1} MB, {}/{} chunks, batch DMA) in {:.1}ms\x1b[0m",
+                queued, alloc_mb, chunks_queued, target_chunks, elapsed_ms);
+        }
         log::info!("HCS soft: async reload queued {} experts ({:.1} MB, {}/{} chunks, batch DMA) in {:.1}ms",
             queued, alloc_mb, chunks_queued, target_chunks, elapsed_ms);
 
@@ -13578,8 +13697,10 @@ impl GpuDecodeStore {
         hcs.num_cached += activated;
         self.last_soft_reload_activated = activated;
 
-        eprintln!("  \x1b[32mHCS soft: async reload complete — {} experts activated ({}/{} chunks)\x1b[0m",
-            activated, hcs.soft_chunks_loaded, hcs.soft_total_chunks);
+        if stderr_debug_enabled() {
+            eprintln!("  \x1b[32mHCS soft: async reload complete — {} experts activated ({}/{} chunks)\x1b[0m",
+                activated, hcs.soft_chunks_loaded, hcs.soft_total_chunks);
+        }
         log::info!("HCS soft: async reload complete — {} experts activated ({}/{} chunks)",
             activated, hcs.soft_chunks_loaded, hcs.soft_total_chunks);
 
@@ -13634,8 +13755,10 @@ impl GpuDecodeStore {
         hcs.num_cached += activated;
         self.last_soft_reload_activated = activated;
 
-        eprintln!("  \x1b[32mHCS soft: sync reload complete — {} experts ({}/{} chunks) in {:.1}ms real DMA\x1b[0m",
-            activated, hcs.soft_chunks_loaded, hcs.soft_total_chunks, real_dma_ms);
+        if stderr_debug_enabled() {
+            eprintln!("  \x1b[32mHCS soft: sync reload complete — {} experts ({}/{} chunks) in {:.1}ms real DMA\x1b[0m",
+                activated, hcs.soft_chunks_loaded, hcs.soft_total_chunks, real_dma_ms);
+        }
         log::info!("HCS soft: sync reload complete — {} experts ({}/{} chunks) in {:.1}ms real DMA",
             activated, hcs.soft_chunks_loaded, hcs.soft_total_chunks, real_dma_ms);
 
@@ -13665,7 +13788,9 @@ impl GpuDecodeStore {
     {
         use std::time::Instant;
 
-        eprintln!("[krasis] gpu_generate_stream called: first_token={}, start_pos={}, max_tokens={}", first_token, start_position, max_tokens);
+        if stderr_debug_enabled() {
+            eprintln!("[krasis] gpu_generate_stream called: first_token={}, start_pos={}, max_tokens={}", first_token, start_position, max_tokens);
+        }
 
         let decode_diag = std::env::var("KRASIS_DECODE_DIAG").map(|v| v == "1").unwrap_or(false);
 
@@ -13741,11 +13866,13 @@ impl GpuDecodeStore {
         // If stable, reuse graphs (skip ~30-40ms recapture overhead per request).
         // If pointers moved (shouldn't happen), fall back to invalidate + recapture.
         if self.verify_graph_pointers() {
-            eprintln!("[krasis] CUDA graphs reused from previous request (ptrs verified stable)");
+            if stderr_debug_enabled() {
+                eprintln!("[krasis] CUDA graphs reused from previous request (ptrs verified stable)");
+            }
         } else {
             let was_captured = self.graph.as_ref()
                 .map(|g| g.graphs_ever_captured).unwrap_or(false);
-            if was_captured {
+            if was_captured && stderr_debug_enabled() {
                 eprintln!("[krasis] CUDA graph ptrs changed — invalidating, will recapture");
             }
             self.invalidate_cuda_graph();
@@ -13852,7 +13979,9 @@ impl GpuDecodeStore {
             let needs_init = self.graph.as_ref().map(|g| g.d_graph_token_id.is_none()).unwrap_or(false);
             if needs_init {
                 match self.init_cuda_graph_buffers() {
-                    Ok(()) => eprintln!("[krasis] CUDA graph buffers initialized"),
+                    Ok(()) => {
+                        if stderr_debug_enabled() { eprintln!("[krasis] CUDA graph buffers initialized"); }
+                    }
                     Err(e) => eprintln!("[krasis] CUDA graph init failed: {}", e),
                 }
             }
@@ -14263,12 +14392,16 @@ impl GpuDecodeStore {
                     // Try to capture per-layer CUDA graphs after first token
                     let _has_graph_bufs = self.graph.as_ref()
                         .map(|g| g.d_graph_token_id.is_some()).unwrap_or(false);
-                    eprintln!("[krasis] step={} has_graph_bufs={}", step, _has_graph_bufs);
+                    if stderr_debug_enabled() {
+                        eprintln!("[krasis] step={} has_graph_bufs={}", step, _has_graph_bufs);
+                    }
                     let no_graph = std::env::var("KRASIS_NO_GRAPH").map(|v| v != "0").unwrap_or(false);
                     if step == 0 && _has_graph_bufs && !no_graph
                     {
                         match self.capture_per_layer_graphs(None, true, true, 0) {
-                            Ok(()) => eprintln!("[krasis] Per-layer CUDA graphs captured after token 0"),
+                            Ok(()) => {
+                                if stderr_debug_enabled() { eprintln!("[krasis] Per-layer CUDA graphs captured after token 0"); }
+                            }
                             Err(e) => eprintln!("[krasis] Per-layer graph capture failed: {}, continuing ungraphed", e),
                         }
                     }
@@ -14744,17 +14877,25 @@ impl GpuDecodeStore {
             let se_k_w13 = graph.hidden_size;
             let expected_bf16 = se_k_w13 * se_n_w13 * 2;
             let expected_int8 = se_k_w13 * se_n_w13;
-            eprintln!("[SHARED_EXPERT_BITS] layer={} packed={} expected_bf16={} expected_int8={} moe_inter={} hidden={}",
-                layer_idx, se.w13_packed_bytes, expected_bf16, expected_int8, graph.moe_intermediate_size, graph.hidden_size);
+            if stderr_debug_enabled() {
+                eprintln!("[SHARED_EXPERT_BITS] layer={} packed={} expected_bf16={} expected_int8={} moe_inter={} hidden={}",
+                    layer_idx, se.w13_packed_bytes, expected_bf16, expected_int8, graph.moe_intermediate_size, graph.hidden_size);
+            }
             if se.w13_packed_bytes >= expected_bf16 {
                 graph.shared_expert_bits = 16;
-                eprintln!("[SHARED_EXPERT_BITS] => BF16 (bits=16)");
+                if stderr_debug_enabled() {
+                    eprintln!("[SHARED_EXPERT_BITS] => BF16 (bits=16)");
+                }
             } else if se.w13_packed_bytes >= expected_int8 {
                 graph.shared_expert_bits = 8;
-                eprintln!("[SHARED_EXPERT_BITS] => INT8 (bits=8)");
+                if stderr_debug_enabled() {
+                    eprintln!("[SHARED_EXPERT_BITS] => INT8 (bits=8)");
+                }
             } else {
                 graph.shared_expert_bits = 4;
-                eprintln!("[SHARED_EXPERT_BITS] => INT4 (bits=4)");
+                if stderr_debug_enabled() {
+                    eprintln!("[SHARED_EXPERT_BITS] => INT4 (bits=4)");
+                }
             }
 
             let total_bytes_se = se.w13_packed_bytes + se.w13_scales_bytes
@@ -17175,7 +17316,7 @@ impl GpuDecodeStore {
                         w13p_bytes, w13s_bytes, w2p_bytes, w2s_bytes, total as f64 / 1024.0,
                     );
                     // BF16 diagnostic: verify CPU data at the pointer
-                    if expert.num_bits == 16 {
+                    if expert.num_bits == 16 && stderr_debug_enabled() {
                         let cpu_data = unsafe { std::slice::from_raw_parts(w13p_ptr as *const u16, 8) };
                         let vals: Vec<f32> = cpu_data.iter().map(|&v| half::bf16::from_bits(v).to_f32()).collect();
                         eprintln!("[BF16-DMA] Expert[0][0] CPU w13p first8={:.4?} (ptr=0x{:x}, bytes={})",
@@ -18026,10 +18167,14 @@ impl GpuDecodeStore {
                 let gpu_vals: Vec<f32> = gpu_check.iter().map(|&v| half::bf16::from_bits(v).to_f32()).collect();
                 let cpu_data = unsafe { std::slice::from_raw_parts(expert.w13_packed_ptr as *const u16, 8) };
                 let cpu_vals: Vec<f32> = cpu_data.iter().map(|&v| half::bf16::from_bits(v).to_f32()).collect();
-                eprintln!("[HCS-VERIFY] L{}E{} GPU first8={:.4?}", layer_idx, expert_idx, gpu_vals);
-                eprintln!("[HCS-VERIFY] L{}E{} CPU first8={:.4?}", layer_idx, expert_idx, cpu_vals);
+                if stderr_debug_enabled() {
+                    eprintln!("[HCS-VERIFY] L{}E{} GPU first8={:.4?}", layer_idx, expert_idx, gpu_vals);
+                    eprintln!("[HCS-VERIFY] L{}E{} CPU first8={:.4?}", layer_idx, expert_idx, cpu_vals);
+                }
                 let match_ok = gpu_vals == cpu_vals;
-                eprintln!("[HCS-VERIFY] Match: {}", match_ok);
+                if stderr_debug_enabled() {
+                    eprintln!("[HCS-VERIFY] Match: {}", match_ok);
+                }
             }
 
             let entry = HcsCacheEntry {
