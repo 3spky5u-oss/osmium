@@ -5,6 +5,10 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(has_marlin_kernels)");
     println!("cargo::rustc-check-cfg=cfg(has_flash_attn_kernels)");
 
+    // Force rerun when env changes (e.g. CUDA_HOME)
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
+
     // Probe for libnuma — link only if the library is found.
     // The runtime code (numa.rs) checks numa_available() and falls back
     // gracefully, but the linker needs -lnuma at build time if we use
@@ -166,8 +170,6 @@ fn compile_cuda_kernels() {
             println!("cargo:warning=nvcc execution error: {e} — GPU decode kernels disabled");
         }
     }
-
-    println!("cargo:rerun-if-changed={cu_src}");
 }
 
 fn compile_prefill_kernels() {
@@ -373,6 +375,27 @@ fn compile_flash_attn_kernels() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let so_path = format!("{out_dir}/libkrasis_flash_attn.so");
 
+    // Skip if .so is newer than all FA2 header sources.
+    // The .cu template instantiation files are generated and never edited,
+    // so we only need to check the headers that contain the actual kernel logic.
+    let fa_sources_owned: Vec<String> = vec![
+        vendor_src.clone(),
+        format!("{fa_dir}/flash_attn_vendor.h"),
+        format!("{fa_dir}/flash.h"),
+        format!("{fa_dir}/flash_fwd_kernel.h"),
+        format!("{fa_dir}/flash_fwd_launch_template.h"),
+        format!("{fa_dir}/kernel_traits.h"),
+        format!("{fa_dir}/softmax.h"),
+        format!("{fa_dir}/mask.h"),
+        format!("{fa_dir}/utils.h"),
+    ];
+    let fa_sources: Vec<&str> = fa_sources_owned.iter().map(|s| s.as_str()).collect();
+    if output_is_fresh(&so_path, &fa_sources) {
+        println!("cargo:rustc-cfg=has_flash_attn_kernels");
+        println!("cargo:warning=FlashAttention .so is fresh — skipping nvcc (21 files)");
+        return;
+    }
+
     // Include paths: FA2 source dir + vendored CUTLASS headers
     let common_args = vec![
         "--expt-relaxed-constexpr".to_string(),
@@ -493,6 +516,8 @@ fn compile_flash_attn_kernels() {
     }
 }
 
+/// Returns true if `output` exists and is newer than every file in `sources`.
+/// Used to skip expensive CUDA recompilation when only unrelated sources changed.
 fn find_nvcc() -> Option<String> {
     // Check CUDA_HOME / CUDA_PATH
     for var in ["CUDA_HOME", "CUDA_PATH"] {

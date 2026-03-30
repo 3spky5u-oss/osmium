@@ -931,7 +931,8 @@ fn handle_prefill_logits(
     } else if let Some(messages) = req.get("messages") {
         let messages_json = messages.to_string();
         let enable_thinking = req.get("enable_thinking").and_then(|v| v.as_bool()).unwrap_or(false);
-        let rendered = match state.chat_template.apply(&messages_json, enable_thinking) {
+        // Always add generation prompt — enable_thinking controls suppression, not template
+        let rendered = match state.chat_template.apply(&messages_json, true) {
             Ok(r) => r,
             Err(e) => {
                 let _ = send_json(stream, 500, &format!(r#"{{"error":"Chat template: {}"}}"#, e));
@@ -2090,8 +2091,10 @@ impl RustServer {
             format!("Failed to load chat template: {}", e)))?;
 
         // Estimate tokens by applying actual chat template and tokenizing
+        // Always add the generation prompt (assistant turn prefix) — enable_thinking
+        // controls thinking suppression later, not template rendering.
         let estimated_tokens = {
-            let rendered = chat_template.apply(&messages_json, enable_thinking)
+            let rendered = chat_template.apply(&messages_json, true)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("Chat template failed: {}", e)))?;
             tokenizer.encode(rendered.as_str(), false)
@@ -2125,9 +2128,9 @@ impl RustServer {
             engine.update_hcs_snapshot(cache_fast, ne);
         }
 
-        // Tokenize using Rust tokenizer
+        // Tokenize using Rust tokenizer (always with generation prompt)
         let token_ids: Vec<u32> = {
-            let rendered = chat_template.apply(&messages_json, enable_thinking)
+            let rendered = chat_template.apply(&messages_json, true)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                     format!("Chat template failed: {}", e)))?;
             let encoding = tokenizer.encode(rendered.as_str(), true)

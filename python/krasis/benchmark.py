@@ -186,7 +186,13 @@ class KrasisBenchmark:
         else:
             decode_mode = f"pure_cpu decode, {expert_mode} prefill"
 
-        kv_dtype_str = "FP8 E4M3" if self.model.kv_dtype == torch.float8_e4m3fn else "BF16"
+        kv_format = getattr(qcfg, 'kv_cache_format', None)
+        if kv_format == "polar4":
+            kv_dtype_str = "Polar4"
+        elif kv_format == "bf16":
+            kv_dtype_str = "BF16"
+        else:
+            kv_dtype_str = "FP8 E4M3"
         num_gpus_used = getattr(self.model, '_num_gpus', len(self.model.pp_partition))
 
         return {
