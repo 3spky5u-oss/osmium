@@ -6194,14 +6194,13 @@ extern "C" __global__ void gqa_attention_polar4_tiled_g(
     }
     __syncthreads();
 
-    // Apply Hadamard transform to Q in shared memory (one thread per 16-element block)
-    for (int b = 0; b < blocks_per_head; b++) {
-        if (tid == b) {
-            float q_local[16];
-            for (int i = 0; i < 16; i++) q_local[i] = s_q[b*16+i] * polar4_signs[i];
-            fht16(q_local);
-            for (int i = 0; i < 16; i++) s_q[b*16+i] = q_local[i] * 0.25f;
-        }
+    // Apply Hadamard transform to Q in shared memory (all blocks in parallel)
+    if (tid < blocks_per_head) {
+        int b = tid;
+        float q_local[16];
+        for (int i = 0; i < 16; i++) q_local[i] = s_q[b*16+i] * polar4_signs[i];
+        fht16(q_local);
+        for (int i = 0; i < 16; i++) s_q[b*16+i] = q_local[i] * 0.25f;
     }
     __syncthreads();
 
@@ -6357,16 +6356,15 @@ extern "C" __global__ void gqa_attention_polar4_reduce_g(
     }
     __syncthreads();
 
-    // Inverse Hadamard transform + sign flip (one thread per 16-element block)
+    // Inverse Hadamard transform + sign flip (all blocks in parallel)
     int blocks_per_head = head_dim / 16;
-    for (int b = 0; b < blocks_per_head; b++) {
-        if (tid == b) {
-            float o_local[16];
-            for (int i = 0; i < 16; i++) o_local[i] = s_merged[b*16+i];
-            fht16(o_local);
-            for (int i = 0; i < 16; i++) {
-                output[qh * head_dim + b*16 + i] = o_local[i] * 0.25f * polar4_signs[i];
-            }
+    if (tid < blocks_per_head) {
+        int b = tid;
+        float o_local[16];
+        for (int i = 0; i < 16; i++) o_local[i] = s_merged[b*16+i];
+        fht16(o_local);
+        for (int i = 0; i < 16; i++) {
+            output[qh * head_dim + b*16 + i] = o_local[i] * 0.25f * polar4_signs[i];
         }
     }
 }
