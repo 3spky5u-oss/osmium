@@ -390,9 +390,9 @@ fn compile_flash_attn_kernels() {
         format!("{fa_dir}/utils.h"),
     ];
     let fa_sources: Vec<&str> = fa_sources_owned.iter().map(|s| s.as_str()).collect();
-    if output_is_fresh(&so_path, &fa_sources) {
+    if is_output_fresh(&fa_sources, &[&so_path]) {
         println!("cargo:rustc-cfg=has_flash_attn_kernels");
-        println!("cargo:warning=FlashAttention .so is fresh — skipping nvcc (21 files)");
+        println!("cargo:warning=Reusing cached FlashAttention kernels at {so_path}");
         return;
     }
 
