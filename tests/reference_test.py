@@ -129,6 +129,10 @@ def start_server(conf_path: str, script_dir: str) -> Tuple[subprocess.Popen, int
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    # Reference testing cares about correctness, not startup VRAM profiling.
+    # Cap the long startup probe so test-endpoint runs do not stall in the
+    # server's heavyweight calibration path before the first request.
+    env.setdefault("KRASIS_STARTUP_CALIBRATION_LONG_TOKENS_CAP", "4000")
 
     # Redirect server output to a file instead of PIPE to avoid pipe-buffer
     # deadlock: the server writes diagnostic output to stdout/stderr, and if

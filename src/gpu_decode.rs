@@ -5475,6 +5475,11 @@ impl GpuDecodeStore {
         self.suppress_tokens = token_ids;
     }
 
+    /// Return the currently configured suppress-token list for reuse by Rust prefill.
+    pub fn suppress_tokens_clone(&self) -> Vec<u32> {
+        self.suppress_tokens.iter().map(|&t| t as u32).collect()
+    }
+
     /// Set min_new_tokens: stop tokens are suppressed for the first N decode steps.
     /// Set stop_ids each request via set_min_new_tokens_stop_ids before decode.
     fn set_min_new_tokens(&mut self, n: usize) {

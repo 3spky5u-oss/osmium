@@ -79,9 +79,9 @@ def _warn(text: str) -> None:
 _model: Optional[KrasisModel] = None
 _model_name: str = "unknown"
 
-STARTUP_CALIBRATION_SHORT_TOKENS = 500
-STARTUP_CALIBRATION_DECODE_TOKENS = 32
-STARTUP_CALIBRATION_LONG_TOKENS_CAP = 50000
+STARTUP_CALIBRATION_SHORT_TOKENS = int(os.environ.get("KRASIS_STARTUP_CALIBRATION_SHORT_TOKENS", "500"))
+STARTUP_CALIBRATION_DECODE_TOKENS = int(os.environ.get("KRASIS_STARTUP_CALIBRATION_DECODE_TOKENS", "32"))
+STARTUP_CALIBRATION_LONG_TOKENS_CAP = int(os.environ.get("KRASIS_STARTUP_CALIBRATION_LONG_TOKENS_CAP", "50000"))
 
 
 def _env_int(name: str, default: int, minimum: int = 1) -> int:
@@ -829,7 +829,8 @@ def main():
     num_layers = cfg.num_hidden_layers
     num_gpus_available = args.num_gpus or torch.cuda.device_count()
 
-    # GPU decode is the only mode — skip CPU expert weights + CPU decoder
+    # GPU decode is the only supported serving mode here. Do not load CPU expert
+    # weights or enable any CPU-side fallback path.
     gpu_only = True
 
     # ── Configuration summary ──

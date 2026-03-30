@@ -703,10 +703,14 @@ fn handle_chat_completion(
             return;
         }
 
+        let suppress_tokens = {
+            let store = unsafe { &*(state.gpu_store_addr as *const GpuDecodeStore) };
+            store.suppress_tokens_clone()
+        };
         let result = engine.run_prefill(
             &token_ids,
             temperature,
-            &[], // suppress tokens handled by decode
+            &suppress_tokens,
         );
 
         // Release scratch to free VRAM for decode/HCS
@@ -993,6 +997,9 @@ fn handle_prefill_logits(
             let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
             let _ = store.hcs_reload_after_prefill_async(token_ids.len());
             let _ = store.hcs_sync_soft_reload();
+            Python::with_gil(|py| {
+                let _ = state.py_model.call_method0(py, "server_cleanup");
+            });
             let _ = send_json(stream, 500, &format!(r#"{{"error":"Prefill logits: {}"}}"#, e));
             return;
         }
@@ -1008,6 +1015,12 @@ fn handle_prefill_logits(
     let store = unsafe { &mut *(state.gpu_store_addr as *mut GpuDecodeStore) };
     let _ = store.hcs_reload_after_prefill_async(token_ids.len());
     let _ = store.hcs_sync_soft_reload();
+
+    // Match the normal reference/inference cleanup path so diagnostic prefill
+    // requests do not leak sequence state into the next prompt.
+    Python::with_gil(|py| {
+        let _ = state.py_model.call_method0(py, "server_cleanup");
+    });
 
     // Format response: {positions: [{position, top_k: [{token_id, logprob}]}]}
     let mut pos_json = Vec::new();
@@ -1106,10 +1119,14 @@ fn handle_reference_test(
     }
 
     // Run prefill with temperature=0 (greedy)
+    let suppress_tokens = {
+        let store = unsafe { &*(state.gpu_store_addr as *const GpuDecodeStore) };
+        store.suppress_tokens_clone()
+    };
     let prefill_result = engine.run_prefill(
         &input_token_ids,
         0.0, // temperature=0 for greedy
-        &[], // no suppress tokens
+        &suppress_tokens,
     );
 
     // Release scratch to free VRAM for decode/HCS
@@ -2135,10 +2152,11 @@ impl RustServer {
                 format!("Scratch alloc failed: {}", e)));
         }
 
+        let suppress_tokens = store.suppress_tokens_clone();
         let prefill_result = engine.run_prefill(
             &token_ids,
             temperature,
-            &[],
+            &suppress_tokens,
         ).map_err(|e| {
             engine.clear_prefill_hcs_guard_store_addr();
             pyo3::exceptions::PyRuntimeError::new_err(
