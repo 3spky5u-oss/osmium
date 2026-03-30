@@ -635,9 +635,9 @@ def main():
     parser.add_argument("--port", type=int, default=8012)
     parser.add_argument("--krasis-threads", type=int, default=40,
                         help="CPU threads for expert computation")
-    parser.add_argument("--kv-dtype", default="fp8_e4m3",
-                        choices=["bf16", "fp8_e4m3", "polar4"],
-                        help="KV cache format: bf16 (uncompressed), fp8_e4m3 (standard), polar4 (4-bit PolarQuant)")
+    parser.add_argument("--kv-dtype", default="polar4",
+                        choices=["polar4", "fp8_e4m3", "bf16"],
+                        help="KV cache format: polar4 (4-bit PolarQuant, default), fp8_e4m3 (8-bit), bf16 (uncompressed)")
     parser.add_argument("--kv-cache-mb", type=int, default=1000,
                         help="KV cache size in MB (default: 1000)")
     parser.add_argument("--heatmap-path", default=None,

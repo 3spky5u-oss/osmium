@@ -52,7 +52,7 @@ class SuiteCombo:
     shared_expert_quant: str = "int8"
     dense_mlp_quant: str = "int8"
     lm_head_quant: str = "int8"
-    kv_dtype: str = "fp8_e4m3"
+    kv_dtype: str = "polar4"
     krasis_threads: int = 40
     gguf_path: str = ""
     layer_group_size: int = 2

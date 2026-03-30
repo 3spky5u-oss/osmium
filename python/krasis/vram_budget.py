@@ -295,7 +295,7 @@ def compute_launcher_budget(
     model_path: str,
     pp_partition: List[int],
     layer_group_size: int = 1,
-    kv_dtype: str = "fp8_e4m3",
+    kv_dtype: str = "polar4",
     gpu_expert_bits: int = 4,
     attention_quant: str = "bf16",
     shared_expert_quant: str = "int8",

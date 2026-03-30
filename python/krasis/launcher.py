@@ -386,7 +386,7 @@ class LauncherConfig:
         self.pp_partition: str = ""
         self.layer_group_size: int = 2  # layers per group (must be even, min 2 for double buffering)
         self.kv_cache_mb: int = 1000
-        self.kv_dtype: str = "fp8_e4m3"
+        self.kv_dtype: str = "polar4"
         self.gpu_expert_bits: int = 4
         self.cpu_expert_bits: int = 4
         self.attention_quant: str = "bf16"
@@ -443,7 +443,7 @@ class LauncherConfig:
             except ValueError:
                 pass
         if "CFG_KV_DTYPE" in saved:
-            self.kv_dtype = "fp8_e4m3"
+            self.kv_dtype = saved["CFG_KV_DTYPE"]
         if "CFG_GPU_EXPERT_BITS" in saved:
             try:
                 self.gpu_expert_bits = int(saved["CFG_GPU_EXPERT_BITS"])
@@ -570,7 +570,7 @@ OPTIONS = [
     ConfigOption("KV cache (MB)", "kv_cache_mb",
                  opt_type="number", min_val=200, max_val=65500, step=100, affects_budget=True),
     ConfigOption("KV dtype", "kv_dtype",
-                 choices=["fp8_e4m3", "polar4", "bf16"], affects_budget=True),
+                 choices=["polar4", "fp8_e4m3", "bf16"], affects_budget=True),
     ConfigOption("GPU expert bits", "gpu_expert_bits",
                  choices=[4, 8], affects_budget=True),
     ConfigOption("Attention quant", "attention_quant",
@@ -1666,7 +1666,7 @@ def _apply_cli_overrides(cfg: LauncherConfig, args: argparse.Namespace) -> None:
     if args.vram_safety_margin is not None:
         cfg.vram_safety_margin = max(500, args.vram_safety_margin)
     if args.kv_dtype is not None:
-        cfg.kv_dtype = "fp8_e4m3"
+        cfg.kv_dtype = args.kv_dtype
     if args.gpu_expert_bits is not None:
         cfg.gpu_expert_bits = args.gpu_expert_bits
     if args.attention_quant is not None:
