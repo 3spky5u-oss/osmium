@@ -146,6 +146,8 @@ const KERNEL_NAMES: &[&str] = &[
     // 4-bit PolarQuant kernels
     "kv_cache_write_polar4",
     "gqa_attention_polar4",
+    "kv_cache_write_polar4_g",
+    "gqa_attention_polar4_g",
 ];
 
 const MODULE_NAME: &str = "decode_kernels";
@@ -1390,6 +1392,8 @@ struct CachedKernels {
     // 4-bit PolarQuant kernels
     kv_cache_write_polar4: cudarc::driver::CudaFunction,
     gqa_attention_polar4: cudarc::driver::CudaFunction,
+    kv_cache_write_polar4_g: cudarc::driver::CudaFunction,
+    gqa_attention_polar4_g: cudarc::driver::CudaFunction,
     // Mamba2 SSM kernels (Nemotron-H)
     mamba2_conv1d: cudarc::driver::CudaFunction,
     mamba2_ssm_step: cudarc::driver::CudaFunction,
@@ -1781,6 +1785,9 @@ struct GpuDecodeGraph {
     /// Snapshot of MLA KV cache pointers at capture time (ckv_cache + kpe_cache).
     /// Vec of (layer_idx, ckv_cache_ptr, kpe_cache_ptr).
     captured_mla_ptrs: Vec<(usize, u64, u64)>,
+    /// Snapshot of Polar4 KV cache pointers at capture time (k_radius, v_radius, k_angles, v_angles).
+    /// Vec of (layer_idx, k_radius_ptr, v_radius_ptr, k_angles_ptr, v_angles_ptr).
+    captured_polar4_ptrs: Vec<(usize, u64, u64, u64, u64)>,
     /// MoE layer indices (which layers have MoE data).
     per_layer_moe_indices: Vec<usize>,
     /// Persistent cuBLAS workspace for CUDA graph capture (prevents internal cudaMalloc).
@@ -2655,6 +2662,7 @@ impl GpuDecodeStore {
             captured_la_ptrs: Vec::new(),
             captured_kv_ptrs: Vec::new(),
             captured_mla_ptrs: Vec::new(),
+            captured_polar4_ptrs: Vec::new(),
             per_layer_moe_indices: Vec::new(),
             d_cublas_workspace: None,
         }));
@@ -2738,6 +2746,8 @@ impl GpuDecodeStore {
                 // 4-bit PolarQuant kernels
                 kv_cache_write_polar4: get("kv_cache_write_polar4")?,
                 gqa_attention_polar4: get("gqa_attention_polar4")?,
+                kv_cache_write_polar4_g: get("kv_cache_write_polar4_g")?,
+                gqa_attention_polar4_g: get("gqa_attention_polar4_g")?,
                 // Mamba2 SSM kernels
                 mamba2_conv1d: get("mamba2_conv1d")?,
                 mamba2_ssm_step: get("mamba2_ssm_step")?,
@@ -7952,6 +7962,26 @@ impl GpuDecodeStore {
             }
         }
 
+        // Check Polar4 KV cache pointers
+        for &(li, cap_kr, cap_vr, cap_ka, cap_va) in &graph.captured_polar4_ptrs {
+            if li >= graph.kv_k_radius_ptrs.len() {
+                if stderr_debug_enabled() {
+                    eprintln!("[krasis] graph-reuse: Polar4 layer {} out of range", li);
+                }
+                return false;
+            }
+            if graph.kv_k_radius_ptrs[li] != cap_kr
+                || graph.kv_v_radius_ptrs[li] != cap_vr
+                || graph.kv_k_angles_ptrs[li] != cap_ka
+                || graph.kv_v_angles_ptrs[li] != cap_va
+            {
+                if stderr_debug_enabled() {
+                    eprintln!("[krasis] graph-reuse: Polar4 layer {} ptrs changed!", li);
+                }
+                return false;
+            }
+        }
+
         true
     }
 
@@ -8206,13 +8236,25 @@ impl GpuDecodeStore {
         graph.captured_la_ptrs.clear();
         graph.captured_kv_ptrs.clear();
         graph.captured_mla_ptrs.clear();
+        graph.captured_polar4_ptrs.clear();
         for (li, layer) in graph.layers.iter().enumerate() {
             match &layer.attn {
                 GpuAttnConfig::LinearAttention { conv_state_ptr, recur_state_ptr, .. } => {
                     graph.captured_la_ptrs.push((li, *conv_state_ptr, *recur_state_ptr));
                 }
                 GpuAttnConfig::GQA { .. } => {
-                    if li < graph.kv_k_ptrs.len() && graph.kv_k_ptrs[li] != 0 {
+                    if graph.kv_format == 2 {
+                        // Polar4: track radius/angles pointers
+                        if li < graph.kv_k_radius_ptrs.len() && graph.kv_k_radius_ptrs[li] != 0 {
+                            graph.captured_polar4_ptrs.push((
+                                li,
+                                graph.kv_k_radius_ptrs[li],
+                                graph.kv_v_radius_ptrs[li],
+                                graph.kv_k_angles_ptrs[li],
+                                graph.kv_v_angles_ptrs[li],
+                            ));
+                        }
+                    } else if li < graph.kv_k_ptrs.len() && graph.kv_k_ptrs[li] != 0 {
                         graph.captured_kv_ptrs.push((li, graph.kv_k_ptrs[li], graph.kv_v_ptrs[li]));
                     }
                 }
@@ -8227,8 +8269,9 @@ impl GpuDecodeStore {
             }
         }
         if stderr_debug_enabled() {
-            eprintln!("[krasis] Pointer snapshot: {} LA ptrs, {} KV ptrs, {} MLA ptrs",
-                graph.captured_la_ptrs.len(), graph.captured_kv_ptrs.len(), graph.captured_mla_ptrs.len());
+            eprintln!("[krasis] Pointer snapshot: {} LA ptrs, {} KV ptrs, {} MLA ptrs, {} Polar4 ptrs",
+                graph.captured_la_ptrs.len(), graph.captured_kv_ptrs.len(),
+                graph.captured_mla_ptrs.len(), graph.captured_polar4_ptrs.len());
         }
 
         self.graph = Some(graph);
@@ -8834,7 +8877,26 @@ impl GpuDecodeStore {
                         }
 
                         // KV cache write
-                        {
+                        if graph.kv_format == 2 {
+                            // Polar4: structured rotation + 4-bit quantization
+                            let num_blocks = graph.kv_num_blocks;
+                            let threads = 256u32;
+                            let blocks = ((num_blocks as u32) + threads - 1) / threads;
+                            unsafe {
+                                k.kv_cache_write_polar4_g.clone().launch(
+                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                    (
+                                        graph.kv_k_radius_ptrs[layer_idx],
+                                        graph.kv_v_radius_ptrs[layer_idx],
+                                        graph.kv_k_angles_ptrs[layer_idx],
+                                        graph.kv_v_angles_ptrs[layer_idx],
+                                        *graph.d_gqa_k.device_ptr(),
+                                        *graph.d_gqa_v.device_ptr(),
+                                        d_pos_ptr, kv_stride as i32,
+                                    ),
+                                ).map_err(|e| format!("kv_cache_write_polar4_g[{}]: {:?}", layer_idx, e))?;
+                            }
+                        } else {
                             let threads = 256u32;
                             let blocks = ((kv_stride as u32) + threads - 1) / threads;
                             unsafe {
@@ -8851,8 +8913,36 @@ impl GpuDecodeStore {
                             }
                         }
 
-                        // GQA attention (tiled + reduce for SM utilization + single K read)
-                        {
+                        // GQA attention
+                        if graph.kv_format == 2 {
+                            // Polar4 attention: single-block-per-head kernel (graph-compatible)
+                            let threads = 256u32;
+                            let num_blocks = graph.kv_num_blocks;
+                            let num_warps = threads / 32;
+                            let shared_mem_bytes = ((hd as u32) * (num_warps + 1) + 2 * num_warps) * 4 + 128;
+                            unsafe {
+                                k.gqa_attention_polar4_g.clone().launch(
+                                    LaunchConfig {
+                                        grid_dim: (nh as u32, 1, 1),
+                                        block_dim: (threads, 1, 1),
+                                        shared_mem_bytes,
+                                    },
+                                    (
+                                        *graph.d_gqa_out.device_ptr(),
+                                        *graph.d_gqa_q.device_ptr(),
+                                        graph.kv_k_radius_ptrs[layer_idx],
+                                        graph.kv_v_radius_ptrs[layer_idx],
+                                        graph.kv_k_angles_ptrs[layer_idx],
+                                        graph.kv_v_angles_ptrs[layer_idx],
+                                        *sm_scale,
+                                        nh as i32, nkv as i32, hd as i32,
+                                        d_seq_len_ptr,
+                                        graph.kv_max_seq as i32,
+                                    ),
+                                ).map_err(|e| format!("gqa_attention_polar4_g[{}]: {:?}", layer_idx, e))?;
+                            }
+                        } else {
+                            // FP8 attention (tiled + reduce for SM utilization + single K read)
                             let threads = 256u32;
                             let tile_size = graph.gqa_tile_size;
                             let max_tiles = graph.gqa_max_tiles;
@@ -11798,9 +11888,7 @@ impl GpuDecodeStore {
         }
 
         // Initialize CUDA graph buffers on all stores
-        // Polar4 KV cache doesn't have graph-compatible kernels yet, disable graphs
-        let polar4_active = self.graph.as_ref().map(|g| g.kv_format == 2).unwrap_or(false);
-        let no_graph = polar4_active || std::env::var("KRASIS_NO_GRAPH").map(|v| v != "0").unwrap_or(false);
+        let no_graph = std::env::var("KRASIS_NO_GRAPH").map(|v| v != "0").unwrap_or(false);
         {
             // GPU0 graph buffers
             if let Err(e) = self.device.bind_to_thread() {
@@ -11862,13 +11950,8 @@ impl GpuDecodeStore {
                 }
                 let t_start = Instant::now();
                 if let Err(e) = self.replay_per_layer_graphs(next_token, pos, false) {
-                    eprintln!("[krasis] GPU0 graph replay failed: {}, falling back", e);
-                    self.invalidate_cuda_graph();
-                    for &addr in aux_store_addrs.iter() {
-                        let s = unsafe { &mut *(addr as *mut GpuDecodeStore) };
-                        s.invalidate_cuda_graph();
-                    }
-                    continue;
+                    log::error!("multi-gpu: GPU0 graph replay failed (no ungraphed fallback): {}", e);
+                    break;
                 }
                 t_gpu_totals[0] += Instant::now().duration_since(t_start).as_secs_f64();
 
@@ -11903,12 +11986,7 @@ impl GpuDecodeStore {
                     let is_last = i + 1 == num_aux;
                     let t_gpu_start = Instant::now();
                     if let Err(e) = aux.replay_per_layer_graphs(next_token, pos, is_last) {
-                        eprintln!("[krasis] GPU{} graph replay failed: {}, falling back", i + 1, e);
-                        self.invalidate_cuda_graph();
-                        for &addr2 in aux_store_addrs.iter() {
-                            let s2 = unsafe { &mut *(addr2 as *mut GpuDecodeStore) };
-                            s2.invalidate_cuda_graph();
-                        }
+                        log::error!("multi-gpu: GPU{} graph replay failed (no ungraphed fallback): {}", i + 1, e);
                         step_ok = false; break;
                     }
                     t_gpu_totals[i + 1] += Instant::now().duration_since(t_gpu_start).as_secs_f64();
@@ -12011,7 +12089,10 @@ impl GpuDecodeStore {
                                 Ok(()) => {
                                     if stderr_debug_enabled() { eprintln!("[krasis] GPU0 per-layer graphs captured"); }
                                 }
-                                Err(e) => eprintln!("[krasis] GPU0 graph capture failed: {}", e),
+                                Err(e) => {
+                                    log::error!("multi-gpu: GPU0 graph capture failed (no ungraphed fallback): {}", e);
+                                    break;
+                                }
                             }
                         }
 
@@ -12028,7 +12109,10 @@ impl GpuDecodeStore {
                                     Ok(()) => {
                                         if stderr_debug_enabled() { eprintln!("[krasis] GPU{} per-layer graphs captured", i + 1); }
                                     }
-                                    Err(e) => eprintln!("[krasis] GPU{} graph capture failed: {}", i + 1, e),
+                                    Err(e) => {
+                                        log::error!("multi-gpu: GPU{} graph capture failed (no ungraphed fallback): {}", i + 1, e);
+                                        step_ok = false; break;
+                                    }
                                 }
                             }
                         }
@@ -15015,7 +15099,7 @@ impl GpuDecodeStore {
 
             } else {
                 // ── Normal (non-speculative) decode path ──
-                // Use per-layer CUDA graph replay when available, fall back to ungraphed.
+                // Per-layer CUDA graph replay. Graph failures are hard errors (no ungraphed fallback).
                 // Timing always uses the production path (graph replay) — never a separate code path.
                 let timing_enabled = self.graph.as_ref()
                     .map(|g| g.timing_enabled).unwrap_or(false);
@@ -15029,12 +15113,8 @@ impl GpuDecodeStore {
                     // Per-layer graph replay: handles sync/routing/DMA between graphs internally
                     let t_step = if timing_enabled { std::time::Instant::now() } else { std::time::Instant::now() };
                     if let Err(e) = self.replay_per_layer_graphs(next_token, pos, true) {
-                        eprintln!("[krasis] Per-layer graph replay failed: {}, falling back", e);
-                        self.invalidate_cuda_graph();
-                        if let Err(e) = self.gpu_decode_step(next_token, pos) {
-                            log::error!("gpu_generate_stream: decode_step error: {}", e);
-                            break;
-                        }
+                        log::error!("gpu_generate_stream: graph replay failed (no ungraphed fallback): {}", e);
+                        break;
                     } else if timing_enabled {
                         // Accumulate total step time for the timing report.
                         // Per-component breakdowns are not available in graph mode
@@ -15071,7 +15151,10 @@ impl GpuDecodeStore {
                                 if stderr_debug_enabled() { eprintln!("[krasis] Per-layer CUDA graphs captured after token 0"); }
                                 sample_min_vram(&mut min_vram_free_bytes);
                             }
-                            Err(e) => eprintln!("[krasis] Per-layer graph capture failed: {}, continuing ungraphed", e),
+                            Err(e) => {
+                                log::error!("Per-layer graph capture failed (no ungraphed fallback): {}", e);
+                                break;
+                            }
                         }
                     }
                 }
