@@ -6127,3 +6127,246 @@ extern "C" __global__ void gqa_attention_polar4_g(
         }
     }
 }
+
+// ── Tiled Polar4 GQA attention (graph-compatible) ─────────────────────
+//
+// Splits KV positions into tiles across grid.y, parallelising across SMs
+// just like gqa_attention_tiled_g does for FP8.  Each block computes a
+// partial softmax-weighted V sum (in the rotated Hadamard domain) for one
+// Q head × one tile.  A separate reduce kernel merges tiles and applies
+// the inverse Hadamard transform.
+//
+// Grid:  (num_q_heads, max_tiles, 1)   Block: (256, 1, 1)
+// Shared: (head_dim + tile_size + 32) * 4 bytes
+
+extern "C" __global__ void gqa_attention_polar4_tiled_g(
+    float* __restrict__ partial_o,     // [num_q_heads, max_tiles, head_dim]
+    float* __restrict__ partial_lse,   // [num_q_heads, max_tiles, 2] (max, sum_exp)
+    const float* __restrict__ q,       // [num_q_heads * head_dim]
+    const unsigned short* __restrict__ k_radius_cache,
+    const unsigned short* __restrict__ v_radius_cache,
+    const unsigned char* __restrict__ k_angles_cache,
+    const unsigned char* __restrict__ v_angles_cache,
+    float sm_scale,
+    int num_kv_heads,
+    int head_dim,
+    const int* __restrict__ d_seq_len,
+    int tile_size
+) {
+    // num_q_heads and max_tiles derived from grid dimensions
+    int num_q_heads = gridDim.x;
+    int max_tiles = gridDim.y;
+
+    int seq_len = *d_seq_len;
+    int qh = blockIdx.x;
+    int tile_idx = (int)blockIdx.y;
+    int num_tiles = (seq_len + tile_size - 1) / tile_size;
+    if (tile_idx >= num_tiles) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    int heads_per_kv = num_q_heads / num_kv_heads;
+    int kv_head = qh / heads_per_kv;
+    int num_blocks = (num_kv_heads * head_dim) / 16;
+    int block_offset_in_head = (kv_head * head_dim) / 16;
+    int blocks_per_head = head_dim / 16;
+
+    int tile_start = tile_idx * tile_size;
+    int tile_end = tile_start + tile_size;
+    if (tile_end > seq_len) tile_end = seq_len;
+    int tile_len = tile_end - tile_start;
+
+    // Shared memory layout: s_q | smem_scores | smem_reduce
+    extern __shared__ float smem[];
+    float* s_q = smem;
+    float* smem_scores = smem + head_dim;
+    float* smem_reduce = smem_scores + tile_size;
+
+    int warp_id = tid / warpSize;
+    int lane_id = tid % warpSize;
+    int num_warps = (num_threads + warpSize - 1) / warpSize;
+
+    // Preload Q into shared memory
+    const float* q_head = q + qh * head_dim;
+    for (int i = tid; i < head_dim; i += num_threads) {
+        s_q[i] = q_head[i];
+    }
+    __syncthreads();
+
+    // Apply Hadamard transform to Q in shared memory (one thread per 16-element block)
+    for (int b = 0; b < blocks_per_head; b++) {
+        if (tid == b) {
+            float q_local[16];
+            for (int i = 0; i < 16; i++) q_local[i] = s_q[b*16+i] * polar4_signs[i];
+            fht16(q_local);
+            for (int i = 0; i < 16; i++) s_q[b*16+i] = q_local[i] * 0.25f;
+        }
+    }
+    __syncthreads();
+
+    // Step 1: Q·K dot products for this tile
+    for (int i = tid; i < tile_len; i += num_threads) {
+        int pos = tile_start + i;
+        float score = 0.0f;
+        for (int b = 0; b < blocks_per_head; b++) {
+            int block_idx = block_offset_in_head + b;
+            float r = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+                &k_radius_cache[pos * num_blocks + block_idx]));
+            const unsigned char* angs = k_angles_cache + (pos * num_blocks + block_idx) * 8;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                unsigned char p = angs[j];
+                score += s_q[b*16 + j*2]   * r * polar4_codebook[p & 0xF];
+                score += s_q[b*16 + j*2+1] * r * polar4_codebook[p >> 4];
+            }
+        }
+        smem_scores[i] = score * sm_scale;
+    }
+    __syncthreads();
+
+    // Step 2: Tile max (parallel reduction)
+    float local_max = -1e30f;
+    for (int i = tid; i < tile_len; i += num_threads) {
+        local_max = fmaxf(local_max, smem_scores[i]);
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_max;
+    __syncthreads();
+    if (tid == 0) {
+        float gmax = smem_reduce[0];
+        for (int w = 1; w < num_warps; w++) gmax = fmaxf(gmax, smem_reduce[w]);
+        smem_reduce[0] = gmax;
+    }
+    __syncthreads();
+    float tile_max = smem_reduce[0];
+
+    // Step 3: exp(score - max) in-place, compute sum
+    float local_sum = 0.0f;
+    for (int i = tid; i < tile_len; i += num_threads) {
+        float w = expf(smem_scores[i] - tile_max);
+        smem_scores[i] = w;
+        local_sum += w;
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_sum;
+    __syncthreads();
+    if (tid == 0) {
+        float gsum = 0.0f;
+        for (int w = 0; w < num_warps; w++) gsum += smem_reduce[w];
+        smem_reduce[0] = gsum;
+    }
+    __syncthreads();
+    float tile_sum = smem_reduce[0];
+
+    // Step 4: Unnormalised weighted V sum (in rotated Hadamard domain)
+    float* out_partial = partial_o + (qh * max_tiles + tile_idx) * head_dim;
+    for (int d = tid; d < head_dim; d += num_threads) {
+        int b = d >> 4;  // d / 16
+        int block_idx = block_offset_in_head + b;
+        int sub_idx = d & 15;
+        int byte_idx = sub_idx >> 1;
+        bool is_high = (sub_idx & 1) != 0;
+        float acc = 0.0f;
+        for (int i = 0; i < tile_len; i++) {
+            int pos = tile_start + i;
+            float r = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(
+                &v_radius_cache[pos * num_blocks + block_idx]));
+            unsigned char p = v_angles_cache[(pos * num_blocks + block_idx) * 8 + byte_idx];
+            float v_val = is_high
+                ? r * polar4_codebook[p >> 4]
+                : r * polar4_codebook[p & 0xF];
+            acc += smem_scores[i] * v_val;
+        }
+        out_partial[d] = acc;
+    }
+
+    // Step 5: Store tile statistics
+    if (tid == 0) {
+        float* lse = partial_lse + (qh * max_tiles + tile_idx) * 2;
+        lse[0] = tile_max;
+        lse[1] = tile_sum;
+    }
+}
+
+// ── Polar4 tiled attention reduce (graph-compatible) ──────────────────
+//
+// Merges per-tile partial outputs using log-sum-exp correction, then
+// applies the inverse Hadamard transform + sign flip to produce the
+// final output in the original (non-rotated) domain.
+//
+// Grid: (num_q_heads, 1, 1)   Block: (256, 1, 1)
+// Shared: (max_tiles + head_dim) * 4 bytes
+
+extern "C" __global__ void gqa_attention_polar4_reduce_g(
+    float* __restrict__ output,            // [num_q_heads * head_dim]
+    const float* __restrict__ partial_o,   // [num_q_heads, max_tiles, head_dim]
+    const float* __restrict__ partial_lse, // [num_q_heads, max_tiles, 2]
+    int num_q_heads,
+    int head_dim,
+    const int* __restrict__ d_seq_len,
+    int tile_size,
+    int max_tiles
+) {
+    int seq_len = *d_seq_len;
+    int num_tiles = (seq_len + tile_size - 1) / tile_size;
+    int qh = blockIdx.x;
+    if (qh >= num_q_heads) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    // Shared memory: tile_weights[max_tiles] | s_merged[head_dim]
+    extern __shared__ float smem[];
+    float* tile_weights = smem;
+    float* s_merged = smem + max_tiles;
+
+    const float* lse = partial_lse + qh * max_tiles * 2;
+
+    // Thread 0 computes normalised correction weights
+    if (tid == 0) {
+        float global_max = -1e30f;
+        for (int t = 0; t < num_tiles; t++) {
+            global_max = fmaxf(global_max, lse[t * 2]);
+        }
+        float global_sum = 0.0f;
+        for (int t = 0; t < num_tiles; t++) {
+            float correction = expf(lse[t * 2] - global_max);
+            global_sum += correction * lse[t * 2 + 1];
+            tile_weights[t] = correction;
+        }
+        float inv_sum = 1.0f / (global_sum + 1e-12f);
+        for (int t = 0; t < num_tiles; t++) {
+            tile_weights[t] *= inv_sum;
+        }
+    }
+    __syncthreads();
+
+    // All threads merge tile partials into rotated-domain output
+    const float* po = partial_o + qh * max_tiles * head_dim;
+    for (int d = tid; d < head_dim; d += num_threads) {
+        float acc = 0.0f;
+        for (int t = 0; t < num_tiles; t++) {
+            acc += tile_weights[t] * po[t * head_dim + d];
+        }
+        s_merged[d] = acc;
+    }
+    __syncthreads();
+
+    // Inverse Hadamard transform + sign flip (one thread per 16-element block)
+    int blocks_per_head = head_dim / 16;
+    for (int b = 0; b < blocks_per_head; b++) {
+        if (tid == b) {
+            float o_local[16];
+            for (int i = 0; i < 16; i++) o_local[i] = s_merged[b*16+i];
+            fht16(o_local);
+            for (int i = 0; i < 16; i++) {
+                output[qh * head_dim + b*16 + i] = o_local[i] * 0.25f * polar4_signs[i];
+            }
+        }
+    }
+}

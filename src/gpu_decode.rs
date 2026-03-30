@@ -148,6 +148,8 @@ const KERNEL_NAMES: &[&str] = &[
     "gqa_attention_polar4",
     "kv_cache_write_polar4_g",
     "gqa_attention_polar4_g",
+    "gqa_attention_polar4_tiled_g",
+    "gqa_attention_polar4_reduce_g",
 ];
 
 const MODULE_NAME: &str = "decode_kernels";
@@ -1394,6 +1396,8 @@ struct CachedKernels {
     gqa_attention_polar4: cudarc::driver::CudaFunction,
     kv_cache_write_polar4_g: cudarc::driver::CudaFunction,
     gqa_attention_polar4_g: cudarc::driver::CudaFunction,
+    gqa_attention_polar4_tiled_g: cudarc::driver::CudaFunction,
+    gqa_attention_polar4_reduce_g: cudarc::driver::CudaFunction,
     // Mamba2 SSM kernels (Nemotron-H)
     mamba2_conv1d: cudarc::driver::CudaFunction,
     mamba2_ssm_step: cudarc::driver::CudaFunction,
@@ -2748,6 +2752,8 @@ impl GpuDecodeStore {
                 gqa_attention_polar4: get("gqa_attention_polar4")?,
                 kv_cache_write_polar4_g: get("kv_cache_write_polar4_g")?,
                 gqa_attention_polar4_g: get("gqa_attention_polar4_g")?,
+                gqa_attention_polar4_tiled_g: get("gqa_attention_polar4_tiled_g")?,
+                gqa_attention_polar4_reduce_g: get("gqa_attention_polar4_reduce_g")?,
                 // Mamba2 SSM kernels
                 mamba2_conv1d: get("mamba2_conv1d")?,
                 mamba2_ssm_step: get("mamba2_ssm_step")?,
@@ -8915,31 +8921,57 @@ impl GpuDecodeStore {
 
                         // GQA attention
                         if graph.kv_format == 2 {
-                            // Polar4 attention: single-block-per-head kernel (graph-compatible)
+                            // Polar4 attention: tiled + reduce (same SM parallelism as FP8)
                             let threads = 256u32;
-                            let num_blocks = graph.kv_num_blocks;
-                            let num_warps = threads / 32;
-                            let shared_mem_bytes = ((hd as u32) * (num_warps + 1) + 2 * num_warps) * 4 + 128;
+                            let tile_size = graph.gqa_tile_size;
+                            let max_tiles = graph.gqa_max_tiles;
+
+                            let tiled_o = graph.d_gqa_tiled_o.as_ref()
+                                .ok_or_else(|| format!("gqa_attention_polar4_tiled_g[{}]: tiled buffers not allocated", layer_idx))?;
+                            let tiled_lse = graph.d_gqa_tiled_lse.as_ref().unwrap();
+                            if tile_size == 0 || max_tiles == 0 {
+                                return Err(format!("gqa_attention_polar4_tiled_g[{}]: tile_size={} max_tiles={} invalid", layer_idx, tile_size, max_tiles));
+                            }
+                            let tile_smem = ((tile_size + hd) as u32) * 4 + 128;
                             unsafe {
-                                k.gqa_attention_polar4_g.clone().launch(
+                                k.gqa_attention_polar4_tiled_g.clone().launch(
                                     LaunchConfig {
-                                        grid_dim: (nh as u32, 1, 1),
+                                        grid_dim: (nh as u32, max_tiles as u32, 1),
                                         block_dim: (threads, 1, 1),
-                                        shared_mem_bytes,
+                                        shared_mem_bytes: tile_smem,
                                     },
                                     (
-                                        *graph.d_gqa_out.device_ptr(),
+                                        *tiled_o.device_ptr(),
+                                        *tiled_lse.device_ptr(),
                                         *graph.d_gqa_q.device_ptr(),
                                         graph.kv_k_radius_ptrs[layer_idx],
                                         graph.kv_v_radius_ptrs[layer_idx],
                                         graph.kv_k_angles_ptrs[layer_idx],
                                         graph.kv_v_angles_ptrs[layer_idx],
                                         *sm_scale,
-                                        nh as i32, nkv as i32, hd as i32,
+                                        nkv as i32, hd as i32,
                                         d_seq_len_ptr,
-                                        graph.kv_max_seq as i32,
+                                        tile_size as i32,
                                     ),
-                                ).map_err(|e| format!("gqa_attention_polar4_g[{}]: {:?}", layer_idx, e))?;
+                                ).map_err(|e| format!("gqa_attention_polar4_tiled_g[{}]: {:?}", layer_idx, e))?;
+
+                                let reduce_smem = ((max_tiles + hd) as u32) * 4;
+                                k.gqa_attention_polar4_reduce_g.clone().launch(
+                                    LaunchConfig {
+                                        grid_dim: (nh as u32, 1, 1),
+                                        block_dim: (threads, 1, 1),
+                                        shared_mem_bytes: reduce_smem,
+                                    },
+                                    (
+                                        *graph.d_gqa_out.device_ptr(),
+                                        *tiled_o.device_ptr(),
+                                        *tiled_lse.device_ptr(),
+                                        nh as i32, hd as i32,
+                                        d_seq_len_ptr,
+                                        tile_size as i32,
+                                        max_tiles as i32,
+                                    ),
+                                ).map_err(|e| format!("gqa_attention_polar4_reduce_g[{}]: {:?}", layer_idx, e))?;
                             }
                         } else {
                             // FP8 attention (tiled + reduce for SM utilization + single K read)
@@ -8947,75 +8979,51 @@ impl GpuDecodeStore {
                             let tile_size = graph.gqa_tile_size;
                             let max_tiles = graph.gqa_max_tiles;
 
-                            if tile_size > 0 && max_tiles > 0 && graph.d_gqa_tiled_o.is_some() {
-                                // Tiled path: grid.y = max_tiles, excess tiles early-exit
-                                let tiled_o = graph.d_gqa_tiled_o.as_ref().unwrap();
-                                let tiled_lse = graph.d_gqa_tiled_lse.as_ref().unwrap();
-                                let tile_smem = ((tile_size + hd) as u32) * 4 + 128;
-                                unsafe {
-                                    k.gqa_attention_tiled_g.clone().launch(
-                                        LaunchConfig {
-                                            grid_dim: (nh as u32, max_tiles as u32, 1),
-                                            block_dim: (threads, 1, 1),
-                                            shared_mem_bytes: tile_smem,
-                                        },
-                                        (
-                                            *tiled_o.device_ptr(),
-                                            *tiled_lse.device_ptr(),
-                                            *graph.d_gqa_q.device_ptr(),
-                                            graph.kv_k_ptrs[layer_idx],
-                                            graph.kv_v_ptrs[layer_idx],
-                                            *sm_scale,
-                                            nh as i32, nkv as i32, hd as i32,
-                                            d_seq_len_ptr,
-                                            tile_size as i32,
-                                            max_tiles as i32,
-                                        ),
-                                    ).map_err(|e| format!("gqa_attention_tiled_g[{}]: {:?}", layer_idx, e))?;
+                            let tiled_o = graph.d_gqa_tiled_o.as_ref()
+                                .ok_or_else(|| format!("gqa_attention_tiled_g[{}]: tiled buffers not allocated", layer_idx))?;
+                            let tiled_lse = graph.d_gqa_tiled_lse.as_ref().unwrap();
+                            if tile_size == 0 || max_tiles == 0 {
+                                return Err(format!("gqa_attention_tiled_g[{}]: tile_size={} max_tiles={} invalid", layer_idx, tile_size, max_tiles));
+                            }
+                            let tile_smem = ((tile_size + hd) as u32) * 4 + 128;
+                            unsafe {
+                                k.gqa_attention_tiled_g.clone().launch(
+                                    LaunchConfig {
+                                        grid_dim: (nh as u32, max_tiles as u32, 1),
+                                        block_dim: (threads, 1, 1),
+                                        shared_mem_bytes: tile_smem,
+                                    },
+                                    (
+                                        *tiled_o.device_ptr(),
+                                        *tiled_lse.device_ptr(),
+                                        *graph.d_gqa_q.device_ptr(),
+                                        graph.kv_k_ptrs[layer_idx],
+                                        graph.kv_v_ptrs[layer_idx],
+                                        *sm_scale,
+                                        nh as i32, nkv as i32, hd as i32,
+                                        d_seq_len_ptr,
+                                        tile_size as i32,
+                                        max_tiles as i32,
+                                    ),
+                                ).map_err(|e| format!("gqa_attention_tiled_g[{}]: {:?}", layer_idx, e))?;
 
-                                    let reduce_smem = (max_tiles as u32) * 4;
-                                    k.gqa_attention_reduce_g.clone().launch(
-                                        LaunchConfig {
-                                            grid_dim: (nh as u32, 1, 1),
-                                            block_dim: (threads, 1, 1),
-                                            shared_mem_bytes: reduce_smem,
-                                        },
-                                        (
-                                            *graph.d_gqa_out.device_ptr(),
-                                            *tiled_o.device_ptr(),
-                                            *tiled_lse.device_ptr(),
-                                            nh as i32, hd as i32,
-                                            d_seq_len_ptr,
-                                            tile_size as i32,
-                                            max_tiles as i32,
-                                        ),
-                                    ).map_err(|e| format!("gqa_attention_reduce_g[{}]: {:?}", layer_idx, e))?;
-                                }
-                            } else {
-                                // Fallback: single-block 2-pass kernel
-                                let q_smem = (hd as u32) * 4;
-                                let reduce_smem = 32 * 4;
-                                let tile_smem = 4096 * 4;
-                                let shared_mem_bytes = q_smem + reduce_smem + tile_smem;
-                                unsafe {
-                                    k.gqa_attention_g.clone().launch(
-                                        LaunchConfig {
-                                            grid_dim: (nh as u32, 1, 1),
-                                            block_dim: (threads, 1, 1),
-                                            shared_mem_bytes,
-                                        },
-                                        (
-                                            *graph.d_gqa_out.device_ptr(),
-                                            *graph.d_gqa_q.device_ptr(),
-                                            graph.kv_k_ptrs[layer_idx],
-                                            graph.kv_v_ptrs[layer_idx],
-                                            *sm_scale,
-                                            nh as i32, nkv as i32, hd as i32,
-                                            d_seq_len_ptr,
-                                            graph.kv_max_seq as i32,
-                                        ),
-                                    ).map_err(|e| format!("gqa_attention_g[{}]: {:?}", layer_idx, e))?;
-                                }
+                                let reduce_smem = (max_tiles as u32) * 4;
+                                k.gqa_attention_reduce_g.clone().launch(
+                                    LaunchConfig {
+                                        grid_dim: (nh as u32, 1, 1),
+                                        block_dim: (threads, 1, 1),
+                                        shared_mem_bytes: reduce_smem,
+                                    },
+                                    (
+                                        *graph.d_gqa_out.device_ptr(),
+                                        *tiled_o.device_ptr(),
+                                        *tiled_lse.device_ptr(),
+                                        nh as i32, hd as i32,
+                                        d_seq_len_ptr,
+                                        tile_size as i32,
+                                        max_tiles as i32,
+                                    ),
+                                ).map_err(|e| format!("gqa_attention_reduce_g[{}]: {:?}", layer_idx, e))?;
                             }
                         }
 
