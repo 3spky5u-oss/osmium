@@ -4851,8 +4851,11 @@ class KrasisModel:
             stash = getattr(self, '_aux_bf16_stash', None)
             if stash is not None and (layer_idx, attr_name) in stash:
                 return stash[(layer_idx, attr_name)]
-            # Direct attribute (if still a tensor)
-            w = getattr(attn, attr_name, None)
+            # Direct attribute or dict lookup (if still a tensor)
+            if isinstance(attn, dict):
+                w = attn.get(attr_name)
+            else:
+                w = getattr(attn, attr_name, None)
             if w is not None and isinstance(w, torch.Tensor):
                 return w
             raise RuntimeError(
@@ -5162,13 +5165,18 @@ class KrasisModel:
                         ckv_cache_dim=attn.ckv_dim,
                     )
             else:
-                # GQA attention
+                # GQA attention — attn object is None for GQA models (weights in layer.gqa_weights)
+                _gqa_head_dim = self.cfg.gqa_head_dim or self.cfg.head_dim
+                _gqa_sm_scale = 1.0 / (_gqa_head_dim ** 0.5)
+                _gqa_gated = hasattr(self.cfg, 'gated_attention') and self.cfg.gated_attention
+                gqa_w = layer.gqa_weights if hasattr(layer, 'gqa_weights') else None
+
                 if in_segment:
-                    # Get BF16 source weights
-                    q_src = _get_bf16_source(attn, "q_proj", layer_idx)
-                    k_src = _get_bf16_source(attn, "k_proj", layer_idx)
-                    v_src = _get_bf16_source(attn, "v_proj", layer_idx)
-                    o_src = _get_bf16_source(attn, "o_proj", layer_idx)
+                    # Get BF16 source weights from gqa_weights dict or stash
+                    q_src = _get_bf16_source(gqa_w, "q_proj", layer_idx)
+                    k_src = _get_bf16_source(gqa_w, "k_proj", layer_idx)
+                    v_src = _get_bf16_source(gqa_w, "v_proj", layer_idx)
+                    o_src = _get_bf16_source(gqa_w, "o_proj", layer_idx)
 
                     # AWQ scales
                     _layer_awq_scales = None
@@ -5213,15 +5221,17 @@ class KrasisModel:
                     post_norm_aux = post_norm.to(aux_device, non_blocking=True)
                     self._aux_decode_weights.extend([inp_norm_aux, post_norm_aux])
 
-                    # QK norms
-                    if attn.q_norm is not None:
-                        q_norm_aux = attn.q_norm.float().contiguous().to(aux_device)
+                    # QK norms from gqa_weights dict
+                    q_norm_src = gqa_w.get("q_norm") if gqa_w else None
+                    k_norm_src = gqa_w.get("k_norm") if gqa_w else None
+                    if q_norm_src is not None:
+                        q_norm_aux = q_norm_src.float().contiguous().to(aux_device)
                         self._aux_decode_weights.append(q_norm_aux)
                         q_norm_ptr = q_norm_aux.data_ptr()
                     else:
                         q_norm_ptr = 0
-                    if attn.k_norm is not None:
-                        k_norm_aux = attn.k_norm.float().contiguous().to(aux_device)
+                    if k_norm_src is not None:
+                        k_norm_aux = k_norm_src.float().contiguous().to(aux_device)
                         self._aux_decode_weights.append(k_norm_aux)
                         k_norm_ptr = k_norm_aux.data_ptr()
                     else:
@@ -5234,10 +5244,11 @@ class KrasisModel:
                         q_proj_wid=q_wid, k_proj_wid=k_wid,
                         v_proj_wid=v_wid, o_proj_wid=o_wid,
                         fused_qkv_wid=None,
-                        num_heads=attn.num_heads, num_kv_heads=attn.num_kv_heads,
-                        head_dim=attn.head_dim, sm_scale=attn.sm_scale,
+                        num_heads=self.cfg.num_attention_heads,
+                        num_kv_heads=self.cfg.num_key_value_heads,
+                        head_dim=_gqa_head_dim, sm_scale=_gqa_sm_scale,
                         q_norm_ptr=q_norm_ptr, k_norm_ptr=k_norm_ptr,
-                        gated=attn.gated_attention,
+                        gated=_gqa_gated,
                     )
 
                     # RoPE tables on aux GPU (from first GQA layer in segment)
@@ -5245,9 +5256,13 @@ class KrasisModel:
                         max_seq = max(
                             c.max_context_tokens for c in self.kv_caches if c is not None
                         )
-                        cos, sin = attn._get_rope_cos_sin(max_seq)
-                        cos_f32 = cos.float().contiguous().to(aux_device)
-                        sin_f32 = sin.float().contiguous().to(aux_device)
+                        rope_half = self.cfg.rotary_dim // 2
+                        inv_freq = 1.0 / (self.cfg.rope_theta ** (
+                            torch.arange(0, rope_half * 2, 2, dtype=torch.float32) / (rope_half * 2)))
+                        t = torch.arange(max_seq, dtype=torch.float32)
+                        freqs = torch.outer(t, inv_freq)
+                        cos_f32 = torch.cos(freqs).contiguous().to(aux_device)
+                        sin_f32 = torch.sin(freqs).contiguous().to(aux_device)
                         self._aux_rope_cos = cos_f32
                         self._aux_rope_sin = sin_f32
                         store.set_rope_tables(
@@ -5265,10 +5280,11 @@ class KrasisModel:
                         q_proj_wid=dummy_wid, k_proj_wid=dummy_wid,
                         v_proj_wid=dummy_wid, o_proj_wid=dummy_wid,
                         fused_qkv_wid=None,
-                        num_heads=attn.num_heads, num_kv_heads=attn.num_kv_heads,
-                        head_dim=attn.head_dim, sm_scale=attn.sm_scale,
+                        num_heads=self.cfg.num_attention_heads,
+                        num_kv_heads=self.cfg.num_key_value_heads,
+                        head_dim=_gqa_head_dim, sm_scale=_gqa_sm_scale,
                         q_norm_ptr=0, k_norm_ptr=0,
-                        gated=attn.gated_attention,
+                        gated=_gqa_gated,
                     )
 
             # Register MLP type
