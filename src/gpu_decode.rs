@@ -11622,92 +11622,168 @@ impl GpuDecodeStore {
         let graph = self.graph.as_ref().ok_or("primary graph not configured")?;
         let aux_graph = aux_store.graph.as_ref().ok_or("aux graph not configured")?;
 
-        // Iterate GQA layers in aux GPU's segment [layer_start..layer_end)
+        if graph.kv_format != aux_graph.kv_format {
+            return Err(format!(
+                "KV format mismatch: primary={} aux={}",
+                graph.kv_format, aux_graph.kv_format
+            ));
+        }
+
         let mut copied = 0usize;
         let mut total_bytes = 0usize;
-        for layer_idx in layer_start..layer_end {
-            let k_src = graph.kv_k_ptrs[layer_idx];
-            let v_src = graph.kv_v_ptrs[layer_idx];
-            if k_src == 0 || v_src == 0 { continue; } // Not a GQA layer
 
-            let k_dst = aux_graph.kv_k_ptrs[layer_idx];
-            let v_dst = aux_graph.kv_v_ptrs[layer_idx];
-            if k_dst == 0 || v_dst == 0 {
-                return Err(format!("Aux store missing KV cache for GQA layer {}", layer_idx));
+        if graph.kv_format == 2 {
+            // Polar4: 4 tensors per GQA layer (k_radius, v_radius, k_angles, v_angles)
+            let num_blocks = graph.kv_num_blocks;
+            if num_blocks == 0 {
+                return Err("Polar4 copy but kv_num_blocks=0".to_string());
             }
+            // Per position: radius = num_blocks * 2 bytes (BF16), angles = num_blocks * 8 bytes (uint8)
+            let radius_bytes_per_pos = num_blocks * 2;
+            let angles_bytes_per_pos = num_blocks * 8;
 
-            // Get KV stride from GQA config
-            let kv_stride = if let GpuAttnConfig::GQA { num_kv_heads, head_dim, .. } = &graph.layers[layer_idx].attn {
-                num_kv_heads * head_dim
-            } else {
-                continue; // Not GQA, skip
-            };
+            for layer_idx in layer_start..layer_end {
+                let kr_src = graph.kv_k_radius_ptrs[layer_idx];
+                let vr_src = graph.kv_v_radius_ptrs[layer_idx];
+                let ka_src = graph.kv_k_angles_ptrs[layer_idx];
+                let va_src = graph.kv_v_angles_ptrs[layer_idx];
+                if kr_src == 0 { continue; } // Not a GQA layer
 
-            // FP8 = 1 byte per element. Copy [0..prompt_len) positions.
-            let bytes = prompt_len * kv_stride;
-            if bytes == 0 { continue; }
-
-            // D2H from GPU0, then H2D to GPU1 (peer access not guaranteed)
-            let mut host_buf = vec![0u8; bytes];
-
-            // Bind GPU0 context for D2H
-            self.device.bind_to_thread()
-                .map_err(|e| format!("bind GPU0 for KV copy: {:?}", e))?;
-            self.device.synchronize()
-                .map_err(|e| format!("sync GPU0 before KV copy: {:?}", e))?;
-
-            unsafe {
-                // K cache: D2H from GPU0
-                let err = cuda_sys::lib().cuMemcpyDtoH_v2(
-                    host_buf.as_mut_ptr() as *mut std::ffi::c_void,
-                    k_src, bytes);
-                if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                    return Err(format!("KV copy D2H K layer {}: {:?}", layer_idx, err));
+                let kr_dst = aux_graph.kv_k_radius_ptrs[layer_idx];
+                let vr_dst = aux_graph.kv_v_radius_ptrs[layer_idx];
+                let ka_dst = aux_graph.kv_k_angles_ptrs[layer_idx];
+                let va_dst = aux_graph.kv_v_angles_ptrs[layer_idx];
+                if kr_dst == 0 {
+                    return Err(format!("Aux store missing Polar4 KV cache for GQA layer {}", layer_idx));
                 }
-            }
 
-            // Bind GPU1 context for H2D
-            aux_store.device.bind_to_thread()
-                .map_err(|e| format!("bind GPU1 for KV copy: {:?}", e))?;
-            unsafe {
-                // K cache: H2D to GPU1
-                let err = cuda_sys::lib().cuMemcpyHtoD_v2(
-                    k_dst,
-                    host_buf.as_ptr() as *const std::ffi::c_void,
-                    bytes);
-                if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                    return Err(format!("KV copy H2D K layer {}: {:?}", layer_idx, err));
-                }
-            }
+                let r_bytes = prompt_len * radius_bytes_per_pos;
+                let a_bytes = prompt_len * angles_bytes_per_pos;
+                if r_bytes == 0 { continue; }
 
-            // Back to GPU0 for V D2H
-            self.device.bind_to_thread()
-                .map_err(|e| format!("bind GPU0 for KV V copy: {:?}", e))?;
-            unsafe {
-                // V cache: D2H from GPU0
-                let err = cuda_sys::lib().cuMemcpyDtoH_v2(
-                    host_buf.as_mut_ptr() as *mut std::ffi::c_void,
-                    v_src, bytes);
-                if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                    return Err(format!("KV copy D2H V layer {}: {:?}", layer_idx, err));
-                }
-            }
+                // Use a single host buffer for the largest tensor (angles)
+                let max_bytes = r_bytes.max(a_bytes);
+                let mut host_buf = vec![0u8; max_bytes];
 
-            // GPU1 for V H2D
-            aux_store.device.bind_to_thread()
-                .map_err(|e| format!("bind GPU1 for KV V copy: {:?}", e))?;
-            unsafe {
-                // V cache: H2D to GPU1
-                let err = cuda_sys::lib().cuMemcpyHtoD_v2(
-                    v_dst,
-                    host_buf.as_ptr() as *const std::ffi::c_void,
-                    bytes);
-                if err != cuda_sys::CUresult::CUDA_SUCCESS {
-                    return Err(format!("KV copy H2D V layer {}: {:?}", layer_idx, err));
+                // Copy all 4 tensors: k_radius, v_radius, k_angles, v_angles
+                let copies: [(u64, u64, usize, &str); 4] = [
+                    (kr_src, kr_dst, r_bytes, "k_radius"),
+                    (vr_src, vr_dst, r_bytes, "v_radius"),
+                    (ka_src, ka_dst, a_bytes, "k_angles"),
+                    (va_src, va_dst, a_bytes, "v_angles"),
+                ];
+
+                for (src, dst, nbytes, name) in &copies {
+                    self.device.bind_to_thread()
+                        .map_err(|e| format!("bind GPU0 for {} copy: {:?}", name, e))?;
+                    if copies[0].0 == *src {
+                        // Sync once before first D2H per layer
+                        self.device.synchronize()
+                            .map_err(|e| format!("sync GPU0 before KV copy: {:?}", e))?;
+                    }
+                    unsafe {
+                        let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+                            host_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                            *src, *nbytes);
+                        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                            return Err(format!("KV copy D2H {} layer {}: {:?}", name, layer_idx, err));
+                        }
+                    }
+                    aux_store.device.bind_to_thread()
+                        .map_err(|e| format!("bind GPU1 for {} copy: {:?}", name, e))?;
+                    unsafe {
+                        let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                            *dst,
+                            host_buf.as_ptr() as *const std::ffi::c_void,
+                            *nbytes);
+                        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                            return Err(format!("KV copy H2D {} layer {}: {:?}", name, layer_idx, err));
+                        }
+                    }
+                    total_bytes += nbytes;
                 }
+                copied += 1;
             }
-            copied += 1;
-            total_bytes += bytes * 2; // K + V
+        } else {
+            // FP8/BF16: 2 tensors per GQA layer (K and V)
+            for layer_idx in layer_start..layer_end {
+                let k_src = graph.kv_k_ptrs[layer_idx];
+                let v_src = graph.kv_v_ptrs[layer_idx];
+                if k_src == 0 || v_src == 0 { continue; } // Not a GQA layer
+
+                let k_dst = aux_graph.kv_k_ptrs[layer_idx];
+                let v_dst = aux_graph.kv_v_ptrs[layer_idx];
+                if k_dst == 0 || v_dst == 0 {
+                    return Err(format!("Aux store missing KV cache for GQA layer {}", layer_idx));
+                }
+
+                // Get KV stride from GQA config
+                let kv_stride = if let GpuAttnConfig::GQA { num_kv_heads, head_dim, .. } = &graph.layers[layer_idx].attn {
+                    num_kv_heads * head_dim
+                } else {
+                    continue; // Not GQA, skip
+                };
+
+                // FP8 = 1 byte per element, BF16 = 2 bytes per element
+                let elem_size = if graph.kv_format == 0 { 2usize } else { 1usize };
+                let bytes = prompt_len * kv_stride * elem_size;
+                if bytes == 0 { continue; }
+
+                let mut host_buf = vec![0u8; bytes];
+
+                // K: D2H from GPU0, H2D to GPU1
+                self.device.bind_to_thread()
+                    .map_err(|e| format!("bind GPU0 for KV copy: {:?}", e))?;
+                self.device.synchronize()
+                    .map_err(|e| format!("sync GPU0 before KV copy: {:?}", e))?;
+
+                unsafe {
+                    let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+                        host_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                        k_src, bytes);
+                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                        return Err(format!("KV copy D2H K layer {}: {:?}", layer_idx, err));
+                    }
+                }
+
+                aux_store.device.bind_to_thread()
+                    .map_err(|e| format!("bind GPU1 for KV copy: {:?}", e))?;
+                unsafe {
+                    let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                        k_dst,
+                        host_buf.as_ptr() as *const std::ffi::c_void,
+                        bytes);
+                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                        return Err(format!("KV copy H2D K layer {}: {:?}", layer_idx, err));
+                    }
+                }
+
+                // V: D2H from GPU0, H2D to GPU1
+                self.device.bind_to_thread()
+                    .map_err(|e| format!("bind GPU0 for KV V copy: {:?}", e))?;
+                unsafe {
+                    let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+                        host_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                        v_src, bytes);
+                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                        return Err(format!("KV copy D2H V layer {}: {:?}", layer_idx, err));
+                    }
+                }
+
+                aux_store.device.bind_to_thread()
+                    .map_err(|e| format!("bind GPU1 for KV V copy: {:?}", e))?;
+                unsafe {
+                    let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                        v_dst,
+                        host_buf.as_ptr() as *const std::ffi::c_void,
+                        bytes);
+                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                        return Err(format!("KV copy H2D V layer {}: {:?}", layer_idx, err));
+                    }
+                }
+                copied += 1;
+                total_bytes += bytes * 2; // K + V
+            }
         }
 
         // Set KV position on aux store
@@ -11715,8 +11791,8 @@ impl GpuDecodeStore {
             ag.kv_current_pos = prompt_len;
         }
 
-        log::info!("copy_kv_to_aux: copied {} GQA layers, {} bytes total ({} positions)",
-            copied, total_bytes, prompt_len);
+        log::info!("copy_kv_to_aux: copied {} GQA layers, {} bytes total ({} positions, format={})",
+            copied, total_bytes, prompt_len, graph.kv_format);
         Ok(())
     }
 

@@ -5317,16 +5317,50 @@ class KrasisModel:
 
         # Allocate KV cache on aux GPU for GQA layers in this segment [split_layer..layer_end)
         cache = self.kv_caches[0]
-        if cache is not None and cache.k_cache is not None:
-            kv_ptrs = []
+        if cache is not None and cache.kv_format == 2 and cache.k_radius_cache is not None:
+            # Polar4 KV cache: 4 tensors per layer (radius BF16 + angles uint8 for K and V)
+            polar4_ptrs = []
             gqa_cache_idx = 0
             for layer_idx, layer in enumerate(self.layers):
-                # Only full GQA attention layers have KV cache slots.
-                # Skip: linear_attention (no KV), MLA (has kv_a_proj), mamba2 (SSM state), moe-only (no attention).
                 if (layer.layer_type not in ("linear_attention", "mamba2", "moe")
                     and not hasattr(layer.attention, 'kv_a_proj')):
                     if split_layer <= layer_idx < layer_end:
-                        # Allocate FP8 KV cache on aux GPU matching primary's shape
+                        kr_src = cache.k_radius_cache[gqa_cache_idx]
+                        vr_src = cache.v_radius_cache[gqa_cache_idx]
+                        ka_src = cache.k_angles_cache[gqa_cache_idx]
+                        va_src = cache.v_angles_cache[gqa_cache_idx]
+                        kr_aux = torch.empty_like(kr_src, device=aux_device)
+                        vr_aux = torch.empty_like(vr_src, device=aux_device)
+                        ka_aux = torch.empty_like(ka_src, device=aux_device)
+                        va_aux = torch.empty_like(va_src, device=aux_device)
+                        if not hasattr(self, '_aux_kv_caches'):
+                            self._aux_kv_caches = []
+                        self._aux_kv_caches.extend([kr_aux, vr_aux, ka_aux, va_aux])
+                        polar4_ptrs.append((layer_idx,
+                                            kr_aux.data_ptr(), vr_aux.data_ptr(),
+                                            ka_aux.data_ptr(), va_aux.data_ptr()))
+                    else:
+                        kr = cache.k_radius_cache[gqa_cache_idx]
+                        vr = cache.v_radius_cache[gqa_cache_idx]
+                        ka = cache.k_angles_cache[gqa_cache_idx]
+                        va = cache.v_angles_cache[gqa_cache_idx]
+                        polar4_ptrs.append((layer_idx,
+                                            kr.data_ptr(), vr.data_ptr(),
+                                            ka.data_ptr(), va.data_ptr()))
+                    gqa_cache_idx += 1
+            max_seq = cache.max_pages * cache.page_size
+            num_blocks = (cache.num_kv_heads * cache.gqa_head_dim) // 16
+            store.set_kv_cache_ptrs_polar4(polar4_ptrs, max_seq, num_blocks)
+            logger.info("Aux Polar4 KV cache on cuda:%d: %d GQA layers for [%d..%d), max_seq=%d, blocks=%d",
+                        gpu_idx, len(polar4_ptrs), split_layer, layer_end, max_seq, num_blocks)
+        elif cache is not None and cache.k_cache is not None:
+            # FP8/BF16 KV cache: 2 tensors per layer (K and V)
+            kv_ptrs = []
+            gqa_cache_idx = 0
+            for layer_idx, layer in enumerate(self.layers):
+                if (layer.layer_type not in ("linear_attention", "mamba2", "moe")
+                    and not hasattr(layer.attention, 'kv_a_proj')):
+                    if split_layer <= layer_idx < layer_end:
                         k_src = cache.k_cache[gqa_cache_idx]
                         v_src = cache.v_cache[gqa_cache_idx]
                         k_aux = torch.empty_like(k_src, device=aux_device)
@@ -5336,7 +5370,6 @@ class KrasisModel:
                         self._aux_kv_caches.extend([k_aux, v_aux])
                         kv_ptrs.append((layer_idx, k_aux.data_ptr(), v_aux.data_ptr()))
                     else:
-                        # Layers outside segment — register primary GPU pointers (won't be accessed)
                         k_layer = cache.k_cache[gqa_cache_idx]
                         v_layer = cache.v_cache[gqa_cache_idx]
                         kv_ptrs.append((layer_idx, k_layer.data_ptr(), v_layer.data_ptr()))
