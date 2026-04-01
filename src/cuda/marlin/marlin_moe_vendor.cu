@@ -56,13 +56,17 @@ __global__ void permute_cols_kernel(
     int row_stride = size_k * sizeof(half) / 16;
 
     auto read_moe_block_data = [&](int block_id) {
+        if (block_id < 0 || block_id >= num_moe_blocks) {
+            block_num_valid_tokens = 0;
+            return;
+        }
         block_num_valid_tokens = moe_block_size;
         int4* tmp_block_sorted_ids = reinterpret_cast<int4*>(block_sorted_ids);
         for (int i = 0; i < moe_block_size / 4; i++) {
             tmp_block_sorted_ids[i] = ((int4*)sorted_token_ids_ptr)[block_id * moe_block_size / 4 + i];
         }
         for (int i = 0; i < moe_block_size; i++) {
-            if (block_sorted_ids[i] >= size_m * top_k) {
+            if (block_sorted_ids[i] < 0 || block_sorted_ids[i] >= size_m * top_k) {
                 block_num_valid_tokens = i;
                 break;
             }
@@ -153,7 +157,12 @@ static int moe_get_kernel_cache_size(
     int tb_k = th_config.thread_k;
     int tb_n = th_config.thread_n;
     int tb_m = thread_m_blocks * 16;
-    int sh_block_meta_size = tb_m * 4;
+    // MoE metadata before sh_new:
+    // - block sorted ids
+    // - reduced sorted ids
+    // - topk weights plus alignment pad
+    // This is 2 * moe_block_size int4s = tb_m * 32 bytes.
+    int sh_block_meta_size = tb_m * 32;
     int sh_a_size = pipe_stages * (tb_m * tb_k) * 2;
     int sh_b_size = pipe_stages * (tb_k * tb_n / pack_factor) * 4;
     int sh_red_size = tb_m * (tb_n + 8) * 2;
@@ -377,11 +386,20 @@ void moe_marlin_mm_impl(
     thread_k = thread_tfg.thread_k;
     thread_n = thread_tfg.thread_n;
     int blocks = sms * exec_cfg.blocks_per_sm;
+    int kernel_shared_mem = max_shared_mem;
     if (exec_cfg.blocks_per_sm > 1)
-        max_shared_mem = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
+        kernel_shared_mem = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
 
     int thread_k_blocks = thread_k / 16;
     int thread_n_blocks = thread_n / 16;
+    int kernel_cache_size = moe_get_kernel_cache_size(
+        thread_tfg, m_block_size_8, thread_m_blocks, prob_m, prob_n, prob_k,
+        num_bits, group_size, has_act_order, is_k_full, has_zp, is_zp_float);
+    // Use the same per-kernel shared-memory budget that config validation used
+    // instead of the raw device opt-in maximum. Passing the larger device limit
+    // lets the template over-expand opportunistic A-cache staging beyond the
+    // validated layout.
+    kernel_shared_mem = min(kernel_shared_mem, kernel_cache_size + 1024);
 
     auto kernel = moe_get_marlin_kernel<scalar_t>(
         q_type, thread_m_blocks, thread_n_blocks, thread_k_blocks,
@@ -396,13 +414,13 @@ void moe_marlin_mm_impl(
         return;
     }
 
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem);
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kernel_shared_mem);
 
-    kernel<<<blocks, num_threads, max_shared_mem, stream>>>(
+    kernel<<<blocks, num_threads, kernel_shared_mem, stream>>>(
         A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, s_ptr, s2_ptr, zp_ptr, g_idx_ptr,
         sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
         topk_weights_ptr, top_k, mul_topk_weights, is_ep, num_groups, prob_m,
-        prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce, max_shared_mem,
+        prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce, kernel_shared_mem,
         (const int64_t*)B_expert_ptrs, (const int64_t*)S_expert_ptrs);
 }
 

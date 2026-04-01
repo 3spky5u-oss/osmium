@@ -1766,6 +1766,8 @@ struct GpuDecodeGraph {
     d_dummy_expert: Option<cudarc::driver::CudaSlice<u8>>,
     /// GPU-side array of 4 u64 dummy pointers [w13p, w13s, w2p, w2s] for unused batch slots.
     d_dummy_ptrs: Option<cudarc::driver::CudaSlice<u64>>,
+    /// Host-side copy of dummy expert pointers for zero-weight padding during replay.
+    h_dummy_ptrs: [u64; 4],
 
     // ── Per-layer CUDA graph capture (49 graphs for 48 MoE layers) ──
     /// Per-layer graph executables: graph[0] = routing for first MoE layer,
@@ -2660,6 +2662,7 @@ impl GpuDecodeStore {
             d_graph_seq_len: None,
             d_dummy_expert: None,
             d_dummy_ptrs: None,
+            h_dummy_ptrs: [0u64; 4],
             per_layer_graphs: Vec::new(),
             per_layer_graphs_valid: false,
             graphs_ever_captured: false,
@@ -7838,6 +7841,7 @@ impl GpuDecodeStore {
                     dummy_base + w13_packed_bytes + w13_scales_bytes,
                     dummy_base + w13_packed_bytes + w13_scales_bytes + w2_packed_bytes,
                 ];
+                graph.h_dummy_ptrs = dummy_vals;
                 let d_dummy_ptrs = self.device.htod_copy(dummy_vals.to_vec())
                     .map_err(|e| format!("alloc d_dummy_ptrs: {:?}", e))?;
                 graph.d_dummy_ptrs = Some(d_dummy_ptrs);
@@ -9921,30 +9925,15 @@ impl GpuDecodeStore {
                     }
 
                     if batch_count < topk {
-                        // Zero-weight padding only needs pointers that are safe to dereference.
-                        // Reuse the first real expert when available so graph replay never
-                        // depends on synthetic dummy layout details (safer across architectures).
-                        let fill_ptrs = if batch_count > 0 {
-                            [
-                                graph.h_batch_w13_packed_ptrs[0],
-                                graph.h_batch_w13_scales_ptrs[0],
-                                graph.h_batch_w2_packed_ptrs[0],
-                                graph.h_batch_w2_scales_ptrs[0],
-                            ]
+                        // Zero-weight padding should not alias real experts in the replayed batch.
+                        // Use the prevalidated dummy expert layout cached at graph init so replay
+                        // stays deterministic without any per-step DtoH traffic.
+                        let fill_ptrs = if graph.h_dummy_ptrs[0] != 0 {
+                            graph.h_dummy_ptrs
                         } else {
                             let dummy_base = graph.d_dummy_expert.as_ref()
                                 .map(|b| *b.device_ptr()).unwrap_or(buf_base[0]);
-                            if let Some(ref dp) = graph.d_dummy_ptrs {
-                                let mut ptrs = [0u64; 4];
-                                unsafe {
-                                    cuda_sys::lib().cuMemcpyDtoH_v2(
-                                        ptrs.as_mut_ptr() as *mut std::ffi::c_void,
-                                        *dp.device_ptr(), 32);
-                                }
-                                ptrs
-                            } else {
-                                [dummy_base, dummy_base, dummy_base, dummy_base]
-                            }
+                            [dummy_base, dummy_base, dummy_base, dummy_base]
                         };
                         for i in batch_count..topk.min(max_ept) {
                             graph.h_batch_w13_packed_ptrs[i] = fill_ptrs[0];

@@ -384,7 +384,8 @@ __global__ void Marlin(
 
   // parallel: num valid moe blocks
   int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
-  int parallel = num_tokens_past_padded / moe_block_size;
+  const int num_moe_blocks = num_tokens_past_padded / moe_block_size;
+  int parallel = num_moe_blocks;
   int num_valid_blocks = parallel;
   if (is_ep) {
     for (int i = 0; i < parallel; i++) {
@@ -420,6 +421,7 @@ __global__ void Marlin(
   int64_t expert_id = 0;  // use int64 to avoid computation result overflow
   int old_expert_id = 0;
   int64_t B_expert_off = 0;
+  bool advanced_moe_block = false;
 
   int4* sh_block_sorted_ids_int4 = sh;
   int4* sh_rd_block_sorted_ids_int4 = sh_block_sorted_ids_int4 + moe_block_size / 4;
@@ -451,6 +453,10 @@ __global__ void Marlin(
   // read moe block data given block_id
   // block_sorted_ids / block_num_valid_tokens / block_topk_weights
   auto read_moe_block_data = [&](int block_id) {
+    if (block_id < 0 || block_id >= num_moe_blocks) {
+      block_num_valid_tokens = 0;
+      return;
+    }
     block_num_valid_tokens = moe_block_size;
 #pragma unroll
     for (int i = 0; i < moe_block_size / 4; i++) {
@@ -459,7 +465,10 @@ __global__ void Marlin(
       int* sorted_token_ids = reinterpret_cast<int*>(&sorted_token_ids_int4);
 #pragma unroll
       for (int j = 0; j < 4; j++) {
-        if (sorted_token_ids[j] >= prob_m * top_k) {
+        // Padded MoE rows are marked with -1 in sorted_token_ids_ptr. Treat both
+        // negative sentinels and out-of-range ids as invalid so partial expert
+        // blocks stop before any A/C reads or writes use a bogus sorted row.
+        if (sorted_token_ids[j] < 0 || sorted_token_ids[j] >= prob_m * top_k) {
           block_num_valid_tokens = i * 4 + j;
           break;
         }
@@ -501,6 +510,7 @@ __global__ void Marlin(
   // and then read moe block data
   auto update_next_moe_block_data = [&]() {
     if (par_id >= parallel) return;
+    advanced_moe_block = true;
 
     old_expert_id = expert_id;
     if (num_invalid_blocks > 0) {
@@ -518,6 +528,10 @@ __global__ void Marlin(
       }
     } else {
       block_id = par_id;
+      if (block_id < 0 || block_id >= num_moe_blocks) {
+        block_num_valid_tokens = 0;
+        return;
+      }
       expert_id = expert_ids_ptr[block_id];
     }
 
@@ -528,11 +542,15 @@ __global__ void Marlin(
 
     if (B_expert_ptrs != nullptr) {
       // Pointer table mode: compute B offset from per-expert pointer
-      // B_ptr[i] was initialized relative to B (which may point to expert 0 or be arbitrary).
-      // B_expert_ptrs[expert_id] gives the actual GPU address for this expert's packed weights.
-      // B_expert_off = (expert_base - B) in int4 elements, so B_ptr[i] + B_expert_off
-      // correctly addresses the expert's weights.
-      B_expert_off = reinterpret_cast<const int4*>(B_expert_ptrs[expert_id]) - B;
+      // B_ptr[i] was initialized relative to B (which may be an arbitrary base).
+      // Do address math explicitly in bytes here instead of subtracting unrelated
+      // pointers directly: the latter is undefined behavior in C++ and can miscompile
+      // for mixed HCS / pinning / cold-staging allocations.
+      const long long expert_addr =
+          reinterpret_cast<long long>(reinterpret_cast<const char*>(reinterpret_cast<const int4*>(B_expert_ptrs[expert_id])));
+      const long long base_addr =
+          reinterpret_cast<long long>(reinterpret_cast<const char*>(B));
+      B_expert_off = (expert_addr - base_addr) / static_cast<long long>(sizeof(int4));
       scales_ptr = reinterpret_cast<const int4*>(S_expert_ptrs[expert_id]);
     } else {
       // Contiguous buffer mode: arithmetic offset
@@ -796,10 +814,14 @@ __global__ void Marlin(
   // runtime; we break dependencies between subsequent accesses with a tile by
   // maintining multiple pointers (we have enough registers), a tiny
   // optimization.
-  const int4* B_ptr[b_sh_wr_iters];
+  int64_t b_elem_idx[b_sh_wr_iters];
+  auto reset_b_elem_idx = [&]() {
 #pragma unroll
-  for (int i = 0; i < b_sh_wr_iters; i++)
-    B_ptr[i] = B + b_gl_rd_delta_i * i + b_gl_rd;
+    for (int i = 0; i < b_sh_wr_iters; i++)
+      b_elem_idx[i] = b_gl_rd_delta_i * i + b_gl_rd;
+  };
+  reset_b_elem_idx();
+  advanced_moe_block = false;
 
   // Shared memory storage for global fetch pipelines.
   constexpr int sh_red_size = (2 * thread_n_blocks + 1) * 16 * thread_m_blocks;
@@ -822,7 +844,13 @@ __global__ void Marlin(
   // shared memory used by weight.
   static_assert(thread_m_blocks * 16 * thread_n_blocks * 16 / 8 <= stages * b_sh_stage);
   int4* sh_a = sh_s + sh_s_size;
-  constexpr int shm_size_used = moe_block_size + stages * (g_idx_stage + zp_sh_stage) + sh_s_size + sh_b_red_bias_size;
+  // Metadata before sh_new uses:
+  // - moe_block_size / 4 int4s for sh_block_sorted_ids
+  // - moe_block_size / 4 int4s for sh_rd_block_sorted_ids
+  // - moe_block_size / 2 + moe_block_size int4s for sh_block_topk_weights plus pad
+  // Total = 2 * moe_block_size int4s, not moe_block_size.
+  constexpr int shm_size_used =
+      2 * moe_block_size + stages * (g_idx_stage + zp_sh_stage) + sh_s_size + sh_b_red_bias_size;
 
   // all remaining shared memory is used to cache A (input)
   // sh_a_max_row is at least ` stages * 16 * thread_m_blocks `
@@ -893,10 +921,14 @@ __global__ void Marlin(
 #pragma unroll
         for (int i = 0; i < a_sh_wr_iters; i++) {
           int row = a_gl_rd_delta_i / a_gl_stride * i + a_gl_rd_row;
-          int64_t sorted_row = 0;
-          if (!m_block_size_8 || row < 8) sorted_row = sh_rd_block_sorted_ids[row];
-          int64_t true_idx = sorted_row * a_gl_stride + a_gl_rd_col + a_gl_rd_delta_o * a_off;
-          cp_async4_pred(&sh_a_stage[a_sh_wr_trans[i]], &A[true_idx], row < block_num_valid_tokens);
+          bool row_valid = row < block_num_valid_tokens;
+          int64_t true_idx = 0;
+          if (row_valid) {
+            int64_t sorted_row = 0;
+            if (!m_block_size_8 || row < 8) sorted_row = sh_rd_block_sorted_ids[row];
+            true_idx = sorted_row * a_gl_stride + a_gl_rd_col + a_gl_rd_delta_o * a_off;
+          }
+          cp_async4_pred(&sh_a_stage[a_sh_wr_trans[i]], &A[true_idx], row_valid);
         }
       }
 
@@ -905,10 +937,22 @@ __global__ void Marlin(
       for (int i = 0; i < b_sh_wr_iters; i++) {
 #pragma unroll
         for (int j = 0; j < b_thread_vecs; j++) {
-          cp_async4(&sh_b_stage[b_sh_wr_delta * i + b_sh_wr + j], B_ptr[i] + j + B_expert_off);
+          if (B_expert_ptrs != nullptr) {
+            const long long expert_addr =
+                static_cast<long long>(reinterpret_cast<intptr_t>(reinterpret_cast<const void*>(B_expert_ptrs[expert_id])));
+            const long long src_addr =
+                expert_addr + static_cast<long long>(b_elem_idx[i] + j) * static_cast<long long>(sizeof(int4));
+            cp_async4(
+                &sh_b_stage[b_sh_wr_delta * i + b_sh_wr + j],
+                reinterpret_cast<const int4*>(static_cast<uintptr_t>(src_addr)));
+          } else {
+            cp_async4(
+                &sh_b_stage[b_sh_wr_delta * i + b_sh_wr + j],
+                B + b_elem_idx[i] + j + B_expert_off);
+          }
         }
 
-        B_ptr[i] += b_gl_rd_delta_o;
+        b_elem_idx[i] += b_gl_rd_delta_o;
       }
 
       if constexpr (has_act_order) {
@@ -1885,13 +1929,18 @@ __global__ void Marlin(
 
       if (slice_iters) {
         a_gl_rd_col = (threadIdx.x % a_gl_rd_delta_o);
-#pragma unroll
-        for (int i = 0; i < b_sh_wr_iters; i++)
-          B_ptr[i] += b_sh_stride - b_gl_rd_delta_o * k_tiles;
-        if (slice_col == 0) {
+        if (advanced_moe_block) {
+          reset_b_elem_idx();
+          advanced_moe_block = false;
+        } else {
 #pragma unroll
           for (int i = 0; i < b_sh_wr_iters; i++)
-            B_ptr[i] -= b_gl_stride;
+            b_elem_idx[i] += b_sh_stride - b_gl_rd_delta_o * k_tiles;
+          if (slice_col == 0) {
+#pragma unroll
+            for (int i = 0; i < b_sh_wr_iters; i++)
+              b_elem_idx[i] -= b_gl_stride;
+          }
         }
 
         bias_gl_rd = (thread_n_blocks * 16 / 8) * slice_col + threadIdx.x;

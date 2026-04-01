@@ -33,6 +33,158 @@ fn prefill_debug_enabled() -> bool {
         .unwrap_or(false)
 }
 
+const MARLIN_PIPE_STAGES: usize = 4;
+const MARLIN_MIN_THREAD_N: usize = 64;
+const MARLIN_MIN_THREAD_K: usize = 64;
+const MARLIN_MAX_BLOCKS_PER_SM: usize = 4;
+const MARLIN_MAX_LOCK_SLOTS_PER_SM: usize = 4;
+
+fn marlin_moe_scales_cache_size(
+    thread_n: usize,
+    thread_k: usize,
+    prob_n: usize,
+    prob_k: usize,
+    num_bits: usize,
+    group_size: isize,
+    has_act_order: bool,
+    is_k_full: bool,
+) -> usize {
+    let cache_scales_chunk = has_act_order && !is_k_full;
+    let tb_n = thread_n;
+    let tb_k = thread_k;
+    let tb_groups = if group_size == -1 {
+        1
+    } else if group_size == 0 {
+        tb_k.div_ceil(32)
+    } else {
+        tb_k.div_ceil(group_size as usize)
+    };
+
+    if cache_scales_chunk {
+        let load_groups = (tb_groups * MARLIN_PIPE_STAGES * 2).max(32);
+        load_groups * tb_n * 2
+    } else {
+        let _ = (prob_n, prob_k, num_bits);
+        tb_groups * tb_n * 2 * MARLIN_PIPE_STAGES
+    }
+}
+
+fn marlin_moe_kernel_cache_size(
+    thread_m_blocks: usize,
+    thread_n: usize,
+    thread_k: usize,
+    prob_n: usize,
+    prob_k: usize,
+    num_bits: usize,
+    group_size: isize,
+    has_act_order: bool,
+    is_k_full: bool,
+    has_zp: bool,
+    is_zp_float: bool,
+) -> usize {
+    let pack_factor = 32 / num_bits;
+    let tb_k = thread_k;
+    let tb_n = thread_n;
+    let tb_m = thread_m_blocks * 16;
+    // MoE metadata ahead of sh_new matches the CUDA template layout:
+    // - sh_block_sorted_ids: moe_block_size / 4 int4s
+    // - sh_rd_block_sorted_ids: moe_block_size / 4 int4s
+    // - sh_block_topk_weights plus pad: moe_block_size / 2 + moe_block_size int4s
+    // Total = 2 * moe_block_size int4s = tb_m * 32 bytes.
+    let sh_block_meta_size = tb_m * 32;
+    let sh_a_size = MARLIN_PIPE_STAGES * (tb_m * tb_k) * 2;
+    let sh_b_size = MARLIN_PIPE_STAGES * (tb_k * tb_n / pack_factor) * 4;
+    let sh_red_size = tb_m * (tb_n + 8) * 2;
+    let sh_bias_size = tb_n * 2;
+    let mut tmp_size = sh_red_size.max(sh_b_size) + sh_bias_size;
+    tmp_size = tmp_size.max(sh_b_size.max(sh_red_size));
+    let sh_s_size = marlin_moe_scales_cache_size(
+        thread_n,
+        thread_k,
+        prob_n,
+        prob_k,
+        num_bits,
+        group_size,
+        has_act_order,
+        is_k_full,
+    );
+    let sh_g_idx_size = if has_act_order && !is_k_full {
+        MARLIN_PIPE_STAGES * tb_k / 4
+    } else {
+        0
+    };
+    let sh_zp_size = if has_zp {
+        if is_zp_float {
+            sh_s_size
+        } else if num_bits == 4 {
+            sh_s_size / 4
+        } else if num_bits == 8 {
+            sh_s_size / 2
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    tmp_size + sh_a_size + sh_s_size + sh_zp_size + sh_g_idx_size + sh_block_meta_size
+}
+
+fn fused_moe_fp32_reduce_floats(
+    moe_block_size: usize,
+    prob_n: usize,
+    prob_k: usize,
+    num_bits: usize,
+    group_size: usize,
+    sms: usize,
+    max_shared_mem: usize,
+) -> usize {
+    let thread_m_blocks = moe_block_size.div_ceil(16);
+    let candidate_cfgs: &[(usize, usize)] = if thread_m_blocks > 1 {
+        &[(64, 256), (64, 128)]
+    } else {
+        &[(128, 128), (64, 128)]
+    };
+    let group_size = group_size as isize;
+    let mut max_floats = 0usize;
+
+    for &(thread_k, thread_n) in candidate_cfgs {
+        if prob_k % thread_k != 0 || prob_n % thread_n != 0 {
+            continue;
+        }
+        if thread_n < MARLIN_MIN_THREAD_N || thread_k < MARLIN_MIN_THREAD_K {
+            continue;
+        }
+        let cache_size = marlin_moe_kernel_cache_size(
+            thread_m_blocks,
+            thread_n,
+            thread_k,
+            prob_n,
+            prob_k,
+            num_bits,
+            group_size,
+            false,
+            true,
+            false,
+            false,
+        );
+        if cache_size + 512 > max_shared_mem {
+            continue;
+        }
+        // The fused MoE kernel indexes C_tmp by locks_off rather than by launch
+        // block id. locks_off can consume any slot in the fixed workspace lock
+        // arena (sms * 4), so the FP32 reduction scratch must cover the full
+        // lock-slot fanout even when the chosen launch occupancy is 1 block/SM.
+        let floats = sms * MARLIN_MAX_LOCK_SLOTS_PER_SM * moe_block_size * thread_n;
+        max_floats = max_floats.max(floats);
+    }
+
+    if max_floats == 0 {
+        sms * moe_block_size * 256
+    } else {
+        max_floats
+    }
+}
+
 fn installed_package_sidecar(name: &str) -> Option<String> {
     use pyo3::types::PyModule;
 
@@ -1212,7 +1364,7 @@ impl PrefillEngine {
             if shared_scratch_elems > 0 {
                 self.d_shared_fp32_scratch = Some(self.device.alloc_zeros::<f32>(shared_scratch_elems)
                     .map_err(|e| format!("alloc shared_fp32_scratch: {e}"))?);
-                self.d_shared_workspace = Some(self.device.alloc_zeros::<i32>(self.config.sms * 4)
+                self.d_shared_workspace = Some(self.device.alloc_zeros::<i32>(self.config.sms * MARLIN_MAX_LOCK_SLOTS_PER_SM)
                     .map_err(|e| format!("alloc shared_workspace: {e}"))?);
             }
 
@@ -2416,7 +2568,7 @@ impl PrefillEngine {
         // locks[off] == expected). Stale non-zero values from prior calls cause
         // deadlocks or incorrect sync, producing zeros or garbage.
         let ws_ptr = *self.scratch.d_workspace.device_ptr();
-        let ws_len = self.config.sms * 4;
+        let ws_len = self.config.sms * MARLIN_MAX_LOCK_SLOTS_PER_SM;
         unsafe {
             cuda_sys::lib().cuMemsetD32Async(ws_ptr, 0, ws_len, self.stream);
         }
@@ -4597,7 +4749,6 @@ impl PrefillEngine {
         }
         let total_sorted = h_num_post[0] as usize;
         let active_experts = h_expert_counts.iter().filter(|&&c| c > 0).count();
-
         if diag_moe && layer_idx == 0 {
             eprintln!("[DIAG MoE L0] selective DMA: {}/{} experts active, total_sorted={}",
                 active_experts, n_experts, total_sorted);
@@ -4945,22 +5096,54 @@ impl PrefillEngine {
 
         let gs = self.config.group_size as i32;
         let q_type_ptr = &self.q_type as *const ScalarType as *const std::ffi::c_void;
+        let mut max_shared_mem: i32 = 0;
+        unsafe {
+            cuda_sys::lib().cuDeviceGetAttribute(
+                &mut max_shared_mem,
+                cuda_sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+                self.config.device_ordinal as i32,
+            );
+        }
+        let max_shared_mem = max_shared_mem.max(0) as usize;
+        let w1_ctmp_floats = fused_moe_fp32_reduce_floats(
+            block_size as usize,
+            w1_n,
+            h,
+            bits as usize,
+            self.config.group_size.max(1),
+            self.config.sms,
+            max_shared_mem,
+        );
+        let w2_ctmp_floats = fused_moe_fp32_reduce_floats(
+            block_size as usize,
+            h,
+            inter,
+            bits as usize,
+            self.config.group_size.max(1),
+            self.config.sms,
+            max_shared_mem,
+        );
 
         // Zero the workspace lock array and C_tmp before fused w1 GEMM.
         let ws_ptr = *self.scratch.d_workspace.device_ptr();
-        let ws_len = self.config.sms * 4;
+        let ws_len = self.config.sms * MARLIN_MAX_LOCK_SLOTS_PER_SM;
         unsafe {
             cuda_sys::lib().cuMemsetD32Async(ws_ptr, 0, ws_len, self.stream);
             // Zero C_tmp (FP32 scratch) — Marlin uses this for fp32_reduce accumulation
-            cuda_sys::lib().cuMemsetD32Async(fused_c_tmp_ptr, 0, total_sorted * w1_n, self.stream);
+            cuda_sys::lib().cuMemsetD32Async(fused_c_tmp_ptr, 0, w1_ctmp_floats, self.stream);
         }
 
-        // In pointer table mode, B and scales_ptr params are used as the base reference
-        // for kernel pointer arithmetic. The pointer table entries provide the actual
-        // per-expert addresses. B can be any valid GPU address (cold_staging_base works).
-        let w1_b_param = if use_ptr_table && w1_base == 0 { cold_staging_base } else { w1_base };
+        let w1_b_param = if use_ptr_table && w1_base == 0 {
+            cold_staging_base
+        } else {
+            w1_base
+        };
         let w1s_b_param = if use_ptr_table && w1s_base == 0 { cold_staging_base } else { w1s_base };
-        let w2_b_param = if use_ptr_table && w2_base == 0 { cold_staging_base } else { w2_base };
+        let w2_b_param = if use_ptr_table && w2_base == 0 {
+            cold_staging_base
+        } else {
+            w2_base
+        };
         let w2s_b_param = if use_ptr_table && w2s_base == 0 { cold_staging_base } else { w2s_base };
 
         // w1: A = fused_input (replicated [m*topk, h]), top_k=1 so kernel reads A[sorted_id] directly
@@ -5143,7 +5326,7 @@ impl PrefillEngine {
         // Zero workspace and C_tmp before fused w2 GEMM
         unsafe {
             cuda_sys::lib().cuMemsetD32Async(ws_ptr, 0, ws_len, self.stream);
-            cuda_sys::lib().cuMemsetD32Async(fused_c_tmp_ptr, 0, total_sorted * h, self.stream);
+            cuda_sys::lib().cuMemsetD32Async(fused_c_tmp_ptr, 0, w2_ctmp_floats, self.stream);
         }
         unsafe {
             fused_fn(
@@ -5189,7 +5372,6 @@ impl PrefillEngine {
                 if use_ptr_table { w2s_ptrs_gpu as *const _ } else { std::ptr::null() },  // S_expert_ptrs
             );
         }
-
         if let Some(t) = mt3 {
             self.stream_sync()?;
             self.t_moe_w2.set(self.t_moe_w2.get() + t.elapsed().as_secs_f64() * 1000.0);
@@ -6368,7 +6550,7 @@ impl PrefillEngine {
             .ok_or("d_shared_fp32_scratch not allocated (call prepare_for_prefill first)")?.device_ptr();
         let shared_ws = *self.d_shared_workspace.as_ref()
             .ok_or("d_shared_workspace not allocated (call prepare_for_prefill first)")?.device_ptr();
-        let shared_ws_len = self.config.sms * 4;
+        let shared_ws_len = self.config.sms * MARLIN_MAX_LOCK_SLOTS_PER_SM;
 
         // Zero workspace + C_tmp before w1 GEMM
         unsafe {
@@ -7169,7 +7351,7 @@ impl PrefillEngine {
         let hidden = *self.scratch.d_hidden.device_ptr();
         let s1_buf = *self.scratch.d_scratch1.device_ptr();
         let s2_buf = *self.scratch.d_scratch2.device_ptr();
-        let shared_ws_len = self.config.sms * 4;
+        let shared_ws_len = self.config.sms * MARLIN_MAX_LOCK_SLOTS_PER_SM;
 
         // BF16 validation mode: reuse the async BF16 method
         if let (Some(sw1_bf16), Some(sw2_bf16)) = (&lw.shared_w1_bf16, &lw.shared_w2_bf16) {
@@ -7875,7 +8057,7 @@ pub fn compute_scratch_vram(config: &PrefillModelConfig) -> (usize, usize) {
         } else { 0 };
         per_token += std::cmp::max(marlin_per_tok, la_per_tok) * 4; // FP32
     }
-    // d_workspace: fixed (sms * 4 * 4 bytes) -- ignore per-token
+    // d_workspace: fixed (sms * MARLIN_MAX_LOCK_SLOTS_PER_SM * 4 bytes) -- ignore per-token
     // d_topk_weights: max_tokens * topk * 4
     per_token += topk * 4;
     // d_topk_ids: max_tokens * topk * 4
@@ -7965,11 +8147,11 @@ pub fn compute_scratch_vram(config: &PrefillModelConfig) -> (usize, usize) {
 
     // Fixed costs (independent of max_tokens):
     let mut fixed: usize = 0;
-    // d_workspace: sms * 4 * 4
-    fixed += config.sms * 4 * 4;
-    // d_shared_workspace: sms * 4 * 4 (shared expert stream, allocated in prepare_for_prefill)
+    // d_workspace: sms * MARLIN_MAX_LOCK_SLOTS_PER_SM * 4
+    fixed += config.sms * MARLIN_MAX_LOCK_SLOTS_PER_SM * 4;
+    // d_shared_workspace: sms * MARLIN_MAX_LOCK_SLOTS_PER_SM * 4 (shared expert stream, allocated in prepare_for_prefill)
     if config.n_routed_experts > 0 {
-        fixed += config.sms * 4 * 4;
+        fixed += config.sms * MARLIN_MAX_LOCK_SLOTS_PER_SM * 4;
     }
     // d_logits: vocab_size * 4
     fixed += config.vocab_size * 4;
@@ -7984,6 +8166,7 @@ pub fn compute_scratch_vram(config: &PrefillModelConfig) -> (usize, usize) {
         let gs = config.group_size.max(1);
         let bits = config.expert_bits as usize;
         let w13_n = if config.moe_gated { 2 * moe_inter } else { moe_inter };
+        let max_moe_n = std::cmp::max(w13_n, h);
         let expert_bytes = h * w13_n * bits / 8  // w13 packed
             + (h / gs) * w13_n * 2               // w13 scales
             + moe_inter * h * bits / 8           // w2 packed
@@ -7997,6 +8180,20 @@ pub fn compute_scratch_vram(config: &PrefillModelConfig) -> (usize, usize) {
             + h * 2 + h * 2 + w1_n * 2 + moe_inter * 2    // gathered + expert_out + gate_up + inter (BF16)
             + 4;                                             // d_gather_src_map (i32)
         fixed += n_routed * block_size_moe * per_sorted_entry;
+
+        let reduce_floor = fused_moe_fp32_reduce_floats(
+            block_size_moe,
+            max_moe_n,
+            h,
+            bits,
+            gs,
+            config.sms,
+            usize::MAX,
+        );
+        let base_fixed_moe_accum = n_routed * block_size_moe * max_moe_n;
+        if reduce_floor > base_fixed_moe_accum {
+            fixed += (reduce_floor - base_fixed_moe_accum) * 4;
+        }
 
         // Fused expert_ids buffer: fused_blocks * 4 (approx n_routed + padding)
         // and num_tokens_post: 4 bytes. Small, just add a rough estimate.
@@ -8055,6 +8252,15 @@ pub fn allocate_scratch(
     } else {
         1 // minimal placeholder — no MoE execution at 0 tokens
     };
+    let mut max_shared_mem: i32 = 0;
+    unsafe {
+        cuda_sys::lib().cuDeviceGetAttribute(
+            &mut max_shared_mem,
+            cuda_sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+            config.device_ordinal as i32,
+        );
+    }
+    let max_shared_mem = max_shared_mem.max(0) as usize;
 
     // GpuBuf uses raw cuMemAlloc_v2 (synchronous, no pool) so alloc/free
     // is immediate and deterministic — no interaction with cudarc's pool.
@@ -8124,7 +8330,7 @@ pub fn allocate_scratch(
             } else { 0 };
             alloc_f32(std::cmp::max(marlin_ctmp, la_size), "fp32_scratch")?
         },
-        d_workspace: alloc_i32(config.sms * 4, "workspace")?,
+        d_workspace: alloc_i32(config.sms * MARLIN_MAX_LOCK_SLOTS_PER_SM, "workspace")?,
         d_topk_weights: alloc_f32(max_tokens * topk, "topk_weights")?,
         d_topk_ids: alloc_i32(max_tokens * topk, "topk_ids")?,
         d_token_ids: alloc_i32(max_tokens, "token_ids")?,
@@ -8166,7 +8372,17 @@ pub fn allocate_scratch(
         d_gate_out: alloc_f32(max_tokens * config.n_routed_experts.max(1), "gate_out")?,
         d_moe_accum: {
             let w1_n = if config.moe_gated { 2 * moe_inter } else { moe_inter };
-            alloc_f32(fsc * std::cmp::max(w1_n, h), "moe_accum")?
+            let max_moe_n = std::cmp::max(w1_n, h);
+            let reduce_floor = fused_moe_fp32_reduce_floats(
+                block_size_moe,
+                max_moe_n,
+                h,
+                config.expert_bits as usize,
+                config.group_size.max(1),
+                config.sms,
+                max_shared_mem,
+            );
+            alloc_f32((fsc * max_moe_n).max(reduce_floor), "moe_accum")?
         },
         d_moe_gathered: alloc_u16(fsc * h, "moe_gathered")?,
         d_moe_expert_out: alloc_u16(fsc * h, "moe_expert_out")?,

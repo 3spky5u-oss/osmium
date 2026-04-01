@@ -1,5 +1,23 @@
 # Krasis Benchmark Results
 
+## Standard Benchmarks — 2026-04-01 (QCN Polar4 AWQ padding rewrite)
+
+Hardware: EPYC 7742, 995 GB RAM, 1x RTX 5090 32 GB used for benchmark, 2x RTX 5090 present.
+
+Config: Qwen3-Coder-Next, 1 GPU, AWQ attention, Polar4 KV, GPU decode, HCS on, timing instrumentation off.
+
+| Variant | Prefill (tok/s) | Decode (tok/s) | HCS | Min free VRAM | Log |
+|--------|----------------:|---------------:|-----|--------------:|-----|
+| Intermediate rewrite (cached dummy ptrs + real-expert alias padding) | 7,398.3 | 90.99 | 17010/24576 (69.2%) | 686 MB | [report](../logs/dev-benchmark_20260401_083831/benchmark_report.log) |
+| Final rewrite (cached dummy ptrs + dummy-only zero-weight padding) | 7,769.5 | 96.43 | 17010/24576 (69.2%) | 686 MB | [report](20260401_084451_qcn_polar4_awq_5090_padding_rewrite.log) |
+
+Notes:
+- The first rewrite removed only the per-step `cuMemcpyDtoH` and did not recover the regression.
+- The final rewrite shows the remaining loss came from aliasing zero-weight slots onto a real expert during replay.
+- Standard benchmark log archived at `benchmarks/20260401_084451_qcn_polar4_awq_5090_padding_rewrite.log`.
+
+---
+
 ## GPU Decode Benchmark — 2026-03-02 (5090, 40% HCS, pinned memory)
 
 **Hardware:** EPYC 7742, 995 GB RAM, 1x RTX 5090 32 GB, PCIe 4.0 x16 (27 GB/s peak).
