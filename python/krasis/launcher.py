@@ -569,18 +569,10 @@ OPTIONS = [
                  choices=[2, 4, 6, 8, 10, 12], affects_budget=True),
     ConfigOption("KV cache (MB)", "kv_cache_mb",
                  opt_type="number", min_val=200, max_val=65500, step=100, affects_budget=True),
-    ConfigOption("KV dtype", "kv_dtype",
-                 choices=["polar4", "fp8_e4m3", "bf16"], affects_budget=True),
     ConfigOption("GPU expert bits", "gpu_expert_bits",
                  choices=[4, 8], affects_budget=True),
     ConfigOption("Attention quant", "attention_quant",
                  choices=["bf16", "awq"], affects_budget=True),
-    ConfigOption("Shared expert", "shared_expert_quant",
-                 choices=["int8", "bf16"], affects_budget=True),
-    ConfigOption("Dense MLP quant", "dense_mlp_quant",
-                 choices=["int8", "bf16"], affects_budget=True),
-    ConfigOption("LM head quant", "lm_head_quant",
-                 choices=["int8", "bf16"], affects_budget=True),
     ConfigOption("VRAM safety margin", "vram_safety_margin",
                  opt_type="number", min_val=500, max_val=8000, step=100),
     ConfigOption("Host/Port", "host", opt_type="text"),
@@ -1169,6 +1161,9 @@ class Launcher:
                 saved = _load_config(path)
                 if saved:
                     self.cfg.apply_saved(saved)
+                    # Interactive TUI keeps KV on the supported default even if
+                    # an older config file was saved with an internal mode.
+                    self.cfg.kv_dtype = "polar4"
                     # Re-resolve GPUs and PP after loading
                     self._resolve_selected_gpus()
                     if self.model_info:
@@ -1292,6 +1287,10 @@ class Launcher:
             self.cfg.pp_partition = self._compute_default_pp(self.model_info["layers"])
         if self.hw["cpu_cores"] > 0:
             self.cfg.krasis_threads = min(self.hw["cpu_cores"], 40)
+
+        # Keep the interactive surface to the supported mainstream path.
+        # Manual configs and CLI flags can still use other internal modes.
+        self.cfg.kv_dtype = "polar4"
 
         # Compute initial budget
         self.budget = self._compute_budget()
