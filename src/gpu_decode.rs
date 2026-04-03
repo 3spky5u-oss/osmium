@@ -6484,7 +6484,7 @@ impl GpuDecodeStore {
             shared_expert_bits: graph.shared_expert_bits,
             group_size: graph.group_size,
             sms: graph.num_sms,
-            device_ordinal: 0, // TODO: get from device
+            device_ordinal: self.gpu_index(),
             layer_types,
             first_k_dense: 0, // TODO: from model config
             scoring_func,
