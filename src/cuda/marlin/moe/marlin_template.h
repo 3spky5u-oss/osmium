@@ -421,6 +421,7 @@ __global__ void Marlin(
   int64_t expert_id = 0;  // use int64 to avoid computation result overflow
   int old_expert_id = 0;
   int64_t B_expert_off = 0;
+  const int4* active_B_base = B;
   bool advanced_moe_block = false;
 
   int4* sh_block_sorted_ids_int4 = sh;
@@ -541,19 +542,11 @@ __global__ void Marlin(
     }
 
     if (B_expert_ptrs != nullptr) {
-      // Pointer table mode: compute B offset from per-expert pointer
-      // B_ptr[i] was initialized relative to B (which may be an arbitrary base).
-      // Do address math explicitly in bytes here instead of subtracting unrelated
-      // pointers directly: the latter is undefined behavior in C++ and can miscompile
-      // for mixed HCS / pinning / cold-staging allocations.
-      const long long expert_addr =
-          reinterpret_cast<long long>(reinterpret_cast<const char*>(reinterpret_cast<const int4*>(B_expert_ptrs[expert_id])));
-      const long long base_addr =
-          reinterpret_cast<long long>(reinterpret_cast<const char*>(B));
-      B_expert_off = (expert_addr - base_addr) / static_cast<long long>(sizeof(int4));
+      active_B_base = reinterpret_cast<const int4*>(B_expert_ptrs[expert_id]);
+      B_expert_off = 0;
       scales_ptr = reinterpret_cast<const int4*>(S_expert_ptrs[expert_id]);
     } else {
-      // Contiguous buffer mode: arithmetic offset
+      active_B_base = B;
       B_expert_off = expert_id * prob_n * prob_k / (pack_factor * 4);
       scales_ptr += (expert_id - old_expert_id) * scales_expert_stride;
     }
@@ -701,9 +694,10 @@ __global__ void Marlin(
                 (threadIdx.x % 32) / (16 / (m_block_size_8 ? 2 : 1));
   a_sh_rd += 2 * ((threadIdx.x / 32) / (thread_n_blocks / 4));
 
-  int b_gl_rd = b_gl_stride * (threadIdx.x / b_sh_stride_threads) + (threadIdx.x % b_sh_stride_threads) * b_thread_vecs;
-  b_gl_rd += b_sh_stride * slice_col;
-  b_gl_rd += b_gl_rd_delta_o * slice_row;
+  int b_gl_rd_base = b_gl_stride * (threadIdx.x / b_sh_stride_threads) + (threadIdx.x % b_sh_stride_threads) * b_thread_vecs;
+  auto current_b_gl_rd = [&]() {
+    return b_gl_rd_base + b_sh_stride * slice_col + b_gl_rd_delta_o * slice_row;
+  };
   auto b_sh_wr = threadIdx.x * b_thread_vecs;
   auto b_sh_rd = threadIdx.x * b_thread_vecs;
 
@@ -814,13 +808,14 @@ __global__ void Marlin(
   // runtime; we break dependencies between subsequent accesses with a tile by
   // maintining multiple pointers (we have enough registers), a tiny
   // optimization.
-  int64_t b_elem_idx[b_sh_wr_iters];
-  auto reset_b_elem_idx = [&]() {
+  int64_t b_elem_base[b_sh_wr_iters];
+  auto reset_b_elem_base = [&]() {
+    int b_gl_rd = current_b_gl_rd();
 #pragma unroll
     for (int i = 0; i < b_sh_wr_iters; i++)
-      b_elem_idx[i] = b_gl_rd_delta_i * i + b_gl_rd;
+      b_elem_base[i] = b_gl_rd_delta_i * i + b_gl_rd;
   };
-  reset_b_elem_idx();
+  reset_b_elem_base();
   advanced_moe_block = false;
 
   // Shared memory storage for global fetch pipelines.
@@ -939,20 +934,20 @@ __global__ void Marlin(
         for (int j = 0; j < b_thread_vecs; j++) {
           if (B_expert_ptrs != nullptr) {
             const long long expert_addr =
-                static_cast<long long>(reinterpret_cast<intptr_t>(reinterpret_cast<const void*>(B_expert_ptrs[expert_id])));
+                static_cast<long long>(reinterpret_cast<intptr_t>(reinterpret_cast<const void*>(active_B_base)));
             const long long src_addr =
-                expert_addr + static_cast<long long>(b_elem_idx[i] + j) * static_cast<long long>(sizeof(int4));
+                expert_addr + static_cast<long long>(b_elem_base[i] + j) * static_cast<long long>(sizeof(int4));
             cp_async4(
                 &sh_b_stage[b_sh_wr_delta * i + b_sh_wr + j],
                 reinterpret_cast<const int4*>(static_cast<uintptr_t>(src_addr)));
           } else {
             cp_async4(
                 &sh_b_stage[b_sh_wr_delta * i + b_sh_wr + j],
-                B + b_elem_idx[i] + j + B_expert_off);
+                active_B_base + b_elem_base[i] + j + B_expert_off);
           }
         }
 
-        b_elem_idx[i] += b_gl_rd_delta_o;
+        b_elem_base[i] += b_gl_rd_delta_o;
       }
 
       if constexpr (has_act_order) {
@@ -1930,16 +1925,16 @@ __global__ void Marlin(
       if (slice_iters) {
         a_gl_rd_col = (threadIdx.x % a_gl_rd_delta_o);
         if (advanced_moe_block) {
-          reset_b_elem_idx();
+          reset_b_elem_base();
           advanced_moe_block = false;
         } else {
 #pragma unroll
           for (int i = 0; i < b_sh_wr_iters; i++)
-            b_elem_idx[i] += b_sh_stride - b_gl_rd_delta_o * k_tiles;
+            b_elem_base[i] += b_sh_stride - b_gl_rd_delta_o * k_tiles;
           if (slice_col == 0) {
 #pragma unroll
             for (int i = 0; i < b_sh_wr_iters; i++)
-              b_elem_idx[i] -= b_gl_stride;
+              b_elem_base[i] -= b_gl_stride;
           }
         }
 
