@@ -894,6 +894,7 @@ pub struct PrefillEngine {
     pub stream: cuda_sys::CUstream,
     pub copy_stream: cuda_sys::CUstream,
     pub cublas_handle: cudarc::cublas::sys::cublasHandle_t,
+    pub shared_cublas_handle: cudarc::cublas::sys::cublasHandle_t,
     pub h_logits: Vec<f32>,
     // Host staging buffers for routing results
     pub h_topk_ids: Vec<i32>,
@@ -1034,6 +1035,37 @@ pub struct AttnWeightStreamBufs {
 // (single-request guarantee). The raw pointers themselves are thread-safe CUDA handles.
 unsafe impl Send for PrefillEngine {}
 unsafe impl Sync for PrefillEngine {}
+
+impl Drop for PrefillEngine {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.shared_event.is_null() {
+                let _ = cuda_sys::lib().cuEventDestroy_v2(self.shared_event);
+            }
+            if !self.compute_event.is_null() {
+                let _ = cuda_sys::lib().cuEventDestroy_v2(self.compute_event);
+            }
+            if !self.dma_event.is_null() {
+                let _ = cuda_sys::lib().cuEventDestroy_v2(self.dma_event);
+            }
+            if !self.shared_stream.is_null() {
+                let _ = cuda_sys::lib().cuStreamDestroy_v2(self.shared_stream);
+            }
+            if !self.copy_stream.is_null() {
+                let _ = cuda_sys::lib().cuStreamDestroy_v2(self.copy_stream);
+            }
+            if !self.stream.is_null() {
+                let _ = cuda_sys::lib().cuStreamDestroy_v2(self.stream);
+            }
+            if !self.shared_cublas_handle.is_null() {
+                let _ = cudarc::cublas::result::destroy_handle(self.shared_cublas_handle);
+            }
+            if !self.cublas_handle.is_null() {
+                let _ = cudarc::cublas::result::destroy_handle(self.cublas_handle);
+            }
+        }
+    }
+}
 
 impl PrefillEngine {
     pub fn set_safety_margin_mb(&mut self, margin_mb: usize) {
@@ -6694,12 +6726,8 @@ impl PrefillEngine {
             unsafe {
                 use cudarc::cublas::sys as cublas_sys;
                 use cudarc::cublas::result as cublas_result;
-                cublas_result::set_stream(
-                    self.cublas_handle,
-                    self.shared_stream as cublas_sys::cudaStream_t,
-                ).map_err(|e| format!("cublas set_stream shared: {:?}", e))?;
                 cublas_result::gemm_ex(
-                    self.cublas_handle,
+                    self.shared_cublas_handle,
                     cublas_sys::cublasOperation_t::CUBLAS_OP_T,
                     cublas_sys::cublasOperation_t::CUBLAS_OP_N,
                     sw1.n as i32, m as i32, sw1.k as i32,
@@ -6738,12 +6766,8 @@ impl PrefillEngine {
             unsafe {
                 use cudarc::cublas::sys as cublas_sys;
                 use cudarc::cublas::result as cublas_result;
-                cublas_result::set_stream(
-                    self.cublas_handle,
-                    self.shared_stream as cublas_sys::cudaStream_t,
-                ).map_err(|e| format!("cublas set_stream shared: {:?}", e))?;
                 cublas_result::gemm_ex(
-                    self.cublas_handle,
+                    self.shared_cublas_handle,
                     cublas_sys::cublasOperation_t::CUBLAS_OP_T,
                     cublas_sys::cublasOperation_t::CUBLAS_OP_N,
                     sw2.n as i32, m as i32, sw2.k as i32,
@@ -6778,12 +6802,8 @@ impl PrefillEngine {
             unsafe {
                 use cudarc::cublas::sys as cublas_sys;
                 use cudarc::cublas::result as cublas_result;
-                cublas_result::set_stream(
-                    self.cublas_handle,
-                    self.shared_stream as cublas_sys::cudaStream_t,
-                ).map_err(|e| format!("cublas set_stream shared: {:?}", e))?;
                 cublas_result::gemm_ex(
-                    self.cublas_handle,
+                    self.shared_cublas_handle,
                     cublas_sys::cublasOperation_t::CUBLAS_OP_T,
                     cublas_sys::cublasOperation_t::CUBLAS_OP_N,
                     sw2.n as i32, m as i32, sw2.k as i32,
@@ -6804,16 +6824,6 @@ impl PrefillEngine {
                 cuda_sys::lib().cuMemcpyDtoDAsync_v2(
                     s1_buf, s2_buf, (m * h * 2) as usize, self.shared_stream);
             }
-        }
-
-        // Restore cuBLAS to main stream
-        unsafe {
-            use cudarc::cublas::sys as cublas_sys;
-            use cudarc::cublas::result as cublas_result;
-            let _ = cublas_result::set_stream(
-                self.cublas_handle,
-                self.stream as cublas_sys::cudaStream_t,
-            );
         }
 
         Ok(())

@@ -113,11 +113,14 @@ Config: Qwen3-Coder-Next, INT4 experts, AWQ attention, Polar4 KV, standard comma
 | 2026-04-03 20:11 | fb49b0f + local BF-05 clean import | Keep ptr-table `B` fetch source indices signed through slice rewinds and guard the hazard path with `cp_async4_pred` | 7,515.0 | 97.82 | 128.37 | 17010/24576 (69.2%) | 686 MB | PASS | [log](20260403_201155_qcn_polar4_awq_5090_bf05_signed_fetch_guard.log) |
 | 2026-04-03 20:36 | 4aa3bee + local no-valid-block guard | Exit `update_next_moe_block_data()` cleanly when invalid-block scanning reaches the padded tail without finding another valid expert block | 7,606.7 | 99.88 | 137.25 | 17010/24576 (69.2%) | 686 MB | PASS | [log](20260403_203640_qcn_polar4_awq_5090_no_valid_block_guard.log) |
 | 2026-04-03 20:54 | 7d09912 + local BF-09 | Feed the active decode-store CUDA ordinal into `PrefillModelConfig` so fused-MoE shared-memory capability queries stop assuming GPU 0 | 7,745.6 | 95.55 | 120.95 | 17010/24576 (69.2%) | 686 MB | PASS | [log](20260403_205423_qcn_polar4_awq_5090_bf09_device_ordinal.log) |
+| 2026-04-03 21:23 | df6c259 + local BF-13 | Split BF16 shared-expert cuBLAS ownership so `shared_stream` uses a dedicated handle instead of retargeting the main prefill handle across streams | 7,498.6 | 100.62 | 137.97 | 17010/24576 (69.2%) | 682 MB | PASS | [log](20260403_212300_qcn_polar4_awq_5090_bf13_shared_cublas_handle.log) |
 
 Notes:
 - The BF-03 cache edit built cleanly through `./dev build`.
 - This benchmark failed in long VRAM calibration at `39,920` prompt tokens before the timed benchmark section.
 - Failure remained `CUDA_ERROR_ILLEGAL_ADDRESS (grid=(39920, 1, 1), block=(1024, 1, 1), smem=4096, nparams=6)`.
+- BF-13 cleared warmup, long calibration, HCS load, and the full timed benchmark on the standard QCN AWQ Polar4 path.
+- BF-13 behaved like a correctness/stability fix with no obvious throughput regression; decode returned to ~100 tok/s while preserving async shared-expert overlap.
 - Reverting the BF-03 cache follow-up did not restore a successful run on this attempt; the same long-calibration illegal-address fault reproduced with the same short-calibration numbers.
 - After reboot, the same BF-03 cache state completed the full standard benchmark cleanly and produced the best prefill result in this local series.
 - The BF-04 clean import also completed the full standard benchmark cleanly on the same branch state, but did not improve throughput versus the earlier post-reboot BF-03 pass.

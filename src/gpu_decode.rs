@@ -6382,7 +6382,6 @@ impl GpuDecodeStore {
         // Create cuBLAS handle
         let cublas_handle = cudarc::cublas::result::create_handle()
             .map_err(|e| format!("Create cuBLAS handle: {:?}", e))?;
-
         // Build model config
         let num_layers = graph.layers.len();
         let mut layer_types = vec![0u8; num_layers];
@@ -6897,6 +6896,14 @@ impl GpuDecodeStore {
             }
             stream
         };
+        let shared_cublas_handle = cudarc::cublas::result::create_handle()
+            .map_err(|e| format!("Create shared cuBLAS handle: {:?}", e))?;
+        unsafe {
+            cudarc::cublas::result::set_stream(
+                shared_cublas_handle,
+                shared_stream as cudarc::cublas::sys::cudaStream_t,
+            ).map_err(|e| format!("Set shared cuBLAS stream: {:?}", e))?;
+        }
         let shared_event = unsafe {
             let mut event: cuda_sys::CUevent = std::ptr::null_mut();
             let err = cuda_sys::lib().cuEventCreate(
@@ -7004,6 +7011,7 @@ impl GpuDecodeStore {
             stream: prefill_stream,
             copy_stream,
             cublas_handle,
+            shared_cublas_handle,
             h_logits: Vec::new(),
             h_topk_ids: vec![0i32; max_possible_chunk * topk],
             h_topk_weights: vec![0.0f32; max_possible_chunk * topk],
