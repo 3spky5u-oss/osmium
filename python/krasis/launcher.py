@@ -569,9 +569,7 @@ OPTIONS = [
                  choices=[2, 4, 6, 8, 10, 12], affects_budget=True),
     ConfigOption("KV cache (MB)", "kv_cache_mb",
                  opt_type="number", min_val=200, max_val=65500, step=100, affects_budget=True),
-    ConfigOption("KV dtype", "kv_dtype",
-                 choices=["polar4", "fp8_e4m3", "bf16"], affects_budget=True),
-    ConfigOption("GPU expert bits", "gpu_expert_bits",
+    ConfigOption("Model quantization", "gpu_expert_bits",
                  choices=[4, 8], affects_budget=True),
     ConfigOption("Attention quant", "attention_quant",
                  choices=["bf16", "awq"], affects_budget=True),
@@ -1213,7 +1211,12 @@ class Launcher:
             except ValueError:
                 idx = 0
             idx = (idx + direction) % len(choices)
-            setattr(self.cfg, opt.key, choices[idx])
+            new_val = choices[idx]
+            setattr(self.cfg, opt.key, new_val)
+            if opt.key == "gpu_expert_bits":
+                # The launcher exposes one expert quantization choice, so keep
+                # the underlying runtime config keys aligned.
+                self.cfg.cpu_expert_bits = int(new_val)
         elif opt.opt_type == "number":
             new_val = int(val) + direction * opt.step
             new_val = max(opt.min_val, min(opt.max_val, new_val))
@@ -1292,6 +1295,10 @@ class Launcher:
             self.cfg.pp_partition = self._compute_default_pp(self.model_info["layers"])
         if self.hw["cpu_cores"] > 0:
             self.cfg.krasis_threads = min(self.hw["cpu_cores"], 40)
+        # Keep the interactive launcher on the supported user-facing path:
+        # one expert quantization choice, Polar4 KV by default in the TUI.
+        self.cfg.cpu_expert_bits = self.cfg.gpu_expert_bits
+        self.cfg.kv_dtype = "polar4"
 
         # Compute initial budget
         self.budget = self._compute_budget()
@@ -1445,7 +1452,7 @@ class Launcher:
         print(f"  Layer group:     {self.cfg.layer_group_size} layers (double-buffered)")
         print(f"  KV cache:        {self.cfg.kv_cache_mb:,} MB")
         print(f"  KV dtype:        {self.cfg.kv_dtype}")
-        print(f"  GPU expert bits: {self.cfg.gpu_expert_bits}")
+        print(f"  Quantization:    INT{self.cfg.gpu_expert_bits}")
         print(f"  Attention quant: {self.cfg.attention_quant}")
         print(f"  Shared expert:   {self.cfg.shared_expert_quant}")
         dense_layers = (self.model_info or {}).get("dense_layers", 0)
@@ -1606,7 +1613,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kv-dtype", default=None,
                         help="KV cache dtype: fp8_e4m3, polar4, or bf16")
     parser.add_argument("--gpu-expert-bits", type=int, default=None,
-                        help="GPU Marlin expert bits: 4 or 8")
+                        help="Model quantization: 4 or 8")
     parser.add_argument("--attention-quant", default=None,
                         help="Attention weight quant: bf16 or awq")
     parser.add_argument("--shared-expert-quant", default=None,

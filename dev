@@ -784,7 +784,11 @@ do_awq_calibrate() {
     local conf
     conf=$(resolve_config "$1")
     shift
-    cleanup_gpu "$conf"
+    if [[ "${KRASIS_SKIP_GPU_CLEANUP:-0}" != "1" ]]; then
+        cleanup_gpu "$conf"
+    else
+        info "Skipping GPU cleanup for nested AWQ calibration"
+    fi
     auto_rebuild
     local run_dir
     run_dir=$(create_run_dir "dev-awq-calibrate")

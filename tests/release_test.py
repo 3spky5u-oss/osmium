@@ -58,13 +58,10 @@ SUPPORTED_MODELS = [
 ]
 
 CONFIG_VARIANTS = [
-    {"name": "INT4/INT4 BF16",  "gpu_bits": 4, "cpu_bits": 4, "attention": "bf16"},
-    {"name": "INT4/INT4 AWQ",   "gpu_bits": 4, "cpu_bits": 4, "attention": "awq"},
-    {"name": "INT8/INT8 AWQ",   "gpu_bits": 8, "cpu_bits": 8, "attention": "awq"},
-    # Thinking variant — same as AWQ but with enable_thinking=True
-    {"name": "INT4/INT4 AWQ Think", "gpu_bits": 4, "cpu_bits": 4, "attention": "awq", "thinking": True},
-    # Multi-GPU variant — skipped automatically if only 1 GPU available
-    {"name": "INT4/INT4 AWQ Multi-GPU", "gpu_bits": 4, "cpu_bits": 4, "attention": "awq", "multi_gpu": True},
+    {"name": "INT4 BF16", "bits": 4, "attention": "bf16"},
+    {"name": "INT4 AWQ", "bits": 4, "attention": "awq"},
+    {"name": "INT8 AWQ", "bits": 8, "attention": "awq"},
+    {"name": "INT4 AWQ Multi-GPU", "bits": 4, "attention": "awq", "multi_gpu": True},
 ]
 
 # ANSI codes (for terminal output only — stripped from report)
@@ -230,25 +227,23 @@ def estimate_total_params_b(config: Dict) -> float:
 def generate_config(model_name: str, variant: Dict, gpu_idx: int,
                     num_layers: int, all_gpu_indices: Optional[List[int]] = None) -> str:
     """Generate a temporary config file. Returns path to temp file.
-
-    For multi-GPU variants, all_gpu_indices is used for CFG_SELECTED_GPUS.
     """
     model_path = os.path.join(MODELS_DIR, model_name)
-
+    bits = variant["bits"]
     if variant.get("multi_gpu") and all_gpu_indices and len(all_gpu_indices) > 1:
-        gpu_str = ",".join(str(i) for i in all_gpu_indices)
+        gpu_selection = ",".join(str(i) for i in all_gpu_indices)
     else:
-        gpu_str = str(gpu_idx)
+        gpu_selection = str(gpu_idx)
 
     lines = [
         f"# Release test config — {variant['name']}",
         f'MODEL_PATH="{model_path}"',
-        f'CFG_SELECTED_GPUS="{gpu_str}"',
+        f'CFG_SELECTED_GPUS="{gpu_selection}"',
         f'CFG_PP_PARTITION="{num_layers}"',
         f'CFG_LAYER_GROUP_SIZE="2"',
         f'CFG_KV_DTYPE="polar4"',
-        f'CFG_GPU_EXPERT_BITS="{variant["gpu_bits"]}"',
-        f'CFG_CPU_EXPERT_BITS="{variant["cpu_bits"]}"',
+        f'CFG_GPU_EXPERT_BITS="{bits}"',
+        f'CFG_CPU_EXPERT_BITS="{bits}"',
         f'CFG_ATTENTION_QUANT="{variant["attention"]}"',
         f'CFG_SHARED_EXPERT_QUANT="int8"',
         f'CFG_DENSE_MLP_QUANT="int8"',
@@ -268,16 +263,18 @@ def generate_config(model_name: str, variant: Dict, gpu_idx: int,
 # Cache Building (Pre-flight)
 # ═══════════════════════════════════════════════════════════════════
 
-def cache_exists(model_name: str, gpu_bits: int, cpu_bits: int) -> bool:
-    """Check if GPU Marlin expert cache exists for given bit-width.
+def cache_exists(model_name: str, bits: int) -> bool:
+    """Check if the Marlin expert cache exists for a given quantization.
 
-    CPU expert caches are no longer used (GPU-only decode mode).
+    The user-facing surface exposes one expert quantization choice. Runtime
+    still expects matching GPU/host bit-width config keys, but there is only
+    one cache artifact per quantization level.
     Checks for any group size (g32, g64, g128) since the Rust engine tries
     multiple group sizes when building.
     """
     import glob as _glob
     model_cache = os.path.join(CACHE_DIR, model_name)
-    has_gpu = bool(_glob.glob(os.path.join(model_cache, f"experts_marlin_int{gpu_bits}_g*.bin")))
+    has_gpu = bool(_glob.glob(os.path.join(model_cache, f"experts_marlin_int{bits}_g*.bin")))
     return has_gpu
 
 
@@ -295,13 +292,15 @@ def build_caches(model_name: str, gpu_idx: int, num_layers: int,
     # Collect unique bit-widths needed across all config variants
     needed_bits = set()
     for variant in CONFIG_VARIANTS:
-        if skip_int8 and variant["gpu_bits"] == 8:
+        if variant.get("multi_gpu"):
             continue
-        needed_bits.add(variant["gpu_bits"])  # gpu_bits == cpu_bits in our configs
+        if skip_int8 and variant["bits"] == 8:
+            continue
+        needed_bits.add(variant["bits"])
 
     results = {}
     for bits in sorted(needed_bits):
-        if not force and cache_exists(model_name, bits, bits):
+        if not force and cache_exists(model_name, bits):
             ok(f"INT{bits} cache already exists — skipping build")
             results[bits] = True
             continue
@@ -471,15 +470,16 @@ def build_awq_template(model_name: str, gpu_idx: int, num_layers: int,
         with os.fdopen(fd, "w") as f:
             f.write("\n".join(lines) + "\n")
 
-        # Run AWQ calibration directly via Python module.
-        # We can't use ./dev awq-calibrate because its cleanup_gpu would kill
-        # THIS release test process (pgrep matches 'python.*krasis\.').
-        # We're already inside ./dev release-test which set up the conda env.
-        cmd = [sys.executable, "-m", "krasis.awq_calibrate", "--config", config_path]
+        script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        cmd = ["./dev", "awq-calibrate", config_path]
+        child_env = os.environ.copy()
+        child_env["KRASIS_SKIP_GPU_CLEANUP"] = "1"
 
         log_file = open(log_path, "w")
         proc = subprocess.Popen(
             cmd,
+            cwd=script_dir,
+            env=child_env,
             stdout=log_file,
             stderr=subprocess.STDOUT,
             preexec_fn=os.setsid,
@@ -2147,7 +2147,6 @@ def main():
     gpu_idx, gpu_name, gpu_vram = detect_best_gpu()
     all_gpus = detect_all_gpus()
     all_gpu_indices = [g[0] for g in all_gpus]
-
     # Find krasis command
     krasis_cmd = find_krasis_command()
 
@@ -2159,10 +2158,9 @@ def main():
         gpu_summary = ", ".join(f"{g[1]} ({g[2]} MB)" for g in all_gpus)
         info(f"All GPUs: {gpu_summary}")
     info(f"Krasis: {krasis_cmd}")
-    # Count active variants (skip multi-GPU if only 1 GPU, skip INT8 if >200B)
     active_variants = [v for v in CONFIG_VARIANTS
                        if (not v.get("multi_gpu") or len(all_gpus) > 1)
-                       and (not skip_int8 or v["gpu_bits"] != 8)]
+                       and (not skip_int8 or v["bits"] != 8)]
     skip_reasons = []
     if len(all_gpus) <= 1 and any(v.get("multi_gpu") for v in CONFIG_VARIANTS):
         skip_reasons.append("multi-GPU skipped: only 1 GPU")
@@ -2214,7 +2212,7 @@ def main():
 
     # ── Pre-flight: build AWQ template ──────────────────────────
 
-    needs_awq = any(v["attention"] == "awq" and (not skip_int8 or v["gpu_bits"] != 8)
+    needs_awq = any(v["attention"] == "awq" and (not skip_int8 or v["bits"] != 8)
                     for v in CONFIG_VARIANTS)
     if needs_awq:
         print(f"{'=' * 64}")
@@ -2255,7 +2253,7 @@ def main():
             continue
 
         # Skip INT8 configs for models >200B params
-        if skip_int8 and variant["gpu_bits"] == 8:
+        if skip_int8 and variant["bits"] == 8:
             result["error"] = f"INT8 skipped — model is ~{total_params_b:.0f}B params (>200B)"
             warn("Skipping (INT8 too large for >200B model)")
             session_notify(
@@ -2276,8 +2274,9 @@ def main():
 
         try:
             # 1. Generate temp config
-            config_path = generate_config(model_name, variant, gpu_idx, num_layers,
-                                          all_gpu_indices=all_gpu_indices)
+            config_path = generate_config(
+                model_name, variant, gpu_idx, num_layers, all_gpu_indices=all_gpu_indices
+            )
             info(f"Config: {config_path}")
 
             # 2. Launch krasis --config <file> --benchmark
