@@ -11,6 +11,7 @@
 #   ./dev network <port>            Run network tests against a running server
 #   ./dev network <port> --large    Include large-prompt tests
 #   ./dev benchmark <config>        Run standard benchmark (prefill/decode/round trip) and exit
+#   ./dev speed-test                Run the fixed standard speed benchmark (QCN INT4 AWQ Polar4)
 #   ./dev perplexity <config>       Run perplexity eval (WikiText-2 by default) and exit
 #   ./dev release-test <model>      Run full release test (5 configs, produces report)
 #   ./dev release-test-all [target]  Run release test on all supported models sequentially
@@ -65,6 +66,7 @@ SO_FILE="$SCRIPT_DIR/python/krasis/krasis.cpython-311-x86_64-linux-gnu.so"
 WHEEL_DIR="$SCRIPT_DIR/target/dev-wheels"
 REPO_PYTHONPATH="$SCRIPT_DIR/python"
 REPO_LIBPATH="$SCRIPT_DIR/python/krasis.libs"
+STANDARD_SPEED_TEST_CONFIG="$SCRIPT_DIR/tests/qcn-polar4-awq.conf"
 
 RED="\033[0;31m"
 GREEN="\033[0;32m"
@@ -752,6 +754,12 @@ do_benchmark() {
     info "Benchmark log saved: $logfile"
 }
 
+do_speed_test() {
+    [[ -f "$STANDARD_SPEED_TEST_CONFIG" ]] || err "Standard speed-test config not found: $STANDARD_SPEED_TEST_CONFIG"
+    info "Standard speed benchmark config: $STANDARD_SPEED_TEST_CONFIG"
+    do_benchmark "$STANDARD_SPEED_TEST_CONFIG" "$@"
+}
+
 do_perplexity() {
     [[ $# -lt 1 ]] && err "Usage: ./dev perplexity <config> [--dataset wikitext-2] [--max-tokens N]"
     local conf
@@ -980,6 +988,7 @@ case "$cmd" in
     run)            do_run "$@" ;;
     test)           do_test "$@" ;;
     benchmark)      do_benchmark "$@" ;;
+    speed-test|speedtest) do_speed_test "$@" ;;
     release-test)   do_release_test "$@" ;;
     release-test-all) do_release_test_all "$@" ;;
     reference-test) do_reference_test "$@" ;;
@@ -1000,6 +1009,7 @@ case "$cmd" in
         echo "  build                     Rebuild Rust extension into this repo only"
         echo "  run <config> [flags]      Launch server (add --benchmark for benchmarks)"
         echo "  benchmark <config>        Run standard benchmark and exit"
+        echo "  speed-test                Run the fixed standard speed benchmark"
         echo "  release-test <model>      Run full release test (5 configs, report)"
         echo "  reference-test <config>   Compare engine output against BF16 reference data"
         echo "  reference-test --compare <model>  Run 4 quant configs, comparative report"
@@ -1031,11 +1041,13 @@ case "$cmd" in
         echo ""
         echo "Configs: qcn, qcn-a4, q235, q235-a4, v2lite, deepseek-vl, qwen35, qwen35-a4"
         echo "         (or path to .conf file)"
+        echo "Standard speed benchmark config: tests/qcn-polar4-awq.conf"
         echo ""
         echo "Examples:"
         echo "  ./dev build"
         echo "  ./dev run qcn"
         echo "  ./dev run qcn --benchmark"
+        echo "  ./dev speed-test"
         echo "  ./dev benchmark qcn --timing    Profile decode components"
         echo "  ./dev benchmark qcn             Normal speed benchmark"
         echo "  ./dev release-test Qwen3-Coder-Next    Full release test"
