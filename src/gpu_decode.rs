@@ -6512,7 +6512,13 @@ impl GpuDecodeStore {
             rope_half_dim: graph.rope_half_dim,
             prefill_chunk_size: 0, // computed dynamically below
             layer_group_size: 4,      // group MoE layers for expert DMA pipelining
+            fused_moe_w1_ctmp_floats: 0,
+            fused_moe_w2_ctmp_floats: 0,
         };
+        let (fused_moe_w1_ctmp_floats, fused_moe_w2_ctmp_floats) =
+            fused_moe_ctmp_floats_for_config(&config);
+        config.fused_moe_w1_ctmp_floats = fused_moe_w1_ctmp_floats;
+        config.fused_moe_w2_ctmp_floats = fused_moe_w2_ctmp_floats;
 
         // Scratch allocation is DYNAMIC per-prompt via prepare_for_prefill/release_scratch.
         // At init, allocate minimal 1-token scratch so HCS gets maximum VRAM.

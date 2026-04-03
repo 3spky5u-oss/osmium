@@ -185,6 +185,50 @@ fn fused_moe_fp32_reduce_floats(
     }
 }
 
+fn max_shared_mem_for_device(device_ordinal: usize) -> usize {
+    let mut max_shared_mem: i32 = 0;
+    unsafe {
+        cuda_sys::lib().cuDeviceGetAttribute(
+            &mut max_shared_mem,
+            cuda_sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+            device_ordinal as i32,
+        );
+    }
+    max_shared_mem.max(0) as usize
+}
+
+pub fn fused_moe_ctmp_floats_for_config(config: &PrefillModelConfig) -> (usize, usize) {
+    if config.n_routed_experts == 0 {
+        return (0, 0);
+    }
+    let moe_block_size = 64;
+    let hidden_size = config.hidden_size;
+    let moe_intermediate_size = config.moe_intermediate_size;
+    let expert_bits = config.expert_bits as usize;
+    let group_size = config.group_size.max(1);
+    let max_shared_mem = max_shared_mem_for_device(config.device_ordinal);
+    let w1_n = if config.moe_gated { 2 * moe_intermediate_size } else { moe_intermediate_size };
+    let w1_ctmp_floats = fused_moe_fp32_reduce_floats(
+        moe_block_size,
+        w1_n,
+        hidden_size,
+        expert_bits,
+        group_size,
+        config.sms,
+        max_shared_mem,
+    );
+    let w2_ctmp_floats = fused_moe_fp32_reduce_floats(
+        moe_block_size,
+        hidden_size,
+        moe_intermediate_size,
+        expert_bits,
+        group_size,
+        config.sms,
+        max_shared_mem,
+    );
+    (w1_ctmp_floats, w2_ctmp_floats)
+}
+
 fn installed_package_sidecar(name: &str) -> Option<String> {
     use pyo3::types::PyModule;
 
@@ -620,6 +664,8 @@ pub struct PrefillModelConfig {
     pub rope_half_dim: usize,       // actual RoPE half dim (may differ from head_dim/2 for partial rotary)
     pub prefill_chunk_size: usize,  // max tokens per chunk (0 = use max_tokens)
     pub layer_group_size: usize,    // how many MoE layers per group for expert DMA (0 = no grouping)
+    pub fused_moe_w1_ctmp_floats: usize,
+    pub fused_moe_w2_ctmp_floats: usize,
 }
 
 pub struct MarlinWeight {
@@ -5096,33 +5142,8 @@ impl PrefillEngine {
 
         let gs = self.config.group_size as i32;
         let q_type_ptr = &self.q_type as *const ScalarType as *const std::ffi::c_void;
-        let mut max_shared_mem: i32 = 0;
-        unsafe {
-            cuda_sys::lib().cuDeviceGetAttribute(
-                &mut max_shared_mem,
-                cuda_sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
-                self.config.device_ordinal as i32,
-            );
-        }
-        let max_shared_mem = max_shared_mem.max(0) as usize;
-        let w1_ctmp_floats = fused_moe_fp32_reduce_floats(
-            block_size as usize,
-            w1_n,
-            h,
-            bits as usize,
-            self.config.group_size.max(1),
-            self.config.sms,
-            max_shared_mem,
-        );
-        let w2_ctmp_floats = fused_moe_fp32_reduce_floats(
-            block_size as usize,
-            h,
-            inter,
-            bits as usize,
-            self.config.group_size.max(1),
-            self.config.sms,
-            max_shared_mem,
-        );
+        let w1_ctmp_floats = self.config.fused_moe_w1_ctmp_floats;
+        let w2_ctmp_floats = self.config.fused_moe_w2_ctmp_floats;
 
         // Zero the workspace lock array and C_tmp before fused w1 GEMM.
         let ws_ptr = *self.scratch.d_workspace.device_ptr();
@@ -5133,18 +5154,13 @@ impl PrefillEngine {
             cuda_sys::lib().cuMemsetD32Async(fused_c_tmp_ptr, 0, w1_ctmp_floats, self.stream);
         }
 
-        let w1_b_param = if use_ptr_table && w1_base == 0 {
-            cold_staging_base
-        } else {
-            w1_base
-        };
-        let w1s_b_param = if use_ptr_table && w1s_base == 0 { cold_staging_base } else { w1s_base };
-        let w2_b_param = if use_ptr_table && w2_base == 0 {
-            cold_staging_base
-        } else {
-            w2_base
-        };
-        let w2s_b_param = if use_ptr_table && w2s_base == 0 { cold_staging_base } else { w2s_base };
+        // Pointer-table mode supplies absolute per-expert addresses for weights/scales.
+        // Use a null base so the device-side ptr-table path derives addresses from the
+        // active expert pointers rather than a mixed-source cold-staging fallback.
+        let w1_b_param = if use_ptr_table { 0 } else { w1_base };
+        let w1s_b_param = if use_ptr_table { 0 } else { w1s_base };
+        let w2_b_param = if use_ptr_table { 0 } else { w2_base };
+        let w2s_b_param = if use_ptr_table { 0 } else { w2s_base };
 
         // w1: A = fused_input (replicated [m*topk, h]), top_k=1 so kernel reads A[sorted_id] directly
         //     C written at sorted_id positions (token*topk+slot), range [0, m*topk)
@@ -8252,16 +8268,6 @@ pub fn allocate_scratch(
     } else {
         1 // minimal placeholder — no MoE execution at 0 tokens
     };
-    let mut max_shared_mem: i32 = 0;
-    unsafe {
-        cuda_sys::lib().cuDeviceGetAttribute(
-            &mut max_shared_mem,
-            cuda_sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
-            config.device_ordinal as i32,
-        );
-    }
-    let max_shared_mem = max_shared_mem.max(0) as usize;
-
     // GpuBuf uses raw cuMemAlloc_v2 (synchronous, no pool) so alloc/free
     // is immediate and deterministic — no interaction with cudarc's pool.
     let alloc_u16 = |n: usize, name: &str| -> Result<GpuBuf<u16>, String> {
@@ -8373,15 +8379,9 @@ pub fn allocate_scratch(
         d_moe_accum: {
             let w1_n = if config.moe_gated { 2 * moe_inter } else { moe_inter };
             let max_moe_n = std::cmp::max(w1_n, h);
-            let reduce_floor = fused_moe_fp32_reduce_floats(
-                block_size_moe,
-                max_moe_n,
-                h,
-                config.expert_bits as usize,
-                config.group_size.max(1),
-                config.sms,
-                max_shared_mem,
-            );
+            let reduce_floor = config
+                .fused_moe_w1_ctmp_floats
+                .max(config.fused_moe_w2_ctmp_floats);
             alloc_f32((fsc * max_moe_n).max(reduce_floor), "moe_accum")?
         },
         d_moe_gathered: alloc_u16(fsc * h, "moe_gathered")?,

@@ -1,5 +1,24 @@
 # Krasis Benchmark Results
 
+## Standard Benchmarks — 2026-04-03 (QCN Polar4 AWQ speed-test rerun on c35d9b0)
+
+Hardware: EPYC 7742, 995 GB RAM, 1x RTX 5090 32 GB used for benchmark, 2x RTX 5090 present.
+
+Config: Qwen3-Coder-Next, 1 GPU, AWQ attention, Polar4 KV, GPU decode, HCS on, timing instrumentation off.
+
+| Variant | Prefill (tok/s) | Decode (tok/s) | HCS | Min free VRAM | Log |
+|--------|----------------:|---------------:|-----|--------------:|-----|
+| c35d9b0 speed-test rerun | FAIL before timed benchmark | 84.8 tok/s short calibration only | not reached | 3262 MB during short prefill probe | [log](20260403_174355_qcn_polar4_awq_5090_failed_illegal_address.log) |
+
+Notes:
+- Run executed via `./dev speed-test` on detached `c35d9b0`.
+- Load, warmup, decode-store setup, and short calibration passed.
+- Failure occurred in long VRAM calibration at 39,920 prompt tokens inside `gpu_store.rust_prefill_tokens(...)`.
+- Error: `CUDA_ERROR_ILLEGAL_ADDRESS (grid=(39920, 1, 1), block=(1024, 1, 1), smem=4096, nparams=6)`.
+- Cleanup also hit a Rust destructor panic while tearing down `GpuDecodeStore` after the illegal address.
+
+---
+
 ## Standard Benchmarks — 2026-04-01 (QCN Polar4 AWQ padding rewrite)
 
 Hardware: EPYC 7742, 995 GB RAM, 1x RTX 5090 32 GB used for benchmark, 2x RTX 5090 present.
@@ -77,6 +96,26 @@ Config: 20K–50K token prompts, FP8 KV cache, BF16 attention, INT8 shared_exper
 - **Model warmup before benchmarks**: Full generate cycle runs before any measurement, paying all cold-start costs.
 
 ---
+
+## Standard Speed Benchmark — 2026-04-03 (resolution, BF-01 host ptr-table base import)
+
+Hardware: 1x RTX 5090
+
+Config: Qwen3-Coder-Next, INT4 experts, AWQ attention, Polar4 KV, standard command `./dev speed-test`, timing instrumentation off.
+
+| Date | Commit | Change | Prefill (tok/s) | Decode (tok/s) | Round trip (tok/s) | HCS | Min free VRAM | Status | Log |
+|------|--------|--------|----------------:|---------------:|-------------------:|-----|--------------:|--------|-----|
+| 2026-04-03 18:53 | 83dd3b0 + local BF-01 | Pointer-table fused MoE host base set to null in ptr-table mode; BF-02 already present | 7,584.7 | 100.38 | 138.95 | 16929/24576 (68.9%) | 738 MB | PASS | [log](20260403_185345_qcn_polar4_awq_5090_bf01_host_null_base.log) |
+| 2026-04-03 19:20 | 83dd3b0 + local BF-01 + BF-03 cache | Cache fused MoE `C_tmp` floor calculation once per model/device config and reuse in hot path | FAIL before timed benchmark | 80.6 tok/s short calibration only | not reached | not reached | 3248 MB during short prefill probe | FAIL | [log](20260403_192025_qcn_polar4_awq_5090_bf03_cached_ctmp_failed_illegal_address.log) |
+| 2026-04-03 19:26 | 83dd3b0 + local BF-01, BF-03 cache reverted | Revert the one-time `C_tmp` cache follow-up and rerun standard speed test | FAIL before timed benchmark | 80.6 tok/s short calibration only | not reached | not reached | 3248 MB during short prefill probe | FAIL | [log](20260403_192634_qcn_polar4_awq_5090_bf03_revert_failed_illegal_address.log) |
+| 2026-04-03 19:38 | 83dd3b0 + local BF-01 + BF-03 cache | Post-reboot rerun with BF-03 one-time `C_tmp` cache reapplied | 7,844.1 | 99.29 | 182.51 | 17010/24576 (69.2%) | 686 MB | PASS | [log](20260403_193344_qcn_polar4_awq_5090_bf03_reapplied_post_reboot.log) |
+
+Notes:
+- The BF-03 cache edit built cleanly through `./dev build`.
+- This benchmark failed in long VRAM calibration at `39,920` prompt tokens before the timed benchmark section.
+- Failure remained `CUDA_ERROR_ILLEGAL_ADDRESS (grid=(39920, 1, 1), block=(1024, 1, 1), smem=4096, nparams=6)`.
+- Reverting the BF-03 cache follow-up did not restore a successful run on this attempt; the same long-calibration illegal-address fault reproduced with the same short-calibration numbers.
+- After reboot, the same BF-03 cache state completed the full standard benchmark cleanly and produced the best prefill result in this local series.
 
 ## Standard Benchmarks — 2026-02-25 (NUMA-optimized, 1 GPU)
 
