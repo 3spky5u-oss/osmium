@@ -6466,6 +6466,8 @@ impl GpuDecodeStore {
             }
         }
 
+        let has_linear_attention = layer_types.iter().any(|&t| t == 3);
+
         let mut config = PrefillModelConfig {
             hidden_size: graph.hidden_size,
             intermediate_size: graph.moe_intermediate_size.max(graph.intermediate_size),
@@ -7099,7 +7101,7 @@ impl GpuDecodeStore {
             t_moe_w2: std::cell::Cell::new(0.0),
             t_moe_scatter: std::cell::Cell::new(0.0),
             t_moe_shared: std::cell::Cell::new(0.0),
-            fla: crate::gpu_prefill::load_fla(),
+            fla: crate::gpu_prefill::load_fla(has_linear_attention)?,
             d_fla_g_cumsum: None,
             d_fla_a: None,
             d_fla_ai: None,

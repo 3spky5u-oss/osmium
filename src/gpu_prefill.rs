@@ -4136,7 +4136,17 @@ impl PrefillEngine {
                 }
             }
 
-            // 11. Compute beta-scaled values: v_beta = v * beta, k_beta = k * beta
+            // 11. Preserve raw q/k in canonical [nv, total_len, dim] layout before
+            // la_apply_beta reuses the token-major staging for scaled outputs.
+            self.launch_transpose_3d_f32(fp32_scratch, la_q, total_len, nv, dk)?;
+            self.memcpy_d2d(la_q, fp32_scratch, (nv * total_len * dk * 4) as u64)?;
+
+            self.launch_transpose_3d_f32(fp32_scratch, la_k, total_len, nv, dk)?;
+            self.memcpy_d2d(la_k, fp32_scratch, (nv * total_len * dk * 4) as u64)?;
+
+            // 12. Compute beta-scaled values:
+            // v_beta = v * beta while v is still token-major [total_len, nv, dv]
+            // k_beta = k * beta directly into canonical [nv, total_len, dk]
             {
                 let bt = std::cmp::max(32, ((std::cmp::min(256, std::cmp::max(dk, dv)) + 31) / 32) * 32) as u32;
                 let mut bp0 = la_v_beta;
@@ -4147,6 +4157,7 @@ impl PrefillEngine {
                 let mut bp5 = nv as i32;
                 let mut bp6 = dk as i32;
                 let mut bp7 = dv as i32;
+                let mut bp8 = total_len as i32;
                 unsafe {
                     launch(self.kernels.la_apply_beta,
                         (total_len as u32, nv as u32, 1), (bt, 1, 1), 0, self.stream,
@@ -4159,6 +4170,7 @@ impl PrefillEngine {
                             &mut bp5 as *mut _ as *mut std::ffi::c_void,
                             &mut bp6 as *mut _ as *mut std::ffi::c_void,
                             &mut bp7 as *mut _ as *mut std::ffi::c_void,
+                            &mut bp8 as *mut _ as *mut std::ffi::c_void,
                         ],
                     )?;
                 }
@@ -4166,14 +4178,6 @@ impl PrefillEngine {
 
             // Transpose all arrays from [total_len, nv, dim] to [nv, total_len, dim]
             // via single kernel launch each (replaces millions of memcpy calls)
-
-            // q: [total_len, nv, dk] -> [nv, total_len, dk]
-            self.launch_transpose_3d_f32(fp32_scratch, la_q, total_len, nv, dk)?;
-            self.memcpy_d2d(la_q, fp32_scratch, (nv * total_len * dk * 4) as u64)?;
-
-            // k: [total_len, nv, dk] -> [nv, total_len, dk]
-            self.launch_transpose_3d_f32(fp32_scratch, la_k, total_len, nv, dk)?;
-            self.memcpy_d2d(la_k, fp32_scratch, (nv * total_len * dk * 4) as u64)?;
 
             // v: [total_len, nv, dv] -> [nv, total_len, dv]
             self.launch_transpose_3d_f32(fp32_scratch, la_v, total_len, nv, dv)?;
@@ -4186,10 +4190,6 @@ impl PrefillEngine {
             // v_beta: [total_len, nv, dv] -> [nv, total_len, dv]
             self.launch_transpose_3d_f32(fp32_scratch, la_v_beta, total_len, nv, dv)?;
             self.memcpy_d2d(la_v_beta, fp32_scratch, (nv * total_len * dv * 4) as u64)?;
-
-            // k_beta: [total_len, nv, dk] -> [nv, total_len, dk]
-            self.launch_transpose_3d_f32(fp32_scratch, la_k_beta, total_len, nv, dk)?;
-            self.memcpy_d2d(la_k_beta, fp32_scratch, (nv * total_len * dk * 4) as u64)?;
 
             // 12. Compute cumulative sum of g within chunks
             // la_gate is now [nv, total_len] = [nv, num_chunks * CS]
@@ -8712,46 +8712,62 @@ fn find_vendor_so(name: &str) -> Option<String> {
 }
 
 /// Load vendored FLA (Flash Linear Attention) kernels from libkrasis_fla.so.
-/// Returns None if the .so is not found or any symbol is missing.
-pub fn load_fla() -> Option<FlaKernels> {
+/// For LA models this is required unless the user explicitly opted out with
+/// KRASIS_NO_FLA, because silently falling back to the older custom LA path
+/// hides packaging/runtime regressions and degrades performance.
+pub fn load_fla(require_for_la_model: bool) -> Result<Option<FlaKernels>, String> {
+    let fail_or_warn = |message: String| -> Result<Option<FlaKernels>, String> {
+        if require_for_la_model {
+            Err(format!(
+                "{message}. Refusing to fall back to custom LA kernels for a linear-attention model. \
+Set KRASIS_NO_FLA=1 only if you explicitly want the slower custom LA path."
+            ))
+        } else {
+            log::warn!("{message} — FLA disabled");
+            Ok(None)
+        }
+    };
+
     if std::env::var("KRASIS_NO_FLA").is_ok() {
         log::info!("KRASIS_NO_FLA set — FLA disabled, using custom LA kernels");
-        return None;
+        return Ok(None);
     }
     let path = match find_vendor_so("libkrasis_fla.so") {
         Some(p) => p,
         None => {
-            log::warn!("libkrasis_fla.so not found — FLA disabled, using custom LA kernels");
-            return None;
+            return fail_or_warn("libkrasis_fla.so not found".to_string());
         }
+    };
+    let path_cstr = match std::ffi::CString::new(path.as_str()) {
+        Ok(v) => v,
+        Err(_) => return fail_or_warn(format!("invalid FLA library path: {}", path)),
     };
     unsafe {
         let lib = libc::dlopen(
-            std::ffi::CString::new(path.as_str()).ok()?.as_ptr(),
+            path_cstr.as_ptr(),
             libc::RTLD_NOW | libc::RTLD_LOCAL,
         );
         if lib.is_null() {
             let err = libc::dlerror();
             if !err.is_null() {
-                log::warn!("dlopen({}) failed: {}", path,
-                    std::ffi::CStr::from_ptr(err).to_string_lossy());
+                let detail = std::ffi::CStr::from_ptr(err).to_string_lossy();
+                return fail_or_warn(format!("dlopen({}) failed: {}", path, detail));
             } else {
-                log::warn!("dlopen({}) failed", path);
+                return fail_or_warn(format!("dlopen({}) failed", path));
             }
-            return None;
         }
 
         // Initialize FLA modules (loads cubins into CUDA context)
         let init_sym = libc::dlsym(lib, b"krasis_fla_init\0".as_ptr() as *const _);
         if init_sym.is_null() {
-            log::warn!("krasis_fla_init not found in {}", path);
-            return None;
+            let _ = libc::dlclose(lib);
+            return fail_or_warn(format!("krasis_fla_init not found in {}", path));
         }
         let init_fn: FlaInitFn = std::mem::transmute(init_sym);
         let rc = init_fn();
         if rc != 0 {
-            log::warn!("krasis_fla_init() failed with rc={}", rc);
-            return None;
+            let _ = libc::dlclose(lib);
+            return fail_or_warn(format!("krasis_fla_init() failed with rc={}", rc));
         }
 
         // Load all 6 kernel function pointers
@@ -8759,8 +8775,8 @@ pub fn load_fla() -> Option<FlaKernels> {
             ($name:expr) => {{
                 let sym = libc::dlsym(lib, concat!($name, "\0").as_ptr() as *const _);
                 if sym.is_null() {
-                    log::warn!("{} not found in {}", $name, path);
-                    return None;
+                    let _ = libc::dlclose(lib);
+                    return fail_or_warn(format!("{} not found in {}", $name, path));
                 }
                 std::mem::transmute(sym)
             }};
@@ -8776,7 +8792,7 @@ pub fn load_fla() -> Option<FlaKernels> {
         };
 
         log::info!("Loaded FLA (Flash Linear Attention) kernels from {}", path);
-        Some(kernels)
+        Ok(Some(kernels))
     }
 }
 

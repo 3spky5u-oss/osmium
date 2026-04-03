@@ -115,6 +115,8 @@ Config: Qwen3-Coder-Next, INT4 experts, AWQ attention, Polar4 KV, standard comma
 | 2026-04-03 20:54 | 7d09912 + local BF-09 | Feed the active decode-store CUDA ordinal into `PrefillModelConfig` so fused-MoE shared-memory capability queries stop assuming GPU 0 | 7,745.6 | 95.55 | 120.95 | 17010/24576 (69.2%) | 686 MB | PASS | [log](20260403_205423_qcn_polar4_awq_5090_bf09_device_ordinal.log) |
 | 2026-04-03 21:23 | df6c259 + local BF-13 | Split BF16 shared-expert cuBLAS ownership so `shared_stream` uses a dedicated handle instead of retargeting the main prefill handle across streams | 7,498.6 | 100.62 | 137.97 | 17010/24576 (69.2%) | 682 MB | PASS | [log](20260403_212300_qcn_polar4_awq_5090_bf13_shared_cublas_handle.log) |
 | 2026-04-03 22:03 | 68f1557 + local BF-10 | Split fused-MoE sorted scatter finalization into a second same-stream kernel so padding and `expert_ids` are written only after scatter completion | 7,510.0 | 100.18 | 135.55 | 17010/24576 (69.2%) | 682 MB | PASS | [log](20260403_220350_qcn_polar4_awq_5090_bf10_scatter_finalize_split.log) |
+| 2026-04-03 22:33 | 1532389 + local FLA fail-closed | Fail startup for linear-attention models when vendored FLA cannot load, keeping `KRASIS_NO_FLA=1` as the only explicit opt-out to the slower custom LA path | 7,572.8 | 97.61 | 134.15 | 17010/24576 (69.2%) | 682 MB | PASS | [log](20260403_223342_qcn_polar4_awq_5090_fla_fail_closed.log) |
+| 2026-04-03 23:00 | 1532389 + local FLA fail-closed + C-02 | Preserve raw `q`/`k` in canonical head-major layout before non-FLA `la_apply_beta`, and emit canonical `k_beta` directly from the beta kernel | 7,943.9 | 98.70 | 133.80 | 17010/24576 (69.2%) | 682 MB | PASS | [log](20260403_230008_qcn_polar4_awq_5090_c02_raw_k_canonical.log) |
 
 Notes:
 - The BF-03 cache edit built cleanly through `./dev build`.
@@ -129,6 +131,8 @@ Notes:
 - The no-valid-block guard also completed the full standard benchmark cleanly; it is a cheap control-flow correctness fix and did not regress standard prefill or decode throughput.
 - The BF-09 actual-device-ordinal wiring also completed the full standard benchmark cleanly; on this single-GPU path it behaves like a correctness/generalization fix rather than a speed optimization.
 - BF-10 also completed the full standard benchmark cleanly; the extra finalize launch did not materially change throughput on the standard QCN AWQ Polar4 path and removed the grid-wide race from the sorted scatter/finalize step.
+- The FLA fail-closed change also completed the full standard benchmark cleanly; startup still succeeds on the shipped QCN path with vendored FLA present, but LA models will now fail visibly instead of silently degrading to the older custom LA kernels when FLA sidecar loading breaks.
+- The C-02 layout-preservation change also completed the full standard benchmark cleanly on the combined branch state. This benchmark still exercises the shipped FLA path, so it confirms no regression in the standard product path but does not by itself prove non-FLA correctness.
 
 ## Standard Benchmarks — 2026-02-25 (NUMA-optimized, 1 GPU)
 

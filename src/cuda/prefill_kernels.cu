@@ -2628,11 +2628,11 @@ extern "C" __global__ void la_transpose_f32_kernel(
  */
 extern "C" __global__ void la_apply_beta_kernel(
     float* __restrict__ v_beta,  /* [M, nv, dv] */
-    float* __restrict__ k_beta,  /* [M, nv, dk] */
+    float* __restrict__ k_beta,  /* [nv, M, dk] */
     const float* __restrict__ v, /* [M, nv, dv] */
-    const float* __restrict__ k, /* [M, nv, dk] */
+    const float* __restrict__ k, /* [nv, M, dk] */
     const float* __restrict__ beta, /* [M, nv] */
-    int nv, int dk, int dv)
+    int nv, int dk, int dv, int total_len)
 {
     int token = blockIdx.x;
     int head = blockIdx.y;
@@ -2646,8 +2646,8 @@ extern "C" __global__ void la_apply_beta_kernel(
     }
 
     /* k_beta */
-    const float* k_src = k + ((int64_t)token * nv + head) * dk;
-    float* k_dst = k_beta + ((int64_t)token * nv + head) * dk;
+    const float* k_src = k + ((int64_t)head * total_len + token) * dk;
+    float* k_dst = k_beta + ((int64_t)head * total_len + token) * dk;
     for (int d = threadIdx.x; d < dk; d += blockDim.x) {
         k_dst[d] = k_src[d] * b;
     }
