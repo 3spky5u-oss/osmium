@@ -7883,18 +7883,15 @@ impl GpuDecodeStore {
             .map_err(|e| format!("alloc d_graph_pos: {:?}", e))?);
         graph.d_graph_seq_len = Some(self.device.alloc_zeros::<i32>(1)
             .map_err(|e| format!("alloc d_graph_seq_len: {:?}", e))?);
-        // Allocate dummy expert buffer (all zeros, used for cold experts during graph replay).
-        // Size = one full expert's worth of data.
-        if let Some(ref hcs) = graph.hcs {
-            if hcs.expert_vram_bytes > 0 {
-                graph.d_dummy_expert = Some(self.device.alloc_zeros::<u8>(hcs.expert_vram_bytes)
-                    .map_err(|e| format!("alloc d_dummy_expert: {:?}", e))?);
-                // Build dummy pointer array [w13p, w13s, w2p, w2s] on GPU
-                let dummy_base = *graph.d_dummy_expert.as_ref().unwrap().device_ptr();
-                let hs = graph.hidden_size;
-                let intermediate = graph.moe_intermediate_size;
-                let gs = graph.group_size;
-                let expert_bits = graph.expert_bits;
+        // Allocate dummy expert buffer (all zeros, used for padded expert slots during
+        // graph replay). Allocated unconditionally from model config so it exists before
+        // HCS loads — prevents GEMV on arbitrary data producing NaN for dummy experts.
+        {
+            let hs = graph.hidden_size;
+            let intermediate = graph.moe_intermediate_size;
+            let gs = graph.group_size;
+            let expert_bits = graph.expert_bits;
+            if intermediate > 0 && hs > 0 && expert_bits > 0 {
                 let w13_packed_bytes = if expert_bits == 16 {
                     (2 * intermediate * hs * 2) as u64
                 } else {
@@ -7908,6 +7905,17 @@ impl GpuDecodeStore {
                 } else {
                     (hs * intermediate * expert_bits as usize / 8) as u64
                 };
+                let w2_scales_bytes = if gs == 0 { 0u64 } else {
+                    (hs * intermediate / gs * 2 / 8) as u64
+                };
+                let total_bytes = (w13_packed_bytes + w13_scales_bytes + w2_packed_bytes
+                    + w2_scales_bytes) as usize;
+                let align = 512usize;
+                let alloc_bytes = (total_bytes + align - 1) & !(align - 1);
+
+                graph.d_dummy_expert = Some(self.device.alloc_zeros::<u8>(alloc_bytes)
+                    .map_err(|e| format!("alloc d_dummy_expert: {:?}", e))?);
+                let dummy_base = *graph.d_dummy_expert.as_ref().unwrap().device_ptr();
                 let dummy_vals: [u64; 4] = [
                     dummy_base,
                     dummy_base + w13_packed_bytes,
@@ -7919,7 +7927,7 @@ impl GpuDecodeStore {
                     .map_err(|e| format!("alloc d_dummy_ptrs: {:?}", e))?;
                 graph.d_dummy_ptrs = Some(d_dummy_ptrs);
                 log::info!("CUDA graph: allocated dummy expert buffer ({} KB)",
-                    hcs.expert_vram_bytes / 1024);
+                    alloc_bytes / 1024);
             }
         }
 

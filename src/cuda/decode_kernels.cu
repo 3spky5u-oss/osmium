@@ -4056,7 +4056,6 @@ extern "C" __global__ void multi_expert_weighted_add_bf16(
     float sum = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&accum[n]));
     for (int e = 0; e < num_experts; e++) {
         float w = weights[e];
-        if (w == 0.0f) continue;  // skip dummy/padded experts to prevent NaN propagation
         float val = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&expert_outs[e * N + n]));
         sum += w * val;
     }
