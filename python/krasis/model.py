@@ -1824,7 +1824,7 @@ class KrasisModel:
                 attn._rope_cos_sin = None
                 import flashinfer
                 workspace_buf = torch.empty(
-                    128 * 1024 * 1024, dtype=torch.uint8, device=device
+                    512 * 1024 * 1024, dtype=torch.uint8, device=device
                 )
                 attn._attn_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
                     workspace_buf,
@@ -1849,7 +1849,7 @@ class KrasisModel:
                 attn._rope_cos_sin = None
                 import flashinfer
                 workspace_buf = torch.empty(
-                    128 * 1024 * 1024, dtype=torch.uint8, device=device
+                    512 * 1024 * 1024, dtype=torch.uint8, device=device
                 )
                 attn._prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
                     workspace_buf,
@@ -3719,6 +3719,7 @@ class KrasisModel:
         extra_stop_tokens: List[str],
         decode_mode: str = "gpu",
         tools_json: str = "",
+        conversation_id: str = "",
     ):
         """GPU prefill for Rust server. Returns result object with first_token, etc.
 
@@ -3754,12 +3755,29 @@ class KrasisModel:
             ids = self.tokenizer.encode(s, add_special_tokens=False)
             stop_ids.extend(ids)
 
-        # Create KV states
-        seq_states = [
-            SequenceKVState(c, seq_id=0) if c is not None else None
-            for c in self.kv_caches
-        ]
+        # Create KV states (reuse via SequenceManager if conversation_id provided)
+        mgr = getattr(self, '_seq_manager', None)
+        if mgr and conversation_id:
+            existing = mgr.get(conversation_id)
+            if existing and existing.seq_len > 0:
+                # TODO: append-prefill (new user message onto existing context).
+                # For now, destroy old and create fresh.
+                mgr.destroy(conversation_id)
+            state = mgr.create(conversation_id)
+            seq_states = [state]
+            # Pad with None for aux GPUs if multi-GPU
+            while len(seq_states) < len(self.kv_caches):
+                seq_states.append(
+                    SequenceKVState(self.kv_caches[len(seq_states)], seq_id=0)
+                    if self.kv_caches[len(seq_states)] is not None else None
+                )
+        else:
+            seq_states = [
+                SequenceKVState(c, seq_id=0) if c is not None else None
+                for c in self.kv_caches
+            ]
         self._server_seq_states = seq_states
+        self._active_conversation_id = conversation_id
 
         # Reset linear attention states
         if self.cfg.is_hybrid:
@@ -3836,6 +3854,7 @@ class KrasisModel:
         r.stop_ids = stop_ids
         r.store_addr = store_addr
         r.decode_mode = decode_mode
+        r.conversation_id = conversation_id
         # Flag: if prompt exceeded Rust KV capacity, skip decode
         rust_max_seq = getattr(gpu_store, 'kv_max_seq', 0)
         r.kv_overflow = (rust_max_seq > 0 and len(prompt_tokens) > rust_max_seq)
@@ -4788,6 +4807,11 @@ class KrasisModel:
 
         store.set_kv_position(prompt_len)
 
+        # Push the active sequence's page table to GPU for paged decode.
+        # seq_states[0] is the primary sequence on GPU0.
+        if seq_states and hasattr(seq_states[0], 'pages') and seq_states[0].pages:
+            store.set_page_table(seq_states[0].pages)
+
     def _update_la_state_ptrs(self):
         """Re-register LA state pointers after prefill (states may have been reallocated).
         Prefill may reassign _conv_state and _recurrent_state tensors, so we
@@ -4890,8 +4914,20 @@ class KrasisModel:
                     getattr(attn, attr_recur).data_ptr(),
                 )
 
-    def server_cleanup(self):
-        """Free server request state (KV cache pages, etc.)."""
+    def server_cleanup(self, conversation_id: Optional[str] = None):
+        """Free server request state (KV cache pages, etc.).
+
+        If conversation_id is set and a SequenceManager is active, the
+        sequence is parked instead of destroyed (keeps pages for resume).
+        """
+        mgr = getattr(self, '_seq_manager', None)
+        if mgr and conversation_id and conversation_id in mgr.sequences:
+            # Park the sequence — keep KV pages for later resume
+            mgr.park(conversation_id)
+            self._server_seq_states = None
+            self._rust_kv_refs = None
+            return
+
         states = getattr(self, '_server_seq_states', None)
         if states:
             for s in states:
@@ -4899,3 +4935,15 @@ class KrasisModel:
                     s.free()
             self._server_seq_states = None
         self._rust_kv_refs = None
+
+    def setup_sequence_manager(self, max_sequences: int = 3):
+        """Initialize the multi-sequence manager for conversation persistence."""
+        from krasis.kv_cache import SequenceManager
+        cache = self.kv_caches[0] if self.kv_caches else None
+        if cache is None:
+            raise RuntimeError("KV cache not initialized")
+        store = getattr(self, '_gpu_decode_store', None)
+        self._seq_manager = SequenceManager(cache, gpu_store=store, max_sequences=max_sequences)
+        logger.info("SequenceManager initialized: max_sequences=%d, cache=%d pages",
+                     max_sequences, cache.max_pages)
+        return self._seq_manager

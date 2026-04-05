@@ -90,7 +90,7 @@ class MLAAttention:
         key = str(device)
         if key not in cls._workspace_bufs:
             cls._workspace_bufs[key] = torch.empty(
-                256 * 1024 * 1024, dtype=torch.uint8, device=device
+                512 * 1024 * 1024, dtype=torch.uint8, device=device
             )
         return cls._workspace_bufs[key]
 

@@ -14,7 +14,8 @@ GQA (Qwen3): standard K/V caches with head dimension (NHD layout).
 
 import logging
 import math
-from typing import List, Optional, Tuple
+import time
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -45,10 +46,12 @@ class PagedKVCache:
         page_size: int = PAGE_SIZE,
         combined: bool = False,
         max_mb: Optional[int] = None,
+        kv_format: str = "fp8",  # "fp8" or "fp4"
     ):
         self.cfg = cfg
         self.num_layers = num_layers
         self.device = device
+        self.kv_format = kv_format
         self.page_size = page_size
         self.kv_dtype = kv_dtype
         self.combined = combined
@@ -120,12 +123,53 @@ class PagedKVCache:
         # GQA caches (separate K and V)
         self.k_cache = None
         self.v_cache = None
+        # FP4 caches: packed data + per-group scale factors
+        self.k_data_fp4 = None
+        self.k_scale_fp4 = None
+        self.v_data_fp4 = None
+        self.v_scale_fp4 = None
         # MLA caches
         self.ckv_cache = None
         self.kpe_cache = None
         self.kv_cache = None
 
-        if cfg.is_gqa:
+        if cfg.is_gqa and kv_format == "fp4":
+            # FP4 GQA: packed uint8 data (2 values per byte) + FP8 scales (1 per 16 values)
+            kv_dim = self.num_kv_heads * self.gqa_head_dim  # flat KV dimension
+            self.fp4_group_size = 16
+            self.k_data_fp4 = torch.zeros(
+                num_layers, max_pages, page_size, kv_dim // 2,
+                dtype=torch.uint8, device=device,
+            )
+            self.k_scale_fp4 = torch.zeros(
+                num_layers, max_pages, page_size, kv_dim // self.fp4_group_size,
+                dtype=torch.float8_e4m3fn, device=device,
+            )
+            self.v_data_fp4 = torch.zeros(
+                num_layers, max_pages, page_size, kv_dim // 2,
+                dtype=torch.uint8, device=device,
+            )
+            self.v_scale_fp4 = torch.zeros(
+                num_layers, max_pages, page_size, kv_dim // self.fp4_group_size,
+                dtype=torch.float8_e4m3fn, device=device,
+            )
+            alloc_mb = sum(t.nbytes for t in [
+                self.k_data_fp4, self.k_scale_fp4, self.v_data_fp4, self.v_scale_fp4
+            ]) / (1024**2)
+            layout_str = "gqa-fp4"
+            # Also allocate FP8 caches for FlashInfer prefill (prefill dequants from FP4)
+            # FlashInfer doesn't read FP4 natively for paged attention,
+            # so prefill writes FP8, and we quantize to FP4 after.
+            self.k_cache = torch.zeros(
+                num_layers, max_pages, page_size, self.num_kv_heads, self.gqa_head_dim,
+                dtype=torch.float8_e4m3fn, device=device,
+            )
+            self.v_cache = torch.zeros(
+                num_layers, max_pages, page_size, self.num_kv_heads, self.gqa_head_dim,
+                dtype=torch.float8_e4m3fn, device=device,
+            )
+            alloc_mb += (self.k_cache.nbytes + self.v_cache.nbytes) / (1024**2)
+        elif cfg.is_gqa:
             # GQA: separate K and V caches [layers, pages, page_size, heads, head_dim]
             self.k_cache = torch.zeros(
                 num_layers, max_pages, page_size, self.num_kv_heads, self.gqa_head_dim,
@@ -169,6 +213,13 @@ class PagedKVCache:
         self._free_pages.reverse()  # pop from end
 
     def _bytes_per_page(self) -> int:
+        if self.kv_format == "fp4":
+            # FP4: 0.5 bytes per element (data) + 1/16 byte per element (scale)
+            # = 0.5625 bytes per element per cache (K or V)
+            kv_dim = self.num_kv_heads * self.gqa_head_dim
+            data_bytes = self.page_size * kv_dim // 2
+            scale_bytes = self.page_size * kv_dim // 16
+            return (data_bytes + scale_bytes) * 2 * self.num_layers  # K + V
         elem_size = 1 if self.kv_dtype == torch.float8_e4m3fn else 2
         return self.page_size * self.kv_cache_dim * elem_size * self.num_layers
 
@@ -193,13 +244,10 @@ class PagedKVCache:
     def free_pages(self, pages: List[int]):
         """Return pages to the free pool.
 
-        Re-sorts in descending order so pop() always gives sequential
-        page indices (0, 1, 2, ...). This is required because Rust decode
-        reads the KV cache contiguously — the paged layout must match the
-        contiguous layout, which only works when pages are in order.
+        Page table indirection in the decode kernels handles non-contiguous
+        page access, so ordering no longer matters.
         """
         self._free_pages.extend(pages)
-        self._free_pages.sort(reverse=True)
 
     # ── MLA cache access ──
 
@@ -311,3 +359,217 @@ class SequenceKVState:
         slots = (positions.long() % page_size)
 
         self.cache.kv_cache[layer_offset, page_indices, slots] = kv_combined.to(self.cache.kv_dtype)
+
+
+class SequenceManager:
+    """Manages multiple concurrent sequences sharing a single PagedKVCache pool.
+
+    Each sequence gets its own SequenceKVState with independent page allocation.
+    Switching the active sequence updates the GPU page table so Rust decode
+    addresses the correct physical pages.
+
+    Typical usage:
+        mgr = SequenceManager(cache, gpu_store)
+        sid = mgr.create("conv-1")        # allocate a new sequence
+        mgr.activate("conv-1")            # push page table to GPU
+        # ... prefill + decode ...
+        mgr.park("conv-1")               # save LA state, keep pages
+        mgr.activate("conv-2")           # switch to another sequence
+    """
+
+    def __init__(self, cache: PagedKVCache, gpu_store=None, max_sequences: int = 3):
+        self.cache = cache
+        self.gpu_store = gpu_store  # GpuDecodeStore (Rust)
+        self.max_sequences = max_sequences
+        self.sequences: Dict[str, SequenceKVState] = {}
+        self.active_id: Optional[str] = None
+        self._last_used: Dict[str, float] = {}  # conv_id → timestamp
+        self._la_snapshots: Dict[str, List[Tuple[torch.Tensor, torch.Tensor]]] = {}
+
+    def create(self, conv_id: str) -> SequenceKVState:
+        """Create a new sequence. Evicts LRU if at capacity."""
+        if conv_id in self.sequences:
+            return self.sequences[conv_id]
+        if len(self.sequences) >= self.max_sequences:
+            evicted = self.evict_lru()
+            if evicted:
+                logger.info("SequenceManager: evicted '%s' to make room for '%s'", evicted, conv_id)
+        state = SequenceKVState(self.cache, seq_id=len(self.sequences))
+        self.sequences[conv_id] = state
+        self._last_used[conv_id] = time.monotonic()
+        logger.info("SequenceManager: created '%s' (%d/%d sequences)",
+                     conv_id, len(self.sequences), self.max_sequences)
+        return state
+
+    def get(self, conv_id: str) -> Optional[SequenceKVState]:
+        """Get a sequence by ID, or None if not found."""
+        return self.sequences.get(conv_id)
+
+    def activate(self, conv_id: str):
+        """Make conv_id the active decode target. Pushes page table to GPU."""
+        if conv_id not in self.sequences:
+            raise KeyError(f"Unknown sequence '{conv_id}'")
+        state = self.sequences[conv_id]
+        self._last_used[conv_id] = time.monotonic()
+
+        if self.gpu_store is not None and state.pages:
+            self.gpu_store.set_page_table(state.pages)
+            self.gpu_store.set_kv_position(state.seq_len)
+
+        self.active_id = conv_id
+        logger.debug("SequenceManager: activated '%s' (seq_len=%d, pages=%d)",
+                      conv_id, state.seq_len, len(state.pages))
+
+    def park(self, conv_id: str):
+        """Park a sequence (keep pages allocated, stop decoding)."""
+        if conv_id == self.active_id:
+            self.active_id = None
+
+    def destroy(self, conv_id: str):
+        """Free all resources for a sequence."""
+        if conv_id in self.sequences:
+            self.sequences[conv_id].free()
+            del self.sequences[conv_id]
+            self._last_used.pop(conv_id, None)
+            self._la_snapshots.pop(conv_id, None)
+            if self.active_id == conv_id:
+                self.active_id = None
+            logger.info("SequenceManager: destroyed '%s' (%d sequences remain)",
+                         conv_id, len(self.sequences))
+
+    def evict_lru(self) -> Optional[str]:
+        """Evict the least-recently-used non-active sequence. Returns evicted ID."""
+        candidates = [
+            (t, cid) for cid, t in self._last_used.items()
+            if cid != self.active_id
+        ]
+        if not candidates:
+            return None
+        candidates.sort()
+        _, evict_id = candidates[0]
+        self.destroy(evict_id)
+        return evict_id
+
+    def page_budget_report(self) -> dict:
+        """Return page usage stats."""
+        used = sum(len(s.pages) for s in self.sequences.values())
+        return {
+            "total_pages": self.cache.max_pages,
+            "free_pages": self.cache.free_page_count,
+            "used_pages": used,
+            "sequences": {
+                cid: {"pages": len(s.pages), "seq_len": s.seq_len,
+                       "swapped": getattr(s, 'swapped', False)}
+                for cid, s in self.sequences.items()
+            },
+        }
+
+    # ── CPU Swap ──
+
+    def swap_out(self, conv_id: str):
+        """Swap a sequence's KV pages to CPU pinned memory, freeing GPU pages.
+
+        After swap-out the sequence's pages list is empty (GPU pages freed)
+        but seq_len is preserved. swap_in() restores the pages.
+        """
+        if conv_id not in self.sequences:
+            raise KeyError(f"Unknown sequence '{conv_id}'")
+        state = self.sequences[conv_id]
+        if not state.pages:
+            return  # nothing to swap
+        if getattr(state, 'swapped', False):
+            return  # already swapped
+
+        cache = self.cache
+        t0 = time.monotonic()
+
+        # Create CPU pinned storage for this sequence's pages
+        swap = _SwapHandle(state.pages[:], state.seq_len, cache)
+        swap.copy_gpu_to_cpu(cache)
+
+        # Free GPU pages
+        state.free()
+        state.seq_len = swap.seq_len  # restore seq_len (free() zeroes it)
+        state.swapped = True
+        state._swap_handle = swap
+
+        if conv_id == self.active_id:
+            self.active_id = None
+
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        logger.info("SequenceManager: swapped out '%s' (%d pages, %d tokens, %.1fms)",
+                     conv_id, len(swap.pages), swap.seq_len, elapsed_ms)
+
+    def swap_in(self, conv_id: str):
+        """Restore a swapped-out sequence's KV pages from CPU to GPU."""
+        if conv_id not in self.sequences:
+            raise KeyError(f"Unknown sequence '{conv_id}'")
+        state = self.sequences[conv_id]
+        if not getattr(state, 'swapped', False):
+            return  # not swapped
+        swap: _SwapHandle = state._swap_handle
+
+        cache = self.cache
+        t0 = time.monotonic()
+
+        # Allocate fresh GPU pages (may be different physical pages)
+        new_pages = cache.alloc_pages(len(swap.pages))
+        swap.copy_cpu_to_gpu(cache, new_pages)
+
+        state.pages = new_pages
+        state.seq_len = swap.seq_len
+        state.swapped = False
+        del state._swap_handle
+
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        logger.info("SequenceManager: swapped in '%s' (%d pages, %d tokens, %.1fms)",
+                     conv_id, len(new_pages), state.seq_len, elapsed_ms)
+
+
+class _SwapHandle:
+    """Holds CPU-side copies of swapped-out KV cache pages."""
+
+    def __init__(self, pages: List[int], seq_len: int, cache: PagedKVCache):
+        self.pages = pages
+        self.seq_len = seq_len
+        self.num_layers = cache.num_layers
+        self.is_gqa = cache.attention_type == "gqa"
+        # CPU pinned storage — allocated per-layer as contiguous blocks
+        # covering only the pages belonging to this sequence.
+        self.k_cpu: Optional[torch.Tensor] = None
+        self.v_cpu: Optional[torch.Tensor] = None
+        # For MLA
+        self.ckv_cpu: Optional[torch.Tensor] = None
+        self.kpe_cpu: Optional[torch.Tensor] = None
+
+    def copy_gpu_to_cpu(self, cache: PagedKVCache):
+        """Copy this sequence's pages from GPU cache to CPU pinned tensors."""
+        pages_t = torch.tensor(self.pages, dtype=torch.long)
+        if self.is_gqa:
+            # k_cache shape: [num_layers, max_pages, page_size, nkv, hd]
+            # Gather pages for all layers at once, copy to CPU pinned memory.
+            # .cpu() does D2H copy, .pin_memory() re-allocates into pinned pages.
+            self.k_cpu = cache.k_cache[:, pages_t].contiguous().cpu().pin_memory()
+            self.v_cpu = cache.v_cache[:, pages_t].contiguous().cpu().pin_memory()
+        else:
+            if cache.ckv_cache is not None:
+                self.ckv_cpu = cache.ckv_cache[:, pages_t].contiguous().cpu().pin_memory()
+                self.kpe_cpu = cache.kpe_cache[:, pages_t].contiguous().cpu().pin_memory()
+            elif cache.kv_cache is not None:
+                self.k_cpu = cache.kv_cache[:, pages_t].contiguous().cpu().pin_memory()
+
+    def copy_cpu_to_gpu(self, cache: PagedKVCache, new_pages: List[int]):
+        """Copy CPU pinned tensors back to GPU cache at new page locations."""
+        new_t = torch.tensor(new_pages, dtype=torch.long)
+        device = cache.device
+        if self.is_gqa:
+            cache.k_cache[:, new_t] = self.k_cpu.to(device, non_blocking=True)
+            cache.v_cache[:, new_t] = self.v_cpu.to(device, non_blocking=True)
+        else:
+            if self.ckv_cpu is not None:
+                cache.ckv_cache[:, new_t] = self.ckv_cpu.to(device, non_blocking=True)
+                cache.kpe_cache[:, new_t] = self.kpe_cpu.to(device, non_blocking=True)
+            elif self.k_cpu is not None:
+                cache.kv_cache[:, new_t] = self.k_cpu.to(device, non_blocking=True)
+        # Sync to ensure copy completes before the tensors are used
+        torch.cuda.synchronize(device)

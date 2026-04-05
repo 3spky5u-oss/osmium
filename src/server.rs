@@ -455,8 +455,7 @@ fn handle_request(
 
         ("GET", "/v1/models") => {
             let body = format!(
-                r#"{{"object":"list","data":[{{"id":"{}","object":"model","owned_by":"krasis"}}]}}"#,
-                state.model_name
+                r#"{{"object":"list","data":[{{"id":"Qwen3.5-122B-A10B","object":"model","owned_by":"osmium"}}]}}"#
             );
             let _ = send_json(&mut tcp_stream, 200, &body);
         }
@@ -1419,29 +1418,99 @@ impl RustServer {
                 multi_gpu_gqa_offsets,
             };
 
-            while running.load(Ordering::Acquire) {
-                match listener.accept() {
-                    Ok((stream, _addr)) => {
-                        // Set blocking for the actual request handling
-                        stream.set_nonblocking(false).ok();
-                        // Disable Nagle's algorithm for immediate SSE chunk delivery
-                        stream.set_nodelay(true).ok();
-                        // Set read timeout to prevent hanging on malformed requests
-                        stream
-                            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
-                            .ok();
-                        handle_request(stream, &state);
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // No connection ready, sleep briefly and retry
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                    Err(e) => {
-                        log::error!("Accept error: {}", e);
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+            // Lightweight endpoints (/v1/models, /health) must respond even during
+            // generation. Use a second thread to accept connections: if it's a lightweight
+            // request, handle inline. If it's a chat completion, queue it for the main thread.
+            let (tx, rx) = std::sync::mpsc::channel::<TcpStream>();
+            let running2 = running.clone();
+            let models_json: &'static str = Box::leak(format!(
+                r#"{{"object":"list","data":[{{"id":"Qwen3.5-122B-A10B","object":"model","owned_by":"osmium"}}]}}"#
+            ).into_boxed_str());
+            let health_json: &'static str = Box::leak(format!(
+                r#"{{"status":"ok","max_context_tokens":{}}}"#,
+                state.max_context_tokens,
+            ).into_boxed_str());
+
+            let accept_thread = std::thread::spawn(move || {
+                while running2.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _addr)) => {
+                            stream.set_nonblocking(false).ok();
+                            stream.set_nodelay(true).ok();
+                            stream.set_read_timeout(Some(std::time::Duration::from_secs(30))).ok();
+
+                            // Peek at the request to see if it's lightweight
+                            let mut buf = [0u8; 512];
+                            let n = match (&stream).peek(&mut buf) {
+                                Ok(n) => n,
+                                Err(_) => { drop(stream); continue; }
+                            };
+                            let head = std::str::from_utf8(&buf[..n]).unwrap_or("");
+
+                            if head.contains("GET /v1/models") {
+                                // Drain the request bytes then respond immediately
+                                use std::io::{Read, Write};
+                                let mut discard = vec![0u8; n];
+                                let _ = (&stream).read(&mut discard);
+                                let resp = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                                     Access-Control-Allow-Origin: *\r\n\
+                                     Connection: close\r\nContent-Length: {}\r\n\r\n{}",
+                                    models_json.len(), models_json
+                                );
+                                let _ = (&stream).write_all(resp.as_bytes());
+                                drop(stream);
+                            } else if head.contains("GET /health") {
+                                use std::io::{Read, Write};
+                                let mut discard = vec![0u8; n];
+                                let _ = (&stream).read(&mut discard);
+                                let resp = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                                     Access-Control-Allow-Origin: *\r\n\
+                                     Connection: close\r\nContent-Length: {}\r\n\r\n{}",
+                                    health_json.len(), health_json
+                                );
+                                let _ = (&stream).write_all(resp.as_bytes());
+                                drop(stream);
+                            } else if head.contains("OPTIONS") {
+                                use std::io::{Read, Write};
+                                let mut discard = vec![0u8; n];
+                                let _ = (&stream).read(&mut discard);
+                                let resp = "HTTP/1.1 204 No Content\r\n\
+                                     Access-Control-Allow-Origin: *\r\n\
+                                     Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+                                     Access-Control-Allow-Headers: Content-Type, Authorization\r\n\
+                                     Connection: close\r\n\r\n";
+                                let _ = (&stream).write_all(resp.as_bytes());
+                                drop(stream);
+                            } else {
+                                // Heavy request — send to main thread
+                                let _ = tx.send(stream);
+                            }
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(e) => {
+                            log::error!("Accept error: {}", e);
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
                     }
                 }
+            });
+
+            // Main thread: handle heavy requests (chat completions) sequentially
+            while running.load(Ordering::Acquire) {
+                match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                    Ok(stream) => {
+                        handle_request(stream, &state);
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
             }
+
+            let _ = accept_thread.join();
 
             log::info!("Rust HTTP server stopped");
         });

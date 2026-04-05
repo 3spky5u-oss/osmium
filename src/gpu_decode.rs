@@ -117,6 +117,9 @@ const KERNEL_NAMES: &[&str] = &[
     "gqa_attention_reduce_g",
     "la_fused_post_proj",
     "expert_classify_prepare",
+    // FP4 KV cache kernels
+    "kv_cache_write_fp4_g",
+    "gqa_attention_tiled_fp4_g",
 ];
 
 const MODULE_NAME: &str = "decode_kernels";
@@ -919,6 +922,9 @@ struct CachedKernels {
     la_fused_post_proj: cudarc::driver::CudaFunction,
     // GPU-side expert classification (eliminates cuStreamSynchronize in route sync)
     expert_classify_prepare: cudarc::driver::CudaFunction,
+    // FP4 KV cache kernels
+    kv_cache_write_fp4_g: cudarc::driver::CudaFunction,
+    gqa_attention_tiled_fp4_g: cudarc::driver::CudaFunction,
 }
 
 // ── Main GPU decode graph ──────────────────────────────────────────────
@@ -1107,6 +1113,21 @@ struct GpuDecodeGraph {
     kv_v_ptrs: Vec<u64>,
     kv_max_seq: usize,
     kv_current_pos: usize,
+
+    /// KV cache format: "fp8" (default) or "fp4".
+    kv_format_fp4: bool,
+    /// FP4 KV cache device pointers (data + scale, per layer).
+    kv_fp4_k_data_ptrs: Vec<u64>,
+    kv_fp4_k_scale_ptrs: Vec<u64>,
+    kv_fp4_v_data_ptrs: Vec<u64>,
+    kv_fp4_v_scale_ptrs: Vec<u64>,
+    kv_fp4_kv_dim: usize,
+
+    /// GPU page table for paged KV cache: maps logical page → physical page index.
+    /// Contents updated via memcpy before each graph replay. Pointer baked into CUDA graph.
+    /// Size: max_pages * sizeof(i32) where max_pages = kv_max_seq / 16.
+    d_page_table: Option<cudarc::driver::CudaSlice<i32>>,
+    page_table_capacity: usize, // max_pages (number of i32 entries)
 
     /// RoPE tables in VRAM: cos[max_seq * half_dim], sin[max_seq * half_dim]
     d_rope_cos: Option<cudarc::driver::CudaSlice<f32>>,
@@ -1925,6 +1946,14 @@ impl GpuDecodeStore {
             kv_k_ptrs: Vec::new(),
             kv_v_ptrs: Vec::new(),
             kv_max_seq: 0,
+            kv_format_fp4: false,
+            kv_fp4_k_data_ptrs: Vec::new(),
+            kv_fp4_k_scale_ptrs: Vec::new(),
+            kv_fp4_v_data_ptrs: Vec::new(),
+            kv_fp4_v_scale_ptrs: Vec::new(),
+            kv_fp4_kv_dim: 0,
+            d_page_table: None,
+            page_table_capacity: 0,
             kv_current_pos: 0,
             d_rope_cos: None,
             d_rope_sin: None,
@@ -2073,6 +2102,8 @@ impl GpuDecodeStore {
                 gqa_attention_reduce_g: get("gqa_attention_reduce_g")?,
                 la_fused_post_proj: get("la_fused_post_proj")?,
                 expert_classify_prepare: get("expert_classify_prepare")?,
+                kv_cache_write_fp4_g: get("kv_cache_write_fp4_g")?,
+                gqa_attention_tiled_fp4_g: get("gqa_attention_tiled_fp4_g")?,
             };
             // Extract raw CUfunction handles for spec routing on spec_stream.
             self.raw_sigmoid_topk = CudaFunc(extract_cu_function(&kernels.sigmoid_topk));
@@ -4141,6 +4172,19 @@ impl GpuDecodeStore {
         log::info!("GpuDecodeStore: KV cache shared FP8 pointers set ({} GQA layers, max_seq={})",
             registered, max_seq);
 
+        // Allocate page table for paged KV cache (identity mapping: page i → physical page i).
+        // PAGE_SIZE = 16 tokens per page (matches Python kv_cache.py PAGE_SIZE).
+        let page_size = 16usize;
+        let max_pages = (max_seq + page_size - 1) / page_size;
+        let identity: Vec<i32> = (0..max_pages as i32).collect();
+        let d_page_table = self.device.htod_sync_copy(&identity)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                format!("page_table alloc: {:?}", e)))?;
+        log::info!("GpuDecodeStore: page table allocated ({} pages, {} KB)",
+            max_pages, max_pages * 4 / 1024);
+        graph.d_page_table = Some(d_page_table);
+        graph.page_table_capacity = max_pages;
+
         // Allocate FlashDecoding tiled attention buffers.
         // Find max num_q_heads and head_dim across all GQA layers.
         let mut max_nh: usize = 0;
@@ -4188,6 +4232,151 @@ impl GpuDecodeStore {
         }
         graph.kv_current_pos = seq_len;
         Ok(())
+    }
+
+    /// Update the page table for the active sequence. Called when switching sequences
+    /// or after prefill to reflect the sequence's actual page allocation.
+    /// page_indices: list of physical page indices for the sequence (one per logical page).
+    #[pyo3(signature = (page_indices,))]
+    fn set_page_table(&mut self, page_indices: Vec<i32>) -> PyResult<()> {
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        if page_indices.len() > graph.page_table_capacity {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                format!("page_indices len {} exceeds page table capacity {}",
+                    page_indices.len(), graph.page_table_capacity)));
+        }
+        let d_pt = graph.d_page_table.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                "Page table not allocated (call set_kv_cache_ptrs first)"))?;
+        // Partial copy: only overwrite the first page_indices.len() entries.
+        // Remaining entries keep their identity mapping from init.
+        let copy_bytes = page_indices.len() * std::mem::size_of::<i32>();
+        unsafe {
+            let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                *d_pt.device_ptr(),
+                page_indices.as_ptr() as *const std::ffi::c_void,
+                copy_bytes,
+            );
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("set_page_table cuMemcpyHtoD: {:?}", err)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Register FP4 KV cache pointers for decode.
+    /// ptrs: Vec of (layer_idx, k_data_ptr, k_scale_ptr, v_data_ptr, v_scale_ptr).
+    /// kv_dim: flat KV dimension (num_kv_heads * head_dim).
+    #[pyo3(signature = (ptrs, kv_dim))]
+    fn set_kv_cache_ptrs_fp4(
+        &mut self,
+        ptrs: Vec<(usize, usize, usize, usize, usize)>,
+        kv_dim: usize,
+    ) -> PyResult<()> {
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Call configure first"))?;
+        let num_layers = graph.layers.len();
+        graph.kv_fp4_k_data_ptrs = vec![0u64; num_layers];
+        graph.kv_fp4_k_scale_ptrs = vec![0u64; num_layers];
+        graph.kv_fp4_v_data_ptrs = vec![0u64; num_layers];
+        graph.kv_fp4_v_scale_ptrs = vec![0u64; num_layers];
+        graph.kv_fp4_kv_dim = kv_dim;
+        graph.kv_format_fp4 = true;
+        for (layer_idx, kd, ks, vd, vs) in ptrs {
+            if layer_idx >= num_layers { continue; }
+            graph.kv_fp4_k_data_ptrs[layer_idx] = kd as u64;
+            graph.kv_fp4_k_scale_ptrs[layer_idx] = ks as u64;
+            graph.kv_fp4_v_data_ptrs[layer_idx] = vd as u64;
+            graph.kv_fp4_v_scale_ptrs[layer_idx] = vs as u64;
+        }
+        log::info!("GpuDecodeStore: FP4 KV cache pointers set (kv_dim={})", kv_dim);
+        Ok(())
+    }
+
+    /// Save all LA layer states to host pinned memory (D2H copy).
+    /// host_ptrs: Vec of (layer_idx, host_conv_ptr, host_recur_ptr).
+    #[pyo3(signature = (host_ptrs,))]
+    fn save_la_states_to_host(&self, host_ptrs: Vec<(usize, usize, usize)>) -> PyResult<usize> {
+        let graph = self.graph.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("graph not configured"))?;
+        let mut total_bytes = 0usize;
+        for (layer_idx, h_conv, h_recur) in &host_ptrs {
+            let (conv_ptr, recur_ptr) = match &graph.layers[*layer_idx].attn {
+                GpuAttnConfig::LinearAttention { conv_state_ptr, recur_state_ptr, .. } => {
+                    (*conv_state_ptr, *recur_state_ptr)
+                }
+                _ => continue,
+            };
+            let backup = graph.la_backup.iter().find(|b| b.layer_idx == *layer_idx);
+            let (conv_bytes, recur_bytes) = match backup {
+                Some(b) => (b.conv_state_bytes, b.recur_state_bytes),
+                None => continue,
+            };
+            unsafe {
+                let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+                    *h_conv as *mut std::ffi::c_void, conv_ptr, conv_bytes);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        format!("save_la_to_host conv[{}]: {:?}", layer_idx, err)));
+                }
+                let err = cuda_sys::lib().cuMemcpyDtoH_v2(
+                    *h_recur as *mut std::ffi::c_void, recur_ptr, recur_bytes);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        format!("save_la_to_host recur[{}]: {:?}", layer_idx, err)));
+                }
+            }
+            total_bytes += conv_bytes + recur_bytes;
+        }
+        Ok(total_bytes)
+    }
+
+    /// Restore all LA layer states from host pinned memory (H2D copy).
+    #[pyo3(signature = (host_ptrs,))]
+    fn restore_la_states_from_host(&self, host_ptrs: Vec<(usize, usize, usize)>) -> PyResult<usize> {
+        let graph = self.graph.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("graph not configured"))?;
+        let mut total_bytes = 0usize;
+        for (layer_idx, h_conv, h_recur) in &host_ptrs {
+            let (conv_ptr, recur_ptr) = match &graph.layers[*layer_idx].attn {
+                GpuAttnConfig::LinearAttention { conv_state_ptr, recur_state_ptr, .. } => {
+                    (*conv_state_ptr, *recur_state_ptr)
+                }
+                _ => continue,
+            };
+            let backup = graph.la_backup.iter().find(|b| b.layer_idx == *layer_idx);
+            let (conv_bytes, recur_bytes) = match backup {
+                Some(b) => (b.conv_state_bytes, b.recur_state_bytes),
+                None => continue,
+            };
+            unsafe {
+                let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                    conv_ptr, *h_conv as *const std::ffi::c_void, conv_bytes);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        format!("restore_la_from_host conv[{}]: {:?}", layer_idx, err)));
+                }
+                let err = cuda_sys::lib().cuMemcpyHtoD_v2(
+                    recur_ptr, *h_recur as *const std::ffi::c_void, recur_bytes);
+                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        format!("restore_la_from_host recur[{}]: {:?}", layer_idx, err)));
+                }
+            }
+            total_bytes += conv_bytes + recur_bytes;
+        }
+        Ok(total_bytes)
+    }
+
+    /// Get LA state sizes for pre-allocating host buffers.
+    fn get_la_state_sizes(&self) -> PyResult<Vec<(usize, usize, usize)>> {
+        let graph = self.graph.as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("graph not configured"))?;
+        Ok(graph.la_backup.iter().map(|b| {
+            (b.layer_idx, b.conv_state_bytes, b.recur_state_bytes)
+        }).collect())
     }
 
     /// Set norm_bias_one flag (Qwen3-Next uses (1+w)*x norms).
@@ -6321,21 +6510,45 @@ impl GpuDecodeStore {
                             }
                         }
 
-                        // KV cache write
+                        // KV cache write (FP8 or FP4)
                         {
-                            let threads = 256u32;
-                            let blocks = ((kv_stride as u32) + threads - 1) / threads;
-                            unsafe {
-                                k.kv_cache_write_g.clone().launch(
-                                    LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
-                                    (
-                                        graph.kv_k_ptrs[layer_idx],
-                                        graph.kv_v_ptrs[layer_idx],
-                                        *graph.d_gqa_k.device_ptr(),
-                                        *graph.d_gqa_v.device_ptr(),
-                                        d_pos_ptr, kv_stride as i32,
-                                    ),
-                                ).map_err(|e| format!("kv_cache_write_g[{}]: {:?}", layer_idx, e))?;
+                            if graph.kv_format_fp4 && graph.kv_fp4_k_data_ptrs[layer_idx] != 0 {
+                                // FP4: one thread per group of 16 elements
+                                let num_groups = (graph.kv_fp4_kv_dim / 16) as u32;
+                                let threads = 256u32.min(num_groups);
+                                let blocks = (num_groups + threads - 1) / threads;
+                                unsafe {
+                                    k.kv_cache_write_fp4_g.clone().launch(
+                                        LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                        (
+                                            graph.kv_fp4_k_data_ptrs[layer_idx],
+                                            graph.kv_fp4_k_scale_ptrs[layer_idx],
+                                            graph.kv_fp4_v_data_ptrs[layer_idx],
+                                            graph.kv_fp4_v_scale_ptrs[layer_idx],
+                                            *graph.d_gqa_k.device_ptr(),
+                                            *graph.d_gqa_v.device_ptr(),
+                                            d_pos_ptr,
+                                            graph.kv_fp4_kv_dim as i32,
+                                            *graph.d_page_table.as_ref().unwrap().device_ptr(),
+                                        ),
+                                    ).map_err(|e| format!("kv_cache_write_fp4_g[{}]: {:?}", layer_idx, e))?;
+                                }
+                            } else {
+                                let threads = 256u32;
+                                let blocks = ((kv_stride as u32) + threads - 1) / threads;
+                                unsafe {
+                                    k.kv_cache_write_g.clone().launch(
+                                        LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
+                                        (
+                                            graph.kv_k_ptrs[layer_idx],
+                                            graph.kv_v_ptrs[layer_idx],
+                                            *graph.d_gqa_k.device_ptr(),
+                                            *graph.d_gqa_v.device_ptr(),
+                                            d_pos_ptr, kv_stride as i32,
+                                            *graph.d_page_table.as_ref().unwrap().device_ptr(),
+                                        ),
+                                    ).map_err(|e| format!("kv_cache_write_g[{}]: {:?}", layer_idx, e))?;
+                                }
                             }
                         }
 
@@ -6350,6 +6563,51 @@ impl GpuDecodeStore {
                                 let tiled_o = graph.d_gqa_tiled_o.as_ref().unwrap();
                                 let tiled_lse = graph.d_gqa_tiled_lse.as_ref().unwrap();
                                 let tile_smem = ((tile_size + hd) as u32) * 4 + 128;
+
+                                if graph.kv_format_fp4 && graph.kv_fp4_k_data_ptrs[layer_idx] != 0 {
+                                    // FP4 tiled attention — 14 params, use raw cuLaunchKernel
+                                    let f = extract_cu_function(&k.gqa_attention_tiled_fp4_g);
+                                    let pt_ptr = *graph.d_page_table.as_ref().unwrap().device_ptr();
+                                    let p_tiled_o = *tiled_o.device_ptr();
+                                    let p_tiled_lse = *tiled_lse.device_ptr();
+                                    let p_q = *graph.d_gqa_q.device_ptr();
+                                    let p_kd = graph.kv_fp4_k_data_ptrs[layer_idx];
+                                    let p_ks = graph.kv_fp4_k_scale_ptrs[layer_idx];
+                                    let p_vd = graph.kv_fp4_v_data_ptrs[layer_idx];
+                                    let p_vs = graph.kv_fp4_v_scale_ptrs[layer_idx];
+                                    let sm_s = *sm_scale;
+                                    let i_nh = nh as i32;
+                                    let i_nkv = nkv as i32;
+                                    let i_hd = hd as i32;
+                                    let i_tile = tile_size as i32;
+                                    let mut params: [*mut std::ffi::c_void; 14] = [
+                                        &p_tiled_o as *const _ as *mut _,
+                                        &p_tiled_lse as *const _ as *mut _,
+                                        &p_q as *const _ as *mut _,
+                                        &p_kd as *const _ as *mut _,
+                                        &p_ks as *const _ as *mut _,
+                                        &p_vd as *const _ as *mut _,
+                                        &p_vs as *const _ as *mut _,
+                                        &sm_s as *const _ as *mut _,
+                                        &i_nh as *const _ as *mut _,
+                                        &i_nkv as *const _ as *mut _,
+                                        &i_hd as *const _ as *mut _,
+                                        &d_seq_len_ptr as *const _ as *mut _,
+                                        &i_tile as *const _ as *mut _,
+                                        &pt_ptr as *const _ as *mut _,
+                                    ];
+                                    unsafe {
+                                        let err = cuda_sys::lib().cuLaunchKernel(
+                                            f, nh as u32, max_tiles as u32, 1,
+                                            threads, 1, 1,
+                                            tile_smem, std::ptr::null_mut(),
+                                            params.as_mut_ptr(), std::ptr::null_mut(),
+                                        );
+                                        if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                            return Err(format!("gqa_attention_tiled_fp4_g[{}]: {:?}", layer_idx, err));
+                                        }
+                                    }
+                                } else {
                                 unsafe {
                                     k.gqa_attention_tiled_g.clone().launch(
                                         LaunchConfig {
@@ -6367,10 +6625,14 @@ impl GpuDecodeStore {
                                             nh as i32, nkv as i32, hd as i32,
                                             d_seq_len_ptr,
                                             tile_size as i32,
-                                            max_tiles as i32,
+                                            *graph.d_page_table.as_ref().unwrap().device_ptr(),
                                         ),
                                     ).map_err(|e| format!("gqa_attention_tiled_g[{}]: {:?}", layer_idx, e))?;
+                                }
+                                }
 
+                                // Reduce kernel (same for both FP8 and FP4 — reads from partial_o/partial_lse)
+                                unsafe {
                                     let reduce_smem = (max_tiles as u32) * 4;
                                     k.gqa_attention_reduce_g.clone().launch(
                                         LaunchConfig {
@@ -6411,6 +6673,7 @@ impl GpuDecodeStore {
                                             nh as i32, nkv as i32, hd as i32,
                                             d_seq_len_ptr,
                                             graph.kv_max_seq as i32,
+                                            *graph.d_page_table.as_ref().unwrap().device_ptr(),
                                         ),
                                     ).map_err(|e| format!("gqa_attention_g[{}]: {:?}", layer_idx, e))?;
                                 }
@@ -7639,6 +7902,7 @@ impl GpuDecodeStore {
                                 *graph.d_gqa_v.device_ptr(),
                                 position as i32,
                                 kv_stride as i32,
+                                *graph.d_page_table.as_ref().unwrap().device_ptr(),
                             )).map_err(|e| format!("kv_cache_write[{}]: {:?}", layer_idx, e))?;
                         }
                     }
@@ -7690,6 +7954,7 @@ impl GpuDecodeStore {
                                         hd as i32,
                                         seq_len as i32,
                                         tile_size as i32,
+                                        *graph.d_page_table.as_ref().unwrap().device_ptr(),
                                     ),
                                 ).map_err(|e| format!("gqa_attention_tiled[{}]: {:?}", layer_idx, e))?;
 
@@ -7738,6 +8003,7 @@ impl GpuDecodeStore {
                                     seq_len as i32,
                                     graph.kv_max_seq as i32,
                                     if use_smem { 1i32 } else { 0i32 },
+                                    *graph.d_page_table.as_ref().unwrap().device_ptr(),
                                 )).map_err(|e| format!("gqa_attention[{}]: {:?}", layer_idx, e))?;
                             }
                         }

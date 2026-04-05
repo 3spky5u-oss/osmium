@@ -1059,19 +1059,32 @@ extern "C" __global__ void apply_rope(
     data[half_dim + i] = x2 * cos_val + x1 * sin_val;
 }
 
-// Write K,V to FP8 E4M3 KV cache at given position
+// Translate a logical token position to a physical offset in the paged KV cache.
+// page_table maps logical page index → physical page index.
+// PAGE_SIZE is always 16 (power of 2 → shift/mask).
+#define KV_PAGE_SIZE 16
+__device__ __forceinline__ int paged_offset(int pos, const int* __restrict__ page_table, int kv_stride) {
+    int logical_page = pos >> 4;           // pos / 16
+    int slot         = pos & 15;           // pos % 16
+    int physical_page = page_table[logical_page];
+    return (physical_page * KV_PAGE_SIZE + slot) * kv_stride;
+}
+
+// Write K,V to FP8 E4M3 KV cache at given position (paged)
 extern "C" __global__ void kv_cache_write(
-    __nv_fp8_e4m3* __restrict__ k_cache,   // [max_seq, kv_stride] FP8
-    __nv_fp8_e4m3* __restrict__ v_cache,   // [max_seq, kv_stride] FP8
+    __nv_fp8_e4m3* __restrict__ k_cache,   // paged FP8
+    __nv_fp8_e4m3* __restrict__ v_cache,   // paged FP8
     const float* __restrict__ k,     // [kv_stride]
     const float* __restrict__ v,     // [kv_stride]
     int position,
-    int kv_stride   // num_kv_heads * head_dim
+    int kv_stride,   // num_kv_heads * head_dim
+    const int* __restrict__ page_table    // logical page → physical page
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < kv_stride) {
-        k_cache[position * kv_stride + i] = f32_to_fp8e4m3(k[i]);
-        v_cache[position * kv_stride + i] = f32_to_fp8e4m3(v[i]);
+        int off = paged_offset(position, page_table, kv_stride);
+        k_cache[off + i] = f32_to_fp8e4m3(k[i]);
+        v_cache[off + i] = f32_to_fp8e4m3(v[i]);
     }
 }
 
@@ -1087,15 +1100,16 @@ extern "C" __global__ void kv_cache_write(
 extern "C" __global__ void gqa_attention(
     float* __restrict__ output,          // [num_q_heads * head_dim]
     const float* __restrict__ q,          // [num_q_heads * head_dim]
-    const __nv_fp8_e4m3* __restrict__ k_cache,   // [max_seq, kv_stride] FP8
-    const __nv_fp8_e4m3* __restrict__ v_cache,   // [max_seq, kv_stride] FP8
+    const __nv_fp8_e4m3* __restrict__ k_cache,   // paged FP8
+    const __nv_fp8_e4m3* __restrict__ v_cache,   // paged FP8
     float sm_scale,
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
     int seq_len,     // number of valid positions (position + 1)
     int max_seq,
-    int use_smem     // 1 = shared memory path, 0 = 2-pass fallback
+    int use_smem,    // 1 = shared memory path, 0 = 2-pass fallback
+    const int* __restrict__ page_table    // logical page → physical page
 ) {
     int qh = blockIdx.x;
     if (qh >= num_q_heads) return;
@@ -1131,10 +1145,10 @@ extern "C" __global__ void gqa_attention(
     if (use_smem) {
         // ══════ FAST PATH: shared memory for scores ══════
 
-        // Step 1: Compute all attention scores (vectorized FP8 loads)
+        // Step 1: Compute all attention scores (vectorized FP8 loads, paged)
         for (int pos = tid; pos < seq_len; pos += num_threads) {
             float score = 0.0f;
-            const __nv_fp8_e4m3* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
+            const __nv_fp8_e4m3* k_vec = k_cache + paged_offset(pos, page_table, kv_stride) + kv_head * head_dim;
             for (int d = 0; d < head_dim; d += 16) {
                 uint4 k_packed = *reinterpret_cast<const uint4*>(k_vec + d);
                 const unsigned char* kb = reinterpret_cast<const unsigned char*>(&k_packed);
@@ -1192,12 +1206,13 @@ extern "C" __global__ void gqa_attention(
         }
         __syncthreads();
 
-        // Step 4: Weighted V sum (each thread handles subset of output dims)
+        // Step 4: Weighted V sum (each thread handles subset of output dims, paged)
         float* out_head = output + qh * head_dim;
         for (int d = tid; d < head_dim; d += num_threads) {
             float acc = 0.0f;
             for (int pos = 0; pos < seq_len; pos++) {
-                acc += smem_scores[pos] * fp8e4m3_to_f32(v_cache[pos * kv_stride + kv_head * head_dim + d]);
+                acc += smem_scores[pos] * fp8e4m3_to_f32(
+                    v_cache[paged_offset(pos, page_table, kv_stride) + kv_head * head_dim + d]);
             }
             out_head[d] = acc;
         }
@@ -1205,12 +1220,12 @@ extern "C" __global__ void gqa_attention(
     } else {
         // ══════ SLOW PATH: 2-pass, no score storage ══════
 
-        // Pass 1: Online softmax — find max and sum_exp (vectorized FP8 K loads)
+        // Pass 1: Online softmax — find max and sum_exp (vectorized FP8 K loads, paged)
         float local_max = -1e30f;
         float local_sum = 0.0f;
         for (int pos = tid; pos < seq_len; pos += num_threads) {
             float score = 0.0f;
-            const __nv_fp8_e4m3* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
+            const __nv_fp8_e4m3* k_vec = k_cache + paged_offset(pos, page_table, kv_stride) + kv_head * head_dim;
             for (int d = 0; d < head_dim; d += 16) {
                 uint4 k_packed = *reinterpret_cast<const uint4*>(k_vec + d);
                 const unsigned char* kb = reinterpret_cast<const unsigned char*>(&k_packed);
@@ -1256,13 +1271,14 @@ extern "C" __global__ void gqa_attention(
         float global_max = smem_reduce[0];
         float inv_sum = 1.0f / smem_reduce[16];
 
-        // Pass 2: Weighted V sum (recompute scores, vectorized FP8 K loads)
+        // Pass 2: Weighted V sum (recompute scores, vectorized FP8 K loads, paged)
         float* out_head = output + qh * head_dim;
         for (int d = tid; d < head_dim; d += num_threads) {
             float acc = 0.0f;
             for (int pos = 0; pos < seq_len; pos++) {
                 float score = 0.0f;
-                const __nv_fp8_e4m3* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
+                int k_off = paged_offset(pos, page_table, kv_stride);
+                const __nv_fp8_e4m3* k_vec = k_cache + k_off + kv_head * head_dim;
                 for (int dd = 0; dd < head_dim; dd += 16) {
                     uint4 k_packed = *reinterpret_cast<const uint4*>(k_vec + dd);
                     const unsigned char* kb = reinterpret_cast<const unsigned char*>(&k_packed);
@@ -1273,7 +1289,8 @@ extern "C" __global__ void gqa_attention(
                     }
                 }
                 float weight = expf(score * sm_scale - global_max) * inv_sum;
-                acc += weight * fp8e4m3_to_f32(v_cache[pos * kv_stride + kv_head * head_dim + d]);
+                acc += weight * fp8e4m3_to_f32(
+                    v_cache[paged_offset(pos, page_table, kv_stride) + kv_head * head_dim + d]);
             }
             out_head[d] = acc;
         }
@@ -1300,14 +1317,15 @@ extern "C" __global__ void gqa_attention_tiled(
     float* __restrict__ partial_o,     // [num_q_heads, num_tiles, head_dim]
     float* __restrict__ partial_lse,   // [num_q_heads, num_tiles, 2] (max, sum_exp)
     const float* __restrict__ q,       // [num_q_heads * head_dim]
-    const __nv_fp8_e4m3* __restrict__ k_cache,  // [max_seq, kv_stride] FP8
-    const __nv_fp8_e4m3* __restrict__ v_cache,  // [max_seq, kv_stride] FP8
+    const __nv_fp8_e4m3* __restrict__ k_cache,  // paged FP8
+    const __nv_fp8_e4m3* __restrict__ v_cache,  // paged FP8
     float sm_scale,
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
     int seq_len,
-    int tile_size
+    int tile_size,
+    const int* __restrict__ page_table    // logical page → physical page
 ) {
     int qh = blockIdx.x;
     int tile_idx = blockIdx.y;
@@ -1347,11 +1365,11 @@ extern "C" __global__ void gqa_attention_tiled(
     }
     __syncthreads();
 
-    // ── Step 1: Q·K dot products for this tile (vectorized FP8 loads) ──
+    // ── Step 1: Q·K dot products for this tile (vectorized FP8 loads, paged) ──
     for (int i = tid; i < tile_len; i += num_threads) {
         int pos = tile_start + i;
         float score = 0.0f;
-        const __nv_fp8_e4m3* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
+        const __nv_fp8_e4m3* k_vec = k_cache + paged_offset(pos, page_table, kv_stride) + kv_head * head_dim;
         // Load 16 FP8 K values at once via uint4 (16 bytes per transaction)
         for (int d = 0; d < head_dim; d += 16) {
             uint4 k_packed = *reinterpret_cast<const uint4*>(k_vec + d);
@@ -1404,13 +1422,14 @@ extern "C" __global__ void gqa_attention_tiled(
     __syncthreads();
     float tile_sum = smem_reduce[0];
 
-    // ── Step 4: Unnormalised weighted V sum ──
+    // ── Step 4: Unnormalised weighted V sum (paged) ──
     float* out_partial = partial_o + (qh * num_tiles + tile_idx) * head_dim;
     for (int d = tid; d < head_dim; d += num_threads) {
         float acc = 0.0f;
         for (int i = 0; i < tile_len; i++) {
+            int vpos = tile_start + i;
             acc += smem_scores[i] * fp8e4m3_to_f32(
-                v_cache[(tile_start + i) * kv_stride + kv_head * head_dim + d]);
+                v_cache[paged_offset(vpos, page_table, kv_stride) + kv_head * head_dim + d]);
         }
         out_partial[d] = acc;
     }
@@ -3591,13 +3610,15 @@ extern "C" __global__ void kv_cache_write_g(
     const float* __restrict__ k,
     const float* __restrict__ v,
     const int* __restrict__ d_position,   // read from GPU pointer
-    int kv_stride
+    int kv_stride,
+    const int* __restrict__ page_table    // logical page → physical page
 ) {
     int position = *d_position;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < kv_stride) {
-        k_cache[position * kv_stride + i] = f32_to_fp8e4m3(k[i]);
-        v_cache[position * kv_stride + i] = f32_to_fp8e4m3(v[i]);
+        int off = paged_offset(position, page_table, kv_stride);
+        k_cache[off + i] = f32_to_fp8e4m3(k[i]);
+        v_cache[off + i] = f32_to_fp8e4m3(v[i]);
     }
 }
 
@@ -3617,7 +3638,8 @@ extern "C" __global__ void gqa_attention_g(
     int num_kv_heads,
     int head_dim,
     const int* __restrict__ d_seq_len,    // read from GPU pointer
-    int max_seq
+    int max_seq,
+    const int* __restrict__ page_table    // logical page → physical page
 ) {
     int seq_len = *d_seq_len;
     int qh = blockIdx.x;
@@ -3655,7 +3677,7 @@ extern "C" __global__ void gqa_attention_g(
     float local_max = -1e30f;
     for (int pos = tid; pos < seq_len; pos += num_threads) {
         float score = 0.0f;
-        const __nv_fp8_e4m3* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
+        const __nv_fp8_e4m3* k_vec = k_cache + paged_offset(pos, page_table, kv_stride) + kv_head * head_dim;
         for (int d = 0; d < head_dim; d += 16) {
             uint4 k_packed = *reinterpret_cast<const uint4*>(k_vec + d);
             const unsigned char* kb = reinterpret_cast<const unsigned char*>(&k_packed);
@@ -3696,7 +3718,7 @@ extern "C" __global__ void gqa_attention_g(
         for (int ti = tid; ti < tile_len; ti += num_threads) {
             int pos = tile_start + ti;
             float score = 0.0f;
-            const __nv_fp8_e4m3* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
+            const __nv_fp8_e4m3* k_vec = k_cache + paged_offset(pos, page_table, kv_stride) + kv_head * head_dim;
             for (int d = 0; d < head_dim; d += 16) {
                 uint4 k_packed = *reinterpret_cast<const uint4*>(k_vec + d);
                 const unsigned char* kb = reinterpret_cast<const unsigned char*>(&k_packed);
@@ -3713,12 +3735,13 @@ extern "C" __global__ void gqa_attention_g(
         __syncthreads();
 
         // Phase B: accumulate weighted V using stored weights
-        const __nv_fp8_e4m3* v_base = v_cache + tile_start * kv_stride + kv_head * head_dim;
         int di = 0;
         for (int d = tid; d < head_dim; d += num_threads) {
             float acc = 0.0f;
             for (int ti = 0; ti < tile_len; ti++) {
-                acc += smem_weights[ti] * fp8e4m3_to_f32(v_base[ti * kv_stride + d]);
+                int vpos = tile_start + ti;
+                acc += smem_weights[ti] * fp8e4m3_to_f32(
+                    v_cache[paged_offset(vpos, page_table, kv_stride) + kv_head * head_dim + d]);
             }
             v_acc[di++] += acc;
         }
@@ -3758,7 +3781,8 @@ extern "C" __global__ void gqa_attention_g_bf16(
     int num_kv_heads,
     int head_dim,
     const int* __restrict__ d_seq_len,
-    int max_seq
+    int max_seq,
+    const int* __restrict__ page_table    // logical page → physical page
 ) {
     int seq_len = *d_seq_len;
     int qh = blockIdx.x;
@@ -3792,7 +3816,7 @@ extern "C" __global__ void gqa_attention_g_bf16(
     float local_max = -1e30f;
     for (int pos = tid; pos < seq_len; pos += num_threads) {
         float score = 0.0f;
-        const __nv_fp8_e4m3* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
+        const __nv_fp8_e4m3* k_vec = k_cache + paged_offset(pos, page_table, kv_stride) + kv_head * head_dim;
         for (int d = 0; d < head_dim; d += 16) {
             uint4 k_packed = *reinterpret_cast<const uint4*>(k_vec + d);
             const unsigned char* kb = reinterpret_cast<const unsigned char*>(&k_packed);
@@ -3831,7 +3855,7 @@ extern "C" __global__ void gqa_attention_g_bf16(
         for (int ti = tid; ti < tile_len; ti += num_threads) {
             int pos = tile_start + ti;
             float score = 0.0f;
-            const __nv_fp8_e4m3* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
+            const __nv_fp8_e4m3* k_vec = k_cache + paged_offset(pos, page_table, kv_stride) + kv_head * head_dim;
             for (int d = 0; d < head_dim; d += 16) {
                 uint4 k_packed = *reinterpret_cast<const uint4*>(k_vec + d);
                 const unsigned char* kb = reinterpret_cast<const unsigned char*>(&k_packed);
@@ -3848,12 +3872,13 @@ extern "C" __global__ void gqa_attention_g_bf16(
         __syncthreads();
 
         // Phase B: accumulate weighted V using stored weights
-        const __nv_fp8_e4m3* v_base = v_cache + tile_start * kv_stride + kv_head * head_dim;
         int di = 0;
         for (int d = tid; d < head_dim; d += num_threads) {
             float acc = 0.0f;
             for (int ti = 0; ti < tile_len; ti++) {
-                acc += smem_weights[ti] * fp8e4m3_to_f32(v_base[ti * kv_stride + d]);
+                int vpos = tile_start + ti;
+                acc += smem_weights[ti] * fp8e4m3_to_f32(
+                    v_cache[paged_offset(vpos, page_table, kv_stride) + kv_head * head_dim + d]);
             }
             v_acc[di++] += acc;
         }
@@ -3901,17 +3926,18 @@ extern "C" __global__ void gqa_attention_tiled_g(
     float* __restrict__ partial_o,     // [num_q_heads, max_tiles, head_dim]
     float* __restrict__ partial_lse,   // [num_q_heads, max_tiles, 2] (max, sum_exp)
     const float* __restrict__ q,       // [num_q_heads * head_dim]
-    const __nv_fp8_e4m3* __restrict__ k_cache,  // [max_seq, kv_stride] FP8
-    const __nv_fp8_e4m3* __restrict__ v_cache,  // [max_seq, kv_stride] FP8
+    const __nv_fp8_e4m3* __restrict__ k_cache,  // paged [max_pages, page_size, kv_stride] FP8
+    const __nv_fp8_e4m3* __restrict__ v_cache,  // paged [max_pages, page_size, kv_stride] FP8
     float sm_scale,
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
     const int* __restrict__ d_seq_len,    // read from GPU pointer
     int tile_size,
-    int max_tiles
+    const int* __restrict__ page_table    // logical page → physical page
 ) {
     int seq_len = *d_seq_len;
+    int max_tiles = (int)gridDim.y;  // grid launched with (nh, max_tiles, 1)
     int qh = blockIdx.x;
     int tile_idx = (int)blockIdx.y;
     int num_tiles = (seq_len + tile_size - 1) / tile_size;
@@ -3950,11 +3976,11 @@ extern "C" __global__ void gqa_attention_tiled_g(
     }
     __syncthreads();
 
-    // Step 1: Q·K dot products for this tile (vectorized FP8 loads)
+    // Step 1: Q·K dot products for this tile (vectorized FP8 loads, paged)
     for (int i = tid; i < tile_len; i += num_threads) {
         int pos = tile_start + i;
         float score = 0.0f;
-        const __nv_fp8_e4m3* k_vec = k_cache + pos * kv_stride + kv_head * head_dim;
+        const __nv_fp8_e4m3* k_vec = k_cache + paged_offset(pos, page_table, kv_stride) + kv_head * head_dim;
         for (int d = 0; d < head_dim; d += 16) {
             uint4 k_packed = *reinterpret_cast<const uint4*>(k_vec + d);
             const unsigned char* kb = reinterpret_cast<const unsigned char*>(&k_packed);
@@ -4006,13 +4032,14 @@ extern "C" __global__ void gqa_attention_tiled_g(
     __syncthreads();
     float tile_sum = smem_reduce[0];
 
-    // Step 4: Unnormalised weighted V sum
+    // Step 4: Unnormalised weighted V sum (paged)
     float* out_partial = partial_o + (qh * max_tiles + tile_idx) * head_dim;
     for (int d = tid; d < head_dim; d += num_threads) {
         float acc = 0.0f;
         for (int i = 0; i < tile_len; i++) {
+            int vpos = tile_start + i;
             acc += smem_scores[i] * fp8e4m3_to_f32(
-                v_cache[(tile_start + i) * kv_stride + kv_head * head_dim + d]);
+                v_cache[paged_offset(vpos, page_table, kv_stride) + kv_head * head_dim + d]);
         }
         out_partial[d] = acc;
     }
@@ -4652,5 +4679,256 @@ extern "C" __global__ void la_fused_post_proj(
         float silu_z = zv / (1.0f + expf(-zv));
         __nv_bfloat16 result = __float2bfloat16(silu_z * normed);
         out_h[i] = *reinterpret_cast<unsigned short*>(&result);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// FP4 E2M1 KV cache support
+// ═══════════════════════════════════════════════════════════════
+//
+// FP4 E2M1 format: 1 sign + 2 exponent + 1 mantissa
+// Values: ±{0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}
+// Packed: 2 values per byte (low nibble = even index, high nibble = odd index)
+// Scales: 1 FP8 E4M3 scale per FP4_GROUP_SIZE elements
+
+#define FP4_GROUP_SIZE 16
+
+// Dequant LUT: nibble → float (unsigned magnitude, sign handled separately)
+__device__ __constant__ float fp4_e2m1_lut[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,    // positive
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f  // negative
+};
+
+__device__ __forceinline__ float fp4_dequant(unsigned char packed_byte, int nibble_idx,
+                                              float scale) {
+    unsigned char nibble = (nibble_idx == 0) ? (packed_byte & 0x0F) : (packed_byte >> 4);
+    return fp4_e2m1_lut[nibble] * scale;
+}
+
+// Quantize a single float to FP4 E2M1 nibble (0-15)
+__device__ __forceinline__ unsigned char fp4_quant_nibble(float val, float inv_scale) {
+    float scaled = val * inv_scale;
+    int sign = (scaled < 0.0f) ? 8 : 0;
+    float abs_val = fabsf(scaled);
+    // Nearest-round to E2M1 codebook: {0, 0.5, 1, 1.5, 2, 3, 4, 6}
+    unsigned char code;
+    if      (abs_val < 0.25f)  code = 0;
+    else if (abs_val < 0.75f)  code = 1;
+    else if (abs_val < 1.25f)  code = 2;
+    else if (abs_val < 1.75f)  code = 3;
+    else if (abs_val < 2.5f)   code = 4;
+    else if (abs_val < 3.5f)   code = 5;
+    else if (abs_val < 5.0f)   code = 6;
+    else                       code = 7;
+    return code | sign;
+}
+
+// Paged offset for FP4 data buffer: kv_dim/2 elements per position
+__device__ __forceinline__ int paged_offset_fp4(int pos, const int* __restrict__ page_table,
+                                                 int half_kv_dim) {
+    int logical_page = pos >> 4;
+    int slot = pos & 15;
+    int physical_page = page_table[logical_page];
+    return (physical_page * KV_PAGE_SIZE + slot) * half_kv_dim;
+}
+
+// Paged offset for FP4 scale buffer: kv_dim/FP4_GROUP_SIZE elements per position
+__device__ __forceinline__ int paged_offset_fp4_scale(int pos, const int* __restrict__ page_table,
+                                                       int num_scale_groups) {
+    int logical_page = pos >> 4;
+    int slot = pos & 15;
+    int physical_page = page_table[logical_page];
+    return (physical_page * KV_PAGE_SIZE + slot) * num_scale_groups;
+}
+
+// ── FP4 KV cache write (graph-compatible) ──
+// Quantizes FP32 K/V to FP4 packed + FP8 scale at the given position.
+extern "C" __global__ void kv_cache_write_fp4_g(
+    unsigned char* __restrict__ k_data,     // [max_pages, page_size, kv_dim/2] uint8
+    __nv_fp8_e4m3* __restrict__ k_scale,    // [max_pages, page_size, kv_dim/16] fp8
+    unsigned char* __restrict__ v_data,
+    __nv_fp8_e4m3* __restrict__ v_scale,
+    const float* __restrict__ k,            // [kv_dim] FP32
+    const float* __restrict__ v,            // [kv_dim] FP32
+    const int* __restrict__ d_position,
+    int kv_dim,
+    const int* __restrict__ page_table
+) {
+    int position = *d_position;
+    int group_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int num_groups = kv_dim / FP4_GROUP_SIZE;
+    if (group_idx >= num_groups) return;
+
+    int base = group_idx * FP4_GROUP_SIZE;
+    int half_kv = kv_dim / 2;
+    int data_off = paged_offset_fp4(position, page_table, half_kv) + group_idx * (FP4_GROUP_SIZE / 2);
+    int scale_off = paged_offset_fp4_scale(position, page_table, num_groups) + group_idx;
+
+    // K: find group max, compute scale, quantize
+    float k_max = 0.0f;
+    float v_max = 0.0f;
+    for (int i = 0; i < FP4_GROUP_SIZE; i++) {
+        k_max = fmaxf(k_max, fabsf(k[base + i]));
+        v_max = fmaxf(v_max, fabsf(v[base + i]));
+    }
+    float k_scale_val = k_max / 6.0f;  // 6.0 = max FP4 E2M1 magnitude
+    float v_scale_val = v_max / 6.0f;
+    float k_inv_scale = (k_scale_val > 0.0f) ? 1.0f / k_scale_val : 0.0f;
+    float v_inv_scale = (v_scale_val > 0.0f) ? 1.0f / v_scale_val : 0.0f;
+
+    k_scale[scale_off] = f32_to_fp8e4m3(k_scale_val);
+    v_scale[scale_off] = f32_to_fp8e4m3(v_scale_val);
+
+    // Pack pairs of FP4 values into bytes
+    for (int i = 0; i < FP4_GROUP_SIZE; i += 2) {
+        unsigned char lo = fp4_quant_nibble(k[base + i], k_inv_scale);
+        unsigned char hi = fp4_quant_nibble(k[base + i + 1], k_inv_scale);
+        k_data[data_off + i / 2] = lo | (hi << 4);
+
+        lo = fp4_quant_nibble(v[base + i], v_inv_scale);
+        hi = fp4_quant_nibble(v[base + i + 1], v_inv_scale);
+        v_data[data_off + i / 2] = lo | (hi << 4);
+    }
+}
+
+// ── FP4 tiled GQA attention (graph-compatible) ──
+// Same structure as gqa_attention_tiled_g but reads FP4 packed + scale instead of FP8.
+extern "C" __global__ void gqa_attention_tiled_fp4_g(
+    float* __restrict__ partial_o,
+    float* __restrict__ partial_lse,
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_data,   // FP4 packed
+    const __nv_fp8_e4m3* __restrict__ k_scale,  // FP8 per-group scale
+    const unsigned char* __restrict__ v_data,
+    const __nv_fp8_e4m3* __restrict__ v_scale,
+    float sm_scale,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    const int* __restrict__ d_seq_len,
+    int tile_size,
+    const int* __restrict__ page_table
+) {
+    int seq_len = *d_seq_len;
+    int max_tiles = (int)gridDim.y;
+    int qh = blockIdx.x;
+    int tile_idx = (int)blockIdx.y;
+    int num_tiles = (seq_len + tile_size - 1) / tile_size;
+    if (qh >= num_q_heads || tile_idx >= num_tiles) return;
+
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    int heads_per_kv = num_q_heads / num_kv_heads;
+    int kv_head = qh / heads_per_kv;
+    int kv_dim = num_kv_heads * head_dim;
+    int half_kv = kv_dim / 2;
+    int num_scale_groups = kv_dim / FP4_GROUP_SIZE;
+    int head_offset_data = kv_head * head_dim / 2;  // byte offset in packed data
+    int head_offset_scale = kv_head * head_dim / FP4_GROUP_SIZE;
+
+    const float* q_head = q + qh * head_dim;
+
+    int tile_start = tile_idx * tile_size;
+    int tile_end = tile_start + tile_size;
+    if (tile_end > seq_len) tile_end = seq_len;
+    int tile_len = tile_end - tile_start;
+
+    extern __shared__ float smem[];
+    float* s_q = smem;
+    float* smem_scores = smem + head_dim;
+    float* smem_reduce = smem_scores + tile_size;
+
+    int warp_id = tid / warpSize;
+    int lane_id = tid % warpSize;
+    int num_warps = (num_threads + warpSize - 1) / warpSize;
+
+    for (int i = tid; i < head_dim; i += num_threads) {
+        s_q[i] = q_head[i];
+    }
+    __syncthreads();
+
+    // Step 1: Q·K dot products (FP4 dequant on the fly)
+    for (int i = tid; i < tile_len; i += num_threads) {
+        int pos = tile_start + i;
+        float score = 0.0f;
+        int k_data_off = paged_offset_fp4(pos, page_table, half_kv) + head_offset_data;
+        int k_scale_off = paged_offset_fp4_scale(pos, page_table, num_scale_groups) + head_offset_scale;
+
+        for (int d = 0; d < head_dim; d += FP4_GROUP_SIZE) {
+            float group_scale = fp8e4m3_to_f32(k_scale[k_scale_off + d / FP4_GROUP_SIZE]);
+            int byte_off = k_data_off + d / 2;
+            #pragma unroll
+            for (int j = 0; j < FP4_GROUP_SIZE; j += 2) {
+                unsigned char packed = k_data[byte_off + j / 2];
+                score += s_q[d + j]     * fp4_dequant(packed, 0, group_scale);
+                score += s_q[d + j + 1] * fp4_dequant(packed, 1, group_scale);
+            }
+        }
+        smem_scores[i] = score * sm_scale;
+    }
+    __syncthreads();
+
+    // Step 2: Local max
+    float local_max = -1e30f;
+    for (int i = tid; i < tile_len; i += num_threads) {
+        local_max = fmaxf(local_max, smem_scores[i]);
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_max;
+    __syncthreads();
+    if (tid == 0) {
+        float gmax = smem_reduce[0];
+        for (int w = 1; w < num_warps; w++) gmax = fmaxf(gmax, smem_reduce[w]);
+        smem_reduce[0] = gmax;
+    }
+    __syncthreads();
+    float tile_max = smem_reduce[0];
+
+    // Step 3: exp(score - max), compute sum
+    float local_sum = 0.0f;
+    for (int i = tid; i < tile_len; i += num_threads) {
+        float w = expf(smem_scores[i] - tile_max);
+        smem_scores[i] = w;
+        local_sum += w;
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+    }
+    if (lane_id == 0) smem_reduce[warp_id] = local_sum;
+    __syncthreads();
+    if (tid == 0) {
+        float gsum = 0.0f;
+        for (int w = 0; w < num_warps; w++) gsum += smem_reduce[w];
+        smem_reduce[0] = gsum;
+    }
+    __syncthreads();
+    float tile_sum = smem_reduce[0];
+
+    // Step 4: Weighted V sum (FP4 dequant)
+    float* out_partial = partial_o + (qh * max_tiles + tile_idx) * head_dim;
+    for (int d = tid; d < head_dim; d += num_threads) {
+        float acc = 0.0f;
+        int d_byte = d / 2;
+        int d_nibble = d & 1;
+        for (int i = 0; i < tile_len; i++) {
+            int vpos = tile_start + i;
+            int v_data_off = paged_offset_fp4(vpos, page_table, half_kv) + head_offset_data + d_byte;
+            int v_scale_off = paged_offset_fp4_scale(vpos, page_table, num_scale_groups)
+                              + head_offset_scale + d / FP4_GROUP_SIZE;
+            float vs = fp8e4m3_to_f32(v_scale[v_scale_off]);
+            unsigned char packed = v_data[v_data_off];
+            acc += smem_scores[i] * fp4_dequant(packed, d_nibble, vs);
+        }
+        out_partial[d] = acc;
+    }
+
+    // Step 5: Store tile stats
+    if (tid == 0) {
+        float* lse = partial_lse + (qh * max_tiles + tile_idx) * 2;
+        lse[0] = tile_max;
+        lse[1] = tile_sum;
     }
 }
