@@ -1,248 +1,110 @@
-# Krasis
+# Osmium
 
-Python-orchestrated Rust LLM runtime. Runs 200B+ parameter models on commodity hardware with full GPU prefill and decode.
+High-performance MoE inference engine for consumer GPUs. Fork of [Krasis](https://github.com/brontoguana/krasis) with WriteCombined DMA staging, SM120 (Blackwell) native kernels, and Python GPU prefill preservation.
 
-You can [contact me here](https://forms.gle/ue4nvyvNNHtUZ7MQ7) but for bugs, difficulties, suggestions or requests for support for other models please report an issue instead.
-
-If you want to easily monitor Krasis during runs, [check out ktop](https://github.com/brontoguana/ktop).
-
-![Krasis Server](krasis_server_3.png)
-
-## Krasis runs LLMs fast on consumer grade hardware (single GPU)
-
-Krasis can run large language models that are much too large to fit in a consumer GPU (multi-hundred gigabyte model with 80- 500+ billion parameters) on consumer or accessible server hardware that doesn't require the huge cost to host the entire model in VRAM. 
-
-## Latest News
-
-* Multi-GPU pre-release now available via the install link in the [ADVANCED.md](https://github.com/brontoguana/krasis/blob/main/ADVANCED.md) doc.  This won't improve prefill speed but could improve decode speed on multi GPU systems with similar GPUs.
+Runs **Qwen3.5-122B-A10B at 3800 tok/s prefill and 60 tok/s decode on a single RTX 5090.**
 
 ## Benchmarks
 
-### 1x RTX 5090 32GB (PCIE 4.0)
+### RTX 5090 32GB, PCIe Gen5 x16
 
-- 1x Epyc 7742, 8-channel DDR4
-- 1x RTX 5090 on PCIE 4.0 (bottlenecked to 32GB/sec since the 5090 supports PCIE 5.0 at 64GB/sec)
-- **Most models (Qwen-3.5-35B at Q4 being the exception) are unable to entirely fit in GPU VRAM.** Krasis **streams through VRAM** as necessary using algorithms optimised for the prefill stage and then the decode stage.
-- Q4 model (BF16 attention, AWQ also supported for more limited VRAM cards)
+Qwen3.5-122B-A10B (122B params, 234 GB BF16 / 56 GB INT4). Single GPU, AWQ attention, FP8 KV cache, WriteCombined DMA.
 
-| Model                 | Params | BF16 Size / INT4 Size | Prefill (pp) | Decode (tg)   |
-| :-------------------- | :----: | :-------------------: | ------------ | ------------- |
-| **Qwen3.5-35B-A3B**   |  35B   |     67 GB / 16GB      | 4475 tok/sec | 109.1 tok/sec |
-| **Qwen3-Coder-Next**  |  80B   |     159 GB / 38GB     | 3560 tok/sec | 70.3 tok/sec  |
-| **Qwen3.5-122B-A10B** |  122B  |     234 GB / 56GB     | 2897 tok/sec | 27.7 tok/sec  |
-| **Qwen3-235B-A22B**   |  235B  |    438 GB / 110GB     | 2124 tok/sec | 9.3 tok/sec   |
+| KV Cache | Context Capacity | Prefill (tok/s) | Decode (tok/s) | HCS Coverage |
+|----------|:----------------:|:---------------:|:--------------:|:------------:|
+| 1000 MB  | 85K tokens       | **3,862**       | **60.1**       | 34.3%        |
+| 3400 MB  | 256K tokens      | **3,742**       | **59.5**       | 27.9%        |
 
-### 1x RTX 5080 16GB (PCIE 4.0)
+### What makes this fast
 
-| Model                | Params | BF16 Size / INT4 Size | Prefill (pp) | Decode (tg)  |
-| -------------------- | :----: | :-------------------: | ------------ | ------------ |
-| **Qwen3-Coder-Next** |  80B   |     159 GB / 38GB     | 1801 tok/sec | 26.8 tok/sec |
+- **WriteCombined DMA staging** (`--wc-alloc`): Expert weights allocated via `cuMemHostAlloc(WRITECOMBINED)` bypass the CPU cache hierarchy. PCIe Gen5 DMA reads hit ~46 GB/s vs ~28 GB/s for regular pinned memory. Per-component layout with incremental heap freeing keeps peak RAM at ~74 GB on a 91 GB system.
+- **Python GPU prefill** via sglang's `fused_marlin_moe`: Full INT4 Marlin GEMM prefill at 3800+ tok/s. The upstream Rust prefill path is 10x slower (364 tok/s) due to lack of optimized GEMM.
+- **Dual-PTX decode kernels**: SM80 (Ampere/Ada) and SM120 (Blackwell) PTX compiled at build time, selected at runtime based on GPU compute capability.
+- **Vectorized INT4 GEMV**: `uint32` loads for 4x fewer iterations and full 128-byte cache line utilization per warp.
+- **HCS (Hot Cache Strategy)**: Frequently-accessed MoE experts cached in VRAM, reducing PCIe DMA for hot paths.
 
-## Krasis tradeoffs
+## Requirements
 
-In order to achieve these speeds, Krasis has a few requirements.
+- **Linux** (Fedora 43, Ubuntu 24.04+, or WSL2)
+- **NVIDIA GPU** with CUDA 12.8+ drivers (SM80+ for Ampere, SM120 for Blackwell)
+- **Python 3.13** (3.10+ should work)
+- **System RAM**: ~74 GB with `--wc-alloc` for 122B models (91 GB physical + 64 GB NVMe swap recommended)
+- **NVMe swap**: Required for WC mode. `sudo fallocate -l 64G /swapfile_osmium && sudo chmod 600 /swapfile_osmium && sudo mkswap /swapfile_osmium && sudo swapon /swapfile_osmium`
 
-- Krasis currently only works with **NVidia GPUs**
-- Krasis must be given the **BF16 safetensors model** downloaded from [HuggingFace](https://huggingface.co/)
-- **Krasis uses comparable system RAM to other runtimes**.  Krasis will auto-quantize to INT4 or INT8 from the safetensors model provided and build a cache on disk, then load that into system RAM.
-- Krasis **will take some time to load on the first run** as it is doing a lot of pre-run work to optimise everything for runtime, much of this is cached for later runs though so subsequent runs will be quicker.
-- Krasis optimises models and caches them in <home folder>/.krasis, these can be large so you may need disk space for the original model BF16 model plus the quantised model size.
-- **Krasis is optimised to run models at Q4 and Q8**, which are generally very good trade-offs vs either running the full precision weights or heavily quantised models much lowered quality.
-
-## Perplexity (Quantization Quality)
-
-Measured with INT4 GPU + INT4 CPU experts (Q4), BF16 attention, INT8 shared/MLP/lm_head, FP8 KV cache. Sliding window (2048 tokens, stride 1024).
-
-| Model | Dataset | Tokens | PPL | BPC |
-|-------|---------|:------:|:---:|:---:|
-| **Qwen3-Coder-Next** | WikiText-2 | 299K | 7.23 | 2.85 |
-| **Qwen3-Coder-Next** | C4 validation | 1M | 12.52 | 3.65 |
-| **DeepSeek V2-Lite** | WikiText-2 | 307K | 6.03 | 2.59 |
-| **DeepSeek V2-Lite** | C4 validation | 500K | 9.22 | 3.20 |
-| **Qwen3.5-35B-A3B** | WikiText-2 | 297K | 6.41 | 2.68 |
-
-## Running Krasis - Quick Start
-
-### Requirements
-
-- **Linux** (Ubuntu 24.04+, or WSL2 on Windows)
-- **Python 3.10+**
-- **NVIDIA GPU** with CUDA drivers installed
-- **System RAM**: roughly 2x the quantised model size
-    - e.g. if BF16 is 100GB, Q8 is 50GB, Q4 is 25GB
-        - to run at Q8 required 2x50GB = 100GB system RAM
-        - to run at Q4 requires 2x25GB = 50GB system RAM
-- **Disk space**: roughly the BF16 model size plus 2x the quantised model size (see system ram)
-
-### 1. Install Krasis
+## Quick Start
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/brontoguana/krasis/main/install.sh | bash
+git clone https://github.com/3spky5u-oss/osmium.git
+cd osmium
+git checkout v0.1.64-sm120
+
+# Create venv and install dependencies
+python3.13 -m venv .venv
+.venv/bin/pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128
+.venv/bin/pip install "sglang[all]==0.5.9" flashinfer-python==0.6.3
+
+# Build (requires Rust toolchain + CUDA toolkit)
+CUDA_HOME=/usr/local/cuda .venv/bin/pip install maturin
+CUDA_HOME=/usr/local/cuda .venv/bin/maturin develop --release
+
+# Download a model
+pip install huggingface-hub
+huggingface-cli download Qwen/Qwen3.5-122B-A10B
+
+# Ensure swap is active
+sudo swapon /swapfile_osmium
+
+# Run with benchmark
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m krasis.server \
+  --model-path ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-122B-A10B/snapshots/* \
+  --benchmark --wc-alloc \
+  --gpu-expert-bits 4 --attention-quant awq --kv-dtype fp8_e4m3 --kv-cache-mb 1000
 ```
 
-This creates a Python environment at `~/.krasis/venv`, installs Krasis, symlinks the commands into `~/.local/bin`, and adds that directory to your PATH. No sudo required. Works immediately in the current terminal session.
+## Key Flags
 
-### 2. Install CUDA dependencies
+| Flag | Description |
+|------|-------------|
+| `--wc-alloc` | WriteCombined DMA staging. ~2x decode speed, requires swap. |
+| `--gpu-expert-bits 4` | INT4 Marlin experts on GPU (default) |
+| `--attention-quant awq` | AWQ attention quantization (frees VRAM for HCS) |
+| `--kv-dtype fp8_e4m3` | FP8 KV cache (halves KV memory vs BF16) |
+| `--kv-cache-mb N` | KV cache size. 1000 = 85K ctx, 3400 = 256K ctx |
+| `--benchmark` | Run prefill + decode benchmark after loading |
+| `--hcs` | Hot Cache Strategy (on by default with `--wc-alloc`) |
+
+## Architecture
+
+Osmium is a hybrid Python/Rust/CUDA system:
+
+- **Python orchestration** (`python/krasis/`): Model loading, GPU prefill via sglang's fused Marlin MoE, server (OpenAI-compatible API), launcher TUI
+- **Rust core** (`src/`): GPU decode engine with CUDA graphs, MoE expert routing + DMA scheduling, weight loading (safetensors, GGUF, Marlin cache)
+- **CUDA kernels** (`src/cuda/`): Decode kernels (RMSNorm, GQA attention, INT4/INT8 GEMV, expert routing), compiled to PTX at build time
+
+MoE expert weights live in system RAM (56 GB for 122B INT4). During decode, the top-K experts per layer are DMA'd to GPU via PCIe. WriteCombined memory makes this transfer ~46 GB/s on Gen5, fast enough for 60 tok/s.
+
+## What Osmium Changes vs Krasis v0.1.64
+
+| Feature | Krasis v0.1.64 | Osmium v0.1 |
+|---------|---------------|-------------|
+| Decode kernels | SM80 PTX only | Dual SM80 + SM120 PTX |
+| Expert DMA | Pinned memory (~28 GB/s) | WriteCombined (~46 GB/s) |
+| INT4 GEMV | Scalar loads | Vectorized uint32 loads |
+| GGUF loading | Use-after-free bug | Fixed (layer_backings_gpu) |
+| GGUF gpu_only | Not forwarded | Proper skip_cpu plumbing |
+| Marlin cache load | 2x peak RSS | Per-layer MADV_DONTNEED |
+| RAM watchdog | 5% floor, no swap | 0.5% floor, counts SwapFree |
+
+## API
+
+OpenAI-compatible at `http://localhost:8012/v1/chat/completions` with SSE streaming. Works with Cursor, OpenCode, Continue, and any OpenAI SDK client.
 
 ```bash
-krasis-setup
+curl http://localhost:8012/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen","messages":[{"role":"user","content":"Hello!"}],"max_tokens":100}'
 ```
-
-This installs the CUDA toolkit (if needed), PyTorch, and FlashInfer. May need sudo for the CUDA toolkit. Only required once.
-
-### 3. Download a model
-
-```bash
-pip install huggingface-hub   # if you don't have it
-
-huggingface-cli download deepseek-ai/DeepSeek-V2-Lite \
-    --local-dir ~/.krasis/models/DeepSeek-V2-Lite
-```
-
-Krasis needs the BF16 safetensors model from HuggingFace. Put it under `~/.krasis/models/`. Some other models you can download:
-
-```bash
-# Qwen3-Coder-Next (80B params, 148 GB, fastest on consumer hardware)
-huggingface-cli download Qwen/Qwen3-Coder-Next \
-    --local-dir ~/.krasis/models/Qwen3-Coder-Next
-
-# Qwen3-235B (235B params, 438 GB, needs ~500 GB RAM)
-huggingface-cli download Qwen/Qwen3-235B-A22B \
-    --local-dir ~/.krasis/models/Qwen3-235B-A22B
-```
-
-### 4. Run
-
-```bash
-krasis
-```
-
-The launcher walks you through model selection and configuration via a TUI. First run takes longer as Krasis builds optimised weight caches (these are saved to disk for subsequent runs).
-
-### Upgrade / Uninstall
-
-```bash
-# Upgrade
-curl -sSf https://raw.githubusercontent.com/brontoguana/krasis/main/install.sh | bash
-
-# Uninstall (keeps model files)
-curl -sSf https://raw.githubusercontent.com/brontoguana/krasis/main/install.sh | bash -s -- --uninstall
-```
-
-### WSL2 (Windows)
-
-Krasis works on WSL2. By default WSL only uses 50% of your system RAM, which is usually not enough for large models. Create or edit `C:\Users\<YourUsername>\.wslconfig`:
-
-```ini
-[wsl2]
-memory=120GB
-```
-
-Adjust the value to leave ~8 GB for Windows. Restart WSL from PowerShell with `wsl --shutdown`, then follow the install steps above inside WSL.
-
-### Install from source
-
-Requires a Rust toolchain (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`):
-
-```bash
-git clone https://github.com/brontoguana/krasis.git
-cd krasis
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e .
-krasis-setup
-krasis
-```
-
-## Usage
-
-### Interactive Launcher
-
-```bash
-krasis
-```
-
-The launcher walks you through a TUI with four screens:
-
-1. **Model selection** — scans `~/.krasis/models/` for safetensors models, shows architecture, layer count, expert count, and estimated RAM
-2. **CPU expert source** — build INT4 or INT8 from the native model, or select an existing GGUF file
-3. **GPU selection** — multi-select your GPUs (Space to toggle, Enter to confirm)
-4. **Configuration editor** — tune all quantization and runtime options with a live VRAM budget display showing per-GPU memory usage and estimated context length
-
-All settings are saved to `~/.krasis/config` and reloaded on subsequent launches.
-
-On the final screen you can choose to launch immediately or run a benchmark first.
-
-### Non-Interactive Launch
-
-```bash
-# Use saved config from last TUI session
-krasis --non-interactive
-
-# Override specific settings
-krasis --non-interactive --model-path /path/to/model --num-gpus 2 --benchmark
-```
-
-### Benchmark Suite
-
-Run all model × config combinations automatically from a single config file. Edit `benchmarks/benchmark_suite.toml` to define which models and hardware configurations to test:
-
-```toml
-[[config]]
-num_gpus = 1
-gpu_expert_bits = 4
-cpu_expert_bits = 4
-
-[[config]]
-num_gpus = 2
-gpu_expert_bits = 4
-cpu_expert_bits = 4
-
-[[model]]
-name = "DeepSeek-V2-Lite"
-
-[[model]]
-name = "Qwen3-235B-A22B"
-gguf_name = "Qwen3-235B-A22B-GGUF"   # searched in ~/.krasis/models/ subdirs
-```
-
-Model `name` is the directory name under `~/.krasis/models/`. Use `gguf_name` to pair a native model with a GGUF for CPU experts (filename searched in models dir), or `gguf_path` for an absolute path. Config fields include `num_gpus`, `gpu_expert_bits`, `cpu_expert_bits`, `attention_quant`, `kv_dtype`, and more — see the config file comments for the full list.
-
-Run the suite:
-
-```bash
-krasis --benchmark-suite                           # uses benchmarks/benchmark_suite.toml
-krasis --benchmark-suite /path/to/custom.toml      # custom config
-```
-
-Each combination runs as an isolated subprocess. Per-combo logs are saved to `benchmarks/suite_logs/` and a markdown summary table is generated at the end.
-
-For launcher flags, per-component quantization options, and direct server usage, see [ADVANCED.md](ADVANCED.md).
-
-### Chat Client
-
-```bash
-krasis-chat                          # auto-discovers running servers
-krasis-chat --port 8012              # connect to specific port
-krasis-chat --url http://host:8012   # connect to remote server
-krasis-chat --temperature 0.3        # override sampling temperature
-```
-
-The chat client auto-discovers running Krasis servers via `~/.krasis/servers/`. Commands: `/new` (clear history), `/system PROMPT` (change system prompt), `/exit`.
-
-### API
-
-The server exposes an OpenAI-compatible API at `http://localhost:8012/v1/chat/completions` with SSE streaming, compatible with Cursor, OpenCode, and any OpenAI SDK client.
-
-Additional endpoints:
-- `GET /health` — server status
-- `GET /v1/models` — list loaded models
-- `POST /v1/timing` — toggle instrumentation at runtime
 
 ## License
 
-SSPL-1.0
-
-Krasis is free to use, modify and distribute.  
-
-If you want to support the project or offer Krasis as part of a commercial product or a hosted/managed service, please [get in touch](https://forms.gle/ue4nvyvNNHtUZ7MQ7).
-
+SSPL-1.0 (inherited from Krasis)
