@@ -744,6 +744,8 @@ def main():
                         help="Run benchmark via HTTP and exit (don't keep server running)")
     parser.add_argument("--timing", action="store_true",
                         help="Enable decode timing instrumentation (per-layer breakdown)")
+    parser.add_argument("--wc-alloc", action="store_true", default=False,
+                        help="Use WriteCombined memory for expert DMA (higher PCIe bandwidth)")
     parser.add_argument("--stress-test", action="store_true",
                         help="Run stress test (diverse prompts) and exit")
     parser.add_argument("--perplexity", action="store_true",
@@ -919,6 +921,11 @@ def main():
         kv_cache_mb=args.kv_cache_mb,
         stream_attention=args.stream_attention,
     )
+
+    # WriteCombined DMA staging: set flag on model so setup_from_engine path can use it
+    if getattr(args, 'wc_alloc', False):
+        _model.wc_alloc = True
+        _detail("WriteCombined expert DMA staging enabled (--wc-alloc)")
 
     # Set attention skip layer if configured
     attn_skip = getattr(args, 'attn_skip_after', None)

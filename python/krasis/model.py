@@ -4350,6 +4350,17 @@ class KrasisModel:
         if self.krasis_engine is not None:
             store.setup_from_engine(self.krasis_engine)
 
+            # WriteCombined DMA staging: migrate expert data to WC memory for higher bandwidth.
+            # Frees heap backing incrementally (peak ~74GB). After WC, rebuild prefill views
+            # from WC pointers since the heap is freed.
+            if getattr(self, 'wc_alloc', False):
+                wc_msg = store.setup_wc_expert_memory(self.krasis_engine)
+                logger.info("WC expert memory: %s", wc_msg)
+
+                # Rebuild prefill tensor views from WC memory (heap was freed)
+                for mgr in self.gpu_prefill_managers.values():
+                    mgr.rebuild_prefill_views_from_wc(store)
+
         # Register shared_expert_gate weights (sigmoid gate for shared expert output)
         # These are BF16 tensors loaded by Python, not in the Rust engine cache
         self._rust_shared_gate_refs = []
@@ -4687,6 +4698,11 @@ class KrasisModel:
         # Register MoE expert data from engine (same engine, same CPU RAM data)
         if self.krasis_engine is not None:
             store.setup_from_engine(self.krasis_engine)
+
+            # WriteCombined DMA staging for aux store
+            if getattr(self, 'wc_alloc', False):
+                wc_msg = store.setup_wc_expert_memory(self.krasis_engine)
+                logger.info("WC expert memory (aux): %s", wc_msg)
 
         # Shared expert gates for aux layers
         if not hasattr(self, '_aux_shared_gate_refs_all'):

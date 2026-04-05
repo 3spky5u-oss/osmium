@@ -1544,6 +1544,45 @@ class GpuPrefillManager:
             self._num_moe_layers, total_bytes / 1e9, elapsed,
         )
 
+    def rebuild_prefill_views_from_wc(self, store):
+        """Rebuild prefill tensor views from WriteCombined memory after heap was freed.
+
+        Called after setup_wc_expert_memory() which migrates expert data to WC and
+        frees the original heap backing. The WC buffer uses per-component layout matching
+        LayerExpertBacking, so tensor views work the same as the original direct views.
+        """
+        if not store.has_wc_expert_memory():
+            return
+
+        self._init_dma_buffers()  # ensure shapes are computed
+
+        t0 = time.perf_counter()
+        total_bytes = 0
+
+        for moe_idx in range(self._num_moe_layers):
+            (w13p_ptr, w13p_len, w13s_ptr, w13s_len,
+             w2p_ptr, w2p_len, w2s_ptr, w2s_len) = store.get_wc_layer_buffer_ptrs(moe_idx)
+
+            if w13p_len == 0:
+                continue
+
+            buf = {
+                "w13p": self._tensor_from_ptr(w13p_ptr, w13p_len),
+                "w13s": self._tensor_from_ptr(w13s_ptr, w13s_len),
+                "w2p": self._tensor_from_ptr(w2p_ptr, w2p_len),
+                "w2s": self._tensor_from_ptr(w2s_ptr, w2s_len),
+            }
+            self._prefill_pinned[moe_idx] = buf
+            total_bytes += w13p_len + w13s_len + w2p_len + w2s_len
+
+        self._prefill_pinned_built = True
+
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            "Prefill views rebuilt from WC memory: %d layers, %.1f GB, %.3fs",
+            self._num_moe_layers, total_bytes / 1e9, elapsed,
+        )
+
     def _build_prefill_pinned_bufs_legacy(self):
         """Legacy path: allocate pinned memory and copy expert data into it.
 

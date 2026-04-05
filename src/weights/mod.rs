@@ -1518,6 +1518,36 @@ impl WeightStore {
         Ok(store)
     }
 
+    /// Free the heap-allocated backing Vecs for a single MoE layer's GPU expert weights.
+    /// Called during WC migration after expert data has been copied to WriteCombined memory.
+    pub fn free_layer_backing_gpu(&self, layer_idx: usize) -> usize {
+        if layer_idx >= self.layer_backings_gpu.len() {
+            return 0;
+        }
+        // SAFETY: The backing data is dead — pointers have been redirected to WC memory.
+        // No concurrent access occurs during WC setup. We use ptr::read + ptr::write to
+        // swap Vecs without creating &mut through a const-to-mut cast.
+        unsafe {
+            let backing_ptr = &self.layer_backings_gpu[layer_idx] as *const LayerExpertBacking
+                as *mut LayerExpertBacking;
+
+            macro_rules! swap_free {
+                ($field:ident) => {{
+                    let field_ptr = std::ptr::addr_of_mut!((*backing_ptr).$field);
+                    let old = std::ptr::read(field_ptr);
+                    let len = old.len();
+                    std::ptr::write(field_ptr, Vec::new());
+                    drop(old);
+                    len
+                }};
+            }
+
+            let freed = swap_free!(w13_packed) + swap_free!(w13_scales)
+                + swap_free!(w2_packed) + swap_free!(w2_scales);
+            freed
+        }
+    }
+
     /// Load from safetensors shards and quantize to INT4/INT8 (or load pre-quantized).
     /// Returns (routed_experts, shared_experts, effective_group_size).
     /// Legacy function — used by save_cache/load_cache paths.

@@ -1295,6 +1295,40 @@ struct CudaGraphExecPtr(CUgraphExec);
 unsafe impl Send for CudaGraphExecPtr {}
 unsafe impl Sync for CudaGraphExecPtr {}
 
+// ── WriteCombined host memory for expert DMA staging ──────────────────
+// WC memory bypasses the CPU cache hierarchy, achieving ~46 GB/s on PCIe Gen5 x16
+// vs ~28 GB/s for regular pinned memory. CPU reads are slow (uncached), but expert
+// data is only read by the GPU DMA engine during decode.
+
+struct WcBuffer {
+    ptr: *mut u8,
+    size: usize,
+}
+
+impl Drop for WcBuffer {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { cuda_sys::lib().cuMemFreeHost(self.ptr as *mut std::ffi::c_void); }
+        }
+    }
+}
+
+unsafe impl Send for WcBuffer {}
+unsafe impl Sync for WcBuffer {}
+
+/// Per-layer WC buffer pointers matching LayerExpertBacking layout.
+/// Used by Python prefill to create tensor views after WC migration.
+struct WcLayerPtrs {
+    w13p_ptr: usize,
+    w13p_len: usize,
+    w13s_ptr: usize,
+    w13s_len: usize,
+    w2p_ptr: usize,
+    w2p_len: usize,
+    w2s_ptr: usize,
+    w2s_len: usize,
+}
+
 // ── PyO3 wrapper ───────────────────────────────────────────────────────
 
 #[pyclass]
@@ -1373,6 +1407,11 @@ pub struct GpuDecodeStore {
     debug_capture_layers: bool,
     #[cfg(feature = "gpu-debug")]
     debug_layer_captures: Vec<Vec<u16>>,
+    /// WriteCombined host memory allocations for expert DMA staging.
+    /// Freed on drop via cuMemFreeHost.
+    wc_expert_buffers: Vec<WcBuffer>,
+    /// Per-layer WC buffer section pointers (per-component layout for prefill views).
+    wc_layer_ptrs: Vec<WcLayerPtrs>,
 }
 
 #[pymethods]
@@ -1644,6 +1683,8 @@ impl GpuDecodeStore {
             debug_capture_layers: false,
             #[cfg(feature = "gpu-debug")]
             debug_layer_captures: Vec::new(),
+            wc_expert_buffers: Vec::new(),
+            wc_layer_ptrs: Vec::new(),
         })
     }
 
@@ -3237,6 +3278,189 @@ impl GpuDecodeStore {
     /// After this, the GpuDecodeStore is ready for moe_forward_gpu() calls.
     fn setup_from_engine(&mut self, engine: &crate::moe::KrasisEngine) -> PyResult<()> {
         self.setup_from_engine_internal(engine)
+    }
+
+    /// Migrate expert weight data from pinned memory to WriteCombined (WC) host memory
+    /// for higher PCIe DMA bandwidth (~46 GB/s Gen5 vs ~28 GB/s pinned).
+    ///
+    /// Uses per-component layout matching LayerExpertBacking: [all_w13p | all_w13s | all_w2p | all_w2s]
+    /// so Python prefill can create tensor views from WC memory after heap is freed.
+    /// Frees heap backing incrementally per layer to keep peak RAM at ~74GB.
+    #[pyo3(signature = (engine))]
+    fn setup_wc_expert_memory(&mut self, engine: &crate::moe::KrasisEngine) -> PyResult<String> {
+        let t0 = std::time::Instant::now();
+        let graph = self.graph.as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                "setup_wc_expert_memory: call configure/setup_from_engine first"))?;
+
+        let store = engine.get_weight_store()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(
+                "setup_wc_expert_memory: engine has no weight store"))?;
+
+        let mut total_wc_bytes: usize = 0;
+        let mut wc_buffers: Vec<WcBuffer> = Vec::new();
+        let mut wc_layer_ptrs: Vec<WcLayerPtrs> = Vec::new();
+
+        // Initialize wc_layer_ptrs with zeros for all layers (including non-MoE)
+        let num_moe_layers = graph.moe_layers.len();
+        for _ in 0..num_moe_layers {
+            wc_layer_ptrs.push(WcLayerPtrs {
+                w13p_ptr: 0, w13p_len: 0, w13s_ptr: 0, w13s_len: 0,
+                w2p_ptr: 0, w2p_len: 0, w2s_ptr: 0, w2s_len: 0,
+            });
+        }
+
+        for (layer_idx, moe_layer_opt) in graph.moe_layers.iter_mut().enumerate() {
+            let moe_layer = match moe_layer_opt {
+                Some(ref mut ml) => ml,
+                None => continue,
+            };
+
+            // Get LayerExpertBacking for per-component sizes
+            if layer_idx >= store.layer_backings_gpu.len() {
+                continue;
+            }
+            let backing = &store.layer_backings_gpu[layer_idx];
+            let w13p_len = backing.w13_packed.len();
+            let w13s_len = backing.w13_scales.len();
+            let w2p_len = backing.w2_packed.len();
+            let w2s_len = backing.w2_scales.len();
+            let layer_bytes = w13p_len + w13s_len + w2p_len + w2s_len;
+
+            if layer_bytes == 0 {
+                continue;
+            }
+
+            // Allocate WC buffer: WRITECOMBINED | PORTABLE
+            let flags: u32 = 0x03;
+            let mut wc_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            let err = unsafe {
+                cuda_sys::lib().cuMemHostAlloc(&mut wc_ptr, layer_bytes, flags)
+            };
+            if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("cuMemHostAlloc WC failed for layer {} ({} MB): {:?}",
+                            layer_idx, layer_bytes / (1024 * 1024), err)));
+            }
+            let wc_base = wc_ptr as *mut u8;
+
+            // Copy per-component from LayerExpertBacking into WC (matching prefill layout)
+            let mut off = 0usize;
+            let w13p_ptr = unsafe { wc_base.add(off) };
+            unsafe { std::ptr::copy_nonoverlapping(backing.w13_packed.as_ptr(), w13p_ptr, w13p_len); }
+            off += w13p_len;
+
+            let w13s_ptr = unsafe { wc_base.add(off) };
+            unsafe { std::ptr::copy_nonoverlapping(backing.w13_scales.as_ptr(), w13s_ptr, w13s_len); }
+            off += w13s_len;
+
+            let w2p_ptr = unsafe { wc_base.add(off) };
+            unsafe { std::ptr::copy_nonoverlapping(backing.w2_packed.as_ptr(), w2p_ptr, w2p_len); }
+            off += w2p_len;
+
+            let w2s_ptr = unsafe { wc_base.add(off) };
+            unsafe { std::ptr::copy_nonoverlapping(backing.w2_scales.as_ptr(), w2s_ptr, w2s_len); }
+
+            // Store per-component pointers for Python prefill views
+            wc_layer_ptrs[layer_idx] = WcLayerPtrs {
+                w13p_ptr: w13p_ptr as usize, w13p_len,
+                w13s_ptr: w13s_ptr as usize, w13s_len,
+                w2p_ptr: w2p_ptr as usize, w2p_len,
+                w2s_ptr: w2s_ptr as usize, w2s_len,
+            };
+
+            // Update decode per-expert pointers to WC memory
+            let n_experts = moe_layer.experts.len();
+            for (ei, expert) in moe_layer.experts.iter_mut().enumerate() {
+                let e_w13p = backing.per_expert_w13p;
+                let e_w13s = backing.per_expert_w13s;
+                let e_w2p = backing.per_expert_w2p;
+                let e_w2s = backing.per_expert_w2s;
+
+                expert.w13_packed_ptr = w13p_ptr as usize + ei * e_w13p;
+                expert.w13_scales_ptr = w13s_ptr as usize + ei * e_w13s;
+                expert.w2_packed_ptr = w2p_ptr as usize + ei * e_w2p;
+                expert.w2_scales_ptr = w2s_ptr as usize + ei * e_w2s;
+                expert.contiguous_ptr = expert.w13_packed_ptr;
+                expert.contiguous_bytes = e_w13p + e_w13s + e_w2p + e_w2s;
+            }
+
+            // Update shared expert if present
+            if n_experts > 0 {
+                if let Some(ref mut se) = moe_layer.shared {
+                    // Shared expert is after all routed experts in each component section
+                    let shared_w13p = w13p_len - n_experts * backing.per_expert_w13p;
+                    let shared_w13s = w13s_len - n_experts * backing.per_expert_w13s;
+                    let shared_w2p = w2p_len - n_experts * backing.per_expert_w2p;
+                    let shared_w2s = w2s_len - n_experts * backing.per_expert_w2s;
+
+                    if shared_w13p > 0 {
+                        se.w13_packed_ptr = w13p_ptr as usize + n_experts * backing.per_expert_w13p;
+                        se.w13_scales_ptr = w13s_ptr as usize + n_experts * backing.per_expert_w13s;
+                        se.w2_packed_ptr = w2p_ptr as usize + n_experts * backing.per_expert_w2p;
+                        se.w2_scales_ptr = w2s_ptr as usize + n_experts * backing.per_expert_w2s;
+                        se.contiguous_ptr = se.w13_packed_ptr;
+                        se.contiguous_bytes = shared_w13p + shared_w13s + shared_w2p + shared_w2s;
+                    }
+                }
+            }
+
+            wc_buffers.push(WcBuffer { ptr: wc_base, size: layer_bytes });
+            total_wc_bytes += layer_bytes;
+
+            // Free the original heap backing to keep peak RAM at ~74GB.
+            // Unregister from CUDA first, then free the Vecs.
+            {
+                let bufs: [&[u8]; 4] = [
+                    &backing.w13_packed, &backing.w13_scales,
+                    &backing.w2_packed, &backing.w2_scales,
+                ];
+                for buf in &bufs {
+                    if !buf.is_empty() {
+                        unsafe {
+                            let _ = cuda_sys::lib().cuMemHostUnregister(
+                                buf.as_ptr() as *mut std::ffi::c_void,
+                            );
+                        }
+                    }
+                }
+            }
+            let freed = store.free_layer_backing_gpu(layer_idx);
+            if freed > 0 && (layer_idx + 1) % 10 == 0 {
+                log::info!("WC migration: {}/{} layers, freed {:.1} MB heap",
+                    layer_idx + 1, num_moe_layers, freed as f64 / 1e6);
+            }
+        }
+
+        self.wc_expert_buffers = wc_buffers;
+        self.wc_layer_ptrs = wc_layer_ptrs;
+
+        let elapsed = t0.elapsed().as_secs_f64();
+        let msg = format!(
+            "WC expert memory: {:.1} GB across {} layers in {:.1}s (heap freed incrementally)",
+            total_wc_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            self.wc_expert_buffers.len(), elapsed,
+        );
+        log::info!("{}", msg);
+        Ok(msg)
+    }
+
+    /// Get WC buffer pointers for a MoE layer (per-component layout for prefill views).
+    /// Returns (w13p_ptr, w13p_len, w13s_ptr, w13s_len, w2p_ptr, w2p_len, w2s_ptr, w2s_len).
+    /// Returns all zeros if WC not set up or layer is not MoE.
+    fn get_wc_layer_buffer_ptrs(&self, moe_layer_idx: usize) -> (usize, usize, usize, usize, usize, usize, usize, usize) {
+        if moe_layer_idx < self.wc_layer_ptrs.len() {
+            let p = &self.wc_layer_ptrs[moe_layer_idx];
+            (p.w13p_ptr, p.w13p_len, p.w13s_ptr, p.w13s_len,
+             p.w2p_ptr, p.w2p_len, p.w2s_ptr, p.w2s_len)
+        } else {
+            (0, 0, 0, 0, 0, 0, 0, 0)
+        }
+    }
+
+    /// Check if WC expert memory has been set up.
+    fn has_wc_expert_memory(&self) -> bool {
+        !self.wc_expert_buffers.is_empty()
     }
 
     /// End-to-end test: load model, set up GPU MoE, run one layer, compare to CPU.
