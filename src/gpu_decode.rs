@@ -3381,8 +3381,10 @@ impl GpuDecodeStore {
                 expert.w13_scales_ptr = w13s_ptr as usize + ei * e_w13s;
                 expert.w2_packed_ptr = w2p_ptr as usize + ei * e_w2p;
                 expert.w2_scales_ptr = w2s_ptr as usize + ei * e_w2s;
-                expert.contiguous_ptr = expert.w13_packed_ptr;
-                expert.contiguous_bytes = e_w13p + e_w13s + e_w2p + e_w2s;
+                // Per-component layout: components are NOT contiguous per-expert.
+                // Force 4-call DMA path by clearing contiguous_ptr.
+                expert.contiguous_ptr = 0;
+                expert.contiguous_bytes = 0;
             }
 
             // Update shared expert if present
@@ -3399,8 +3401,8 @@ impl GpuDecodeStore {
                         se.w13_scales_ptr = w13s_ptr as usize + n_experts * backing.per_expert_w13s;
                         se.w2_packed_ptr = w2p_ptr as usize + n_experts * backing.per_expert_w2p;
                         se.w2_scales_ptr = w2s_ptr as usize + n_experts * backing.per_expert_w2s;
-                        se.contiguous_ptr = se.w13_packed_ptr;
-                        se.contiguous_bytes = shared_w13p + shared_w13s + shared_w2p + shared_w2s;
+                        se.contiguous_ptr = 0;
+                        se.contiguous_bytes = 0;
                     }
                 }
             }
