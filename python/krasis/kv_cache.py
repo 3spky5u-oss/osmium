@@ -214,12 +214,13 @@ class PagedKVCache:
 
     def _bytes_per_page(self) -> int:
         if self.kv_format == "fp4":
-            # FP4: 0.5 bytes per element (data) + 1/16 byte per element (scale)
-            # = 0.5625 bytes per element per cache (K or V)
+            # FP4 mode allocates BOTH FP8 (for FlashInfer prefill) and FP4 (for Rust decode).
+            # Budget must cover both to avoid OOM.
             kv_dim = self.num_kv_heads * self.gqa_head_dim
-            data_bytes = self.page_size * kv_dim // 2
-            scale_bytes = self.page_size * kv_dim // 16
-            return (data_bytes + scale_bytes) * 2 * self.num_layers  # K + V
+            fp8_bytes = self.page_size * kv_dim * 2  # K + V, 1 byte each (FP8)
+            fp4_data = self.page_size * kv_dim // 2 * 2  # K + V packed
+            fp4_scale = self.page_size * kv_dim // 16 * 2  # K + V scales
+            return (fp8_bytes + fp4_data + fp4_scale) * self.num_layers
         elem_size = 1 if self.kv_dtype == torch.float8_e4m3fn else 2
         return self.page_size * self.kv_cache_dim * elem_size * self.num_layers
 

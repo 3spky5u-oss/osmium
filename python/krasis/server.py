@@ -689,7 +689,7 @@ def main():
     parser.add_argument("--krasis-threads", type=int, default=40,
                         help="CPU threads for expert computation")
     parser.add_argument("--kv-dtype", default="fp8_e4m3",
-                        choices=["fp8_e4m3", "bf16"])
+                        choices=["fp8_e4m3", "bf16", "fp4"])
     parser.add_argument("--kv-cache-mb", type=int, default=1000,
                         help="KV cache size in MB (default: 1000)")
     parser.add_argument("--heatmap-path", default=None,
@@ -852,7 +852,10 @@ def main():
     global _model, _model_name
     import torch
 
-    kv_dtype = torch.float8_e4m3fn if args.kv_dtype == "fp8_e4m3" else torch.bfloat16
+    # FP4 mode: allocate FP8 cache for prefill + FP4 cache for decode.
+    # The torch dtype stays fp8 (FlashInfer prefill needs it); kv_format signals FP4 decode.
+    kv_format = "fp4" if args.kv_dtype == "fp4" else "fp8"
+    kv_dtype = torch.float8_e4m3fn if args.kv_dtype in ("fp8_e4m3", "fp4") else torch.bfloat16
 
     quant_cfg = QuantConfig(
         lm_head=args.lm_head_quant,
@@ -921,6 +924,11 @@ def main():
         kv_cache_mb=args.kv_cache_mb,
         stream_attention=args.stream_attention,
     )
+
+    # KV cache format (fp4 for NVFP4 decode, fp8 default)
+    _model.kv_format = kv_format
+    if kv_format == "fp4":
+        _detail("NVFP4 KV cache enabled (--kv-dtype fp4) — SM120+ only")
 
     # WriteCombined DMA staging: set flag on model so setup_from_engine path can use it
     if getattr(args, 'wc_alloc', False):

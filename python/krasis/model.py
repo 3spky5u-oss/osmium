@@ -2134,6 +2134,7 @@ class KrasisModel:
                     kv_dtype=self.kv_dtype,
                     combined=use_combined,
                     max_mb=kv_mb,
+                    kv_format=getattr(self, 'kv_format', 'fp8'),
                 )
             else:
                 cache = None
@@ -4811,6 +4812,99 @@ class KrasisModel:
         # seq_states[0] is the primary sequence on GPU0.
         if seq_states and hasattr(seq_states[0], 'pages') and seq_states[0].pages:
             store.set_page_table(seq_states[0].pages)
+
+        # FP4 mode: quantize prefilled FP8 pages to FP4, then export FP4 pointers.
+        cache = self.kv_caches[0] if self.kv_caches else None
+        if cache and getattr(cache, 'kv_format', 'fp8') == 'fp4' and cache.k_data_fp4 is not None:
+            self._quantize_kv_fp8_to_fp4(cache, seq_states[0])
+            self._export_fp4_ptrs_to_rust(cache, store)
+
+    def _quantize_kv_fp8_to_fp4(self, cache, seq_state):
+        """Quantize prefilled FP8 KV pages to FP4 packed + scale tensors.
+
+        FlashInfer writes FP8 into k_cache/v_cache during prefill. This method
+        converts those pages to the FP4 format that the Rust decode kernels read.
+        """
+        import time as _time
+        t0 = _time.monotonic()
+
+        pages = seq_state.pages
+        if not pages:
+            return
+        pages_t = torch.tensor(pages, dtype=torch.long, device=cache.device)
+        group_size = cache.fp4_group_size  # 16
+
+        for layer_idx in range(cache.num_layers):
+            # K: [page_count, page_size, nkv, hd] FP8 → flat [page_count, page_size, kv_dim]
+            k_fp8 = cache.k_cache[layer_idx, pages_t].float()  # upcast to FP32
+            v_fp8 = cache.v_cache[layer_idx, pages_t].float()
+            shape = k_fp8.shape  # [npages, page_size, nkv, hd]
+            k_flat = k_fp8.reshape(shape[0], shape[1], -1)  # [npages, page_size, kv_dim]
+            v_flat = v_fp8.reshape(shape[0], shape[1], -1)
+            kv_dim = k_flat.shape[-1]
+
+            # Per-group quantization: reshape to [npages, page_size, kv_dim/group_size, group_size]
+            k_groups = k_flat.reshape(shape[0], shape[1], kv_dim // group_size, group_size)
+            v_groups = v_flat.reshape(shape[0], shape[1], kv_dim // group_size, group_size)
+
+            # Compute scales: max(abs(group)) / 6.0 (FP4 E2M1 max magnitude)
+            k_scales = k_groups.abs().amax(dim=-1) / 6.0  # [npages, ps, ngroups]
+            v_scales = v_groups.abs().amax(dim=-1) / 6.0
+
+            # Quantize to FP4 nibbles: round to nearest codebook entry
+            k_inv = torch.where(k_scales > 0, 1.0 / k_scales, torch.zeros_like(k_scales))
+            v_inv = torch.where(v_scales > 0, 1.0 / v_scales, torch.zeros_like(v_scales))
+
+            k_scaled = k_groups * k_inv.unsqueeze(-1)  # [npages, ps, ngroups, gs]
+            v_scaled = v_groups * v_inv.unsqueeze(-1)
+
+            # E2M1 codebook: {0, 0.5, 1, 1.5, 2, 3, 4, 6}
+            # Nearest-round via thresholds
+            codebook = torch.tensor([0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=k_flat.device)
+            thresholds = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=k_flat.device)
+
+            def quantize_to_nibbles(scaled):
+                sign = (scaled < 0).to(torch.uint8) * 8
+                abs_val = scaled.abs()
+                code = torch.zeros_like(abs_val, dtype=torch.uint8)
+                for i, thr in enumerate(thresholds):
+                    code += (abs_val >= thr).to(torch.uint8)
+                return (code | sign).to(torch.uint8)
+
+            k_nibbles = quantize_to_nibbles(k_scaled)  # [npages, ps, ngroups, gs]
+            v_nibbles = quantize_to_nibbles(v_scaled)
+
+            # Pack pairs into bytes: low nibble = even, high nibble = odd
+            k_nib_flat = k_nibbles.reshape(shape[0], shape[1], kv_dim)
+            v_nib_flat = v_nibbles.reshape(shape[0], shape[1], kv_dim)
+            k_packed = (k_nib_flat[..., 0::2] | (k_nib_flat[..., 1::2] << 4)).to(torch.uint8)
+            v_packed = (v_nib_flat[..., 0::2] | (v_nib_flat[..., 1::2] << 4)).to(torch.uint8)
+
+            # Write to FP4 cache tensors
+            cache.k_data_fp4[layer_idx, pages_t] = k_packed
+            cache.v_data_fp4[layer_idx, pages_t] = v_packed
+            cache.k_scale_fp4[layer_idx, pages_t] = k_scales.to(torch.float8_e4m3fn)
+            cache.v_scale_fp4[layer_idx, pages_t] = v_scales.to(torch.float8_e4m3fn)
+
+        torch.cuda.synchronize()
+        elapsed_ms = (_time.monotonic() - t0) * 1000
+        logger.info("FP4 quantize: %d layers × %d pages in %.1fms", cache.num_layers, len(pages), elapsed_ms)
+
+    def _export_fp4_ptrs_to_rust(self, cache, store):
+        """Register FP4 KV cache device pointers with the Rust decode store."""
+        kv_dim = cache.num_kv_heads * cache.gqa_head_dim
+        fp4_ptrs = []
+        gqa_cache_idx = 0
+        for layer_idx, layer in enumerate(self.layers):
+            if layer.layer_type != "linear_attention":
+                kd = cache.k_data_fp4[gqa_cache_idx]
+                ks = cache.k_scale_fp4[gqa_cache_idx]
+                vd = cache.v_data_fp4[gqa_cache_idx]
+                vs = cache.v_scale_fp4[gqa_cache_idx]
+                fp4_ptrs.append((layer_idx, kd.data_ptr(), ks.data_ptr(), vd.data_ptr(), vs.data_ptr()))
+                gqa_cache_idx += 1
+        store.set_kv_cache_ptrs_fp4(fp4_ptrs, kv_dim)
+        logger.info("FP4 KV pointers exported: %d GQA layers, kv_dim=%d", len(fp4_ptrs), kv_dim)
 
     def _update_la_state_ptrs(self):
         """Re-register LA state pointers after prefill (states may have been reallocated).
