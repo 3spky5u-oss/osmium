@@ -157,9 +157,7 @@ class PagedKVCache:
                 self.k_data_fp4, self.k_scale_fp4, self.v_data_fp4, self.v_scale_fp4
             ]) / (1024**2)
             layout_str = "gqa-fp4"
-            # Also allocate FP8 caches for FlashInfer prefill (prefill dequants from FP4)
-            # FlashInfer doesn't read FP4 natively for paged attention,
-            # so prefill writes FP8, and we quantize to FP4 after.
+            # FP8 shadow for FlashInfer prefill (same pages, both always allocated)
             self.k_cache = torch.zeros(
                 num_layers, max_pages, page_size, self.num_kv_heads, self.gqa_head_dim,
                 dtype=torch.float8_e4m3fn, device=device,
@@ -214,10 +212,9 @@ class PagedKVCache:
 
     def _bytes_per_page(self) -> int:
         if self.kv_format == "fp4":
-            # FP4 mode allocates BOTH FP8 (for FlashInfer prefill) and FP4 (for Rust decode).
-            # Budget must cover both to avoid OOM.
+            # FP4 mode needs both FP8 (prefill) and FP4 (decode) per page.
             kv_dim = self.num_kv_heads * self.gqa_head_dim
-            fp8_bytes = self.page_size * kv_dim * 2  # K + V, 1 byte each (FP8)
+            fp8_bytes = self.page_size * kv_dim * 2  # K + V, 1 byte each
             fp4_data = self.page_size * kv_dim // 2 * 2  # K + V packed
             fp4_scale = self.page_size * kv_dim // 16 * 2  # K + V scales
             return (fp8_bytes + fp4_data + fp4_scale) * self.num_layers
@@ -274,6 +271,42 @@ class PagedKVCache:
         """
         assert self.attention_type == "gqa"
         return self.k_cache[layer_offset], self.v_cache[layer_offset]
+
+    # ── FP4 shadow cache management ──
+
+    def alloc_fp8_shadow(self):
+        """Allocate FP8 shadow caches for FlashInfer prefill (FP4 mode only).
+        Called before prefill; freed after FP4 quantization via free_fp8_shadow().
+        """
+        if self.kv_format != "fp4" or getattr(self, '_fp8_shadow_allocated', False):
+            return
+        self.k_cache = torch.zeros(
+            self.num_layers, self.max_pages, self.page_size,
+            self.num_kv_heads, self.gqa_head_dim,
+            dtype=torch.float8_e4m3fn, device=self.device,
+        )
+        self.v_cache = torch.zeros(
+            self.num_layers, self.max_pages, self.page_size,
+            self.num_kv_heads, self.gqa_head_dim,
+            dtype=torch.float8_e4m3fn, device=self.device,
+        )
+        self._fp8_shadow_allocated = True
+        mb = (self.k_cache.nbytes + self.v_cache.nbytes) / (1024**2)
+        logger.info("FP4: allocated FP8 shadow cache (%.0f MB) for prefill", mb)
+
+    def free_fp8_shadow(self):
+        """Free FP8 shadow caches after FP4 quantization (FP4 mode only).
+        Frees VRAM for HCS/decode.
+        """
+        if self.kv_format != "fp4" or not getattr(self, '_fp8_shadow_allocated', False):
+            return
+        mb = (self.k_cache.nbytes + self.v_cache.nbytes) / (1024**2)
+        del self.k_cache, self.v_cache
+        self.k_cache = None
+        self.v_cache = None
+        self._fp8_shadow_allocated = False
+        torch.cuda.empty_cache()
+        logger.info("FP4: freed FP8 shadow cache (%.0f MB)", mb)
 
 
 class SequenceKVState:

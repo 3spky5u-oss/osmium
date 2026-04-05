@@ -4402,7 +4402,7 @@ class KrasisModel:
             gqa_cache_idx = 0
             for layer_idx, layer in enumerate(self.layers):
                 if layer.layer_type != "linear_attention":
-                    k_layer = cache.k_cache[gqa_cache_idx]  # [max_pages, page_size, nkv, hd]
+                    k_layer = cache.k_cache[gqa_cache_idx]
                     v_layer = cache.v_cache[gqa_cache_idx]
                     gqa_cache_idx += 1
                     kv_ptrs.append((layer_idx, k_layer.data_ptr(), v_layer.data_ptr()))
@@ -4813,7 +4813,7 @@ class KrasisModel:
         if seq_states and hasattr(seq_states[0], 'pages') and seq_states[0].pages:
             store.set_page_table(seq_states[0].pages)
 
-        # FP4 mode: quantize prefilled FP8 pages to FP4, then export FP4 pointers.
+        # FP4 mode: quantize prefilled FP8 pages to FP4, then free FP8 shadow.
         cache = self.kv_caches[0] if self.kv_caches else None
         if cache and getattr(cache, 'kv_format', 'fp8') == 'fp4' and cache.k_data_fp4 is not None:
             self._quantize_kv_fp8_to_fp4(cache, seq_states[0])
