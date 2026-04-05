@@ -1581,13 +1581,14 @@ class KrasisModel:
         engine = KrasisEngine(parallel=True, num_threads=self.krasis_threads, skip_shared_experts=skip_shared)
 
         if self.gguf_path:
-            logger.info("Loading CPU experts from GGUF: %s (native=%s)", self.gguf_path, self.gguf_native)
+            logger.info("Loading CPU experts from GGUF: %s (native=%s, gpu_only=%s)", self.gguf_path, self.gguf_native, gpu_only)
             engine.load(
                 self.cfg.model_path,
                 cpu_num_bits=cpu_bits,
                 gpu_num_bits=gpu_bits,
                 gguf_path=self.gguf_path,
                 gguf_native=self.gguf_native,
+                gpu_only=gpu_only,
             )
         else:
             engine.load(self.cfg.model_path, cpu_num_bits=cpu_bits, gpu_num_bits=gpu_bits, gpu_only=gpu_only)
@@ -1700,15 +1701,15 @@ class KrasisModel:
             len(self.gpu_prefill_managers), self.gpu_prefill_threshold,
         )
 
-    def _start_ram_watchdog(self, floor_pct: float = 5.0):
+    def _start_ram_watchdog(self, floor_pct: float = 0.5):
         """Start daemon thread that monitors system RAM and exits if too low.
 
-        Checks /proc/meminfo every second. If MemAvailable drops below
-        floor_pct% of MemTotal, logs an error and calls os._exit() to
+        Checks /proc/meminfo every second. If MemAvailable + SwapFree drops
+        below floor_pct% of MemTotal, logs an error and calls os._exit() to
         prevent a full system OOM that kills desktop processes.
 
         Args:
-            floor_pct: Minimum % free RAM before forced exit (default 5%)
+            floor_pct: Minimum % free RAM+swap before forced exit (default 0.5%)
         """
         def _watchdog():
             while True:
@@ -1717,13 +1718,13 @@ class KrasisModel:
                 if not meminfo:
                     continue
                 total_kb = meminfo.get("MemTotal", 0)
-                avail_kb = meminfo.get("MemAvailable", 0)
+                avail_kb = meminfo.get("MemAvailable", 0) + meminfo.get("SwapFree", 0)
                 if total_kb == 0:
                     continue
                 pct_free = 100.0 * avail_kb / total_kb
                 if pct_free < floor_pct:
                     logger.error(
-                        "RAM WATCHDOG: %.1f%% free (%.1f GB available / %.1f GB total) "
+                        "RAM WATCHDOG: %.1f%% free (%.1f GB available+swap / %.1f GB total) "
                         "— below %.1f%% floor. Exiting to prevent system OOM!",
                         pct_free, avail_kb / 1024 / 1024,
                         total_kb / 1024 / 1024, floor_pct,

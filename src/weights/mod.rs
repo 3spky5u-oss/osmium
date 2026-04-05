@@ -2610,11 +2610,26 @@ impl WeightStore {
         let mut experts_gpu = Vec::with_capacity(num_layers_to_load);
         let mut layer_backings_gpu = Vec::with_capacity(num_layers_to_load);
         for layer_idx in 0..num_layers_to_load {
+            let offset_before = offset;
             let (backing, layer_experts) = read_marlin_layer(
                 &mmap, &mut offset, h, m, group_size, gpu_bits, config.n_routed_experts,
             );
             layer_backings_gpu.push(backing);
             experts_gpu.push(layer_experts);
+
+            // Release mmap pages for the just-read layer data. The data is now in heap
+            // Vecs — keeping the mmap resident doubles peak RSS (~10 GB for 58 layers).
+            let page_start = offset_before & !0xFFF;
+            let page_end = (offset + 0xFFF) & !0xFFF;
+            if page_end > page_start {
+                unsafe {
+                    libc::madvise(
+                        mmap.as_ptr().add(page_start) as *mut libc::c_void,
+                        page_end - page_start,
+                        libc::MADV_DONTNEED,
+                    );
+                }
+            }
 
             if (layer_idx + 1) % 10 == 0 || layer_idx + 1 == num_layers_to_load {
                 log::info!(
@@ -3432,6 +3447,7 @@ impl WeightStore {
         cpu_num_bits: u8,
         gpu_num_bits: u8,
         gguf_native: bool,
+        skip_cpu: bool,
     ) -> Result<Self, String> {
         let start = std::time::Instant::now();
 
@@ -3478,6 +3494,7 @@ impl WeightStore {
         let cache_gs = effective_gs_hint.unwrap_or(group_size);
         let mut experts_gpu: Vec<Vec<UnifiedExpertWeights>> = Vec::new();
         let mut shared_experts_gpu: Vec<UnifiedExpertWeights> = Vec::new();
+        let mut layer_backings_gpu: Vec<LayerExpertBacking> = Vec::new();
         let mut effective_gs = cache_gs;
         let mut gpu_loaded = false;
 
@@ -3497,6 +3514,7 @@ impl WeightStore {
                         );
                         experts_gpu = store.experts_gpu;
                         shared_experts_gpu = store.shared_experts_gpu;
+                        layer_backings_gpu = store.layer_backings_gpu;
                         effective_gs = *try_gs;
                         gpu_loaded = true;
                     }
@@ -3526,6 +3544,7 @@ impl WeightStore {
                     ) {
                         experts_gpu = store.experts_gpu;
                         shared_experts_gpu = store.shared_experts_gpu;
+                        layer_backings_gpu = store.layer_backings_gpu;
                         effective_gs = *try_gs;
                         gpu_loaded = true;
                     }
@@ -3540,12 +3559,14 @@ impl WeightStore {
         let mut shared_experts_gguf: Vec<GgufExpertWeights> = Vec::new();
         let mut cpu_loaded = false;
 
-        if gguf_native {
+        if skip_cpu {
+            log::info!("gpu_only mode — skipping CPU expert loading (saves ~40 GB RAM)");
+        } else if gguf_native {
             log::info!("GGUF native mode — bypassing AVX2 cache, loading raw GGUF blocks");
         }
 
-        // Step 1: Try loading existing GGUF→AVX2 cache (unless gguf_native)
-        if !gguf_native {
+        // Step 1: Try loading existing GGUF→AVX2 cache (unless gguf_native or skip_cpu)
+        if !skip_cpu && !gguf_native {
             let avx2_cache_path = cache_path_gguf_avx2(model_dir, effective_gs);
             if avx2_cache_path.exists() {
                 match Self::load_gguf_cpu_cache(
@@ -3566,8 +3587,8 @@ impl WeightStore {
             }
         }
 
-        // Step 2: Build AVX2 cache from GGUF if needed (unless gguf_native)
-        if !cpu_loaded && !gguf_native {
+        // Step 2: Build AVX2 cache from GGUF if needed (unless gguf_native or skip_cpu)
+        if !skip_cpu && !cpu_loaded && !gguf_native {
             let avx2_cache_path = cache_path_gguf_avx2(model_dir, effective_gs);
             log::info!("No GGUF→AVX2 cache found, building from GGUF...");
             let (w13b, w2b) = Self::streaming_build_cpu_cache_from_gguf(
@@ -3594,7 +3615,7 @@ impl WeightStore {
         }
 
         // Step 3: Fall back to raw GGUF native if requested or if AVX2 cache failed
-        if !cpu_loaded {
+        if !skip_cpu && !cpu_loaded {
             log::info!(
                 "Loading CPU experts from GGUF native ({} layers × {} experts)...",
                 num_moe_layers, config.n_routed_experts,
@@ -3748,7 +3769,7 @@ impl WeightStore {
             shared_experts_cpu,
             experts_gpu,
             shared_experts_gpu,
-            layer_backings_gpu: Vec::new(), // GGUF path doesn't use per-layer backing yet
+            layer_backings_gpu,
             experts_gguf,
             shared_experts_gguf,
             config: config.clone(),

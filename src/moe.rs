@@ -1738,10 +1738,11 @@ impl KrasisEngine {
 
         // Load weights: either from GGUF (CPU experts) or from HF safetensors (both)
         let mut store = if let Some(gguf) = gguf_path {
-            log::info!("[DIAG-RUST] Loading CPU experts from GGUF: {} (native={})", gguf, gguf_native);
+            let skip_cpu = gpu_only.unwrap_or(false);
+            log::info!("[DIAG-RUST] Loading CPU experts from GGUF: {} (native={}, skip_cpu={})", gguf, gguf_native, skip_cpu);
             crate::syscheck::log_memory_usage("[DIAG-RUST] before load_from_gguf");
             let s = WeightStore::load_from_gguf(
-                path, Path::new(gguf), gs, max_layers, start_layer, cpu_bits, gpu_bits, gguf_native,
+                path, Path::new(gguf), gs, max_layers, start_layer, cpu_bits, gpu_bits, gguf_native, skip_cpu,
             ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
             log::info!("[DIAG-RUST] WeightStore::load_from_gguf completed OK");
             crate::syscheck::log_memory_usage("[DIAG-RUST] after load_from_gguf");

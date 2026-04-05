@@ -21,8 +21,12 @@ use cudarc::driver::{CudaDevice, DevicePtr, LaunchAsync, LaunchConfig};
 use cudarc::driver::sys as cuda_sys;
 
 // PTX compiled from src/cuda/decode_kernels.cu at build time.
+// sm_80 works on all GPUs >= Ampere (3090/SM86, 4090/SM89, 5090/SM120 via JIT).
+// sm_120 is native Blackwell with better warp scheduling.
 #[cfg(has_decode_kernels)]
-const DECODE_KERNELS_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/decode_kernels.ptx"));
+const DECODE_KERNELS_PTX_SM80: &str = include_str!(concat!(env!("OUT_DIR"), "/decode_kernels_sm80.ptx"));
+#[cfg(has_decode_kernels_sm120)]
+const DECODE_KERNELS_PTX_SM120: &str = include_str!(concat!(env!("OUT_DIR"), "/decode_kernels_sm120.ptx"));
 
 // CUDA graph types from cudarc's sys bindings (dynamically loaded via cuda_sys::lib())
 type CUgraph = cuda_sys::CUgraph;
@@ -1448,12 +1452,40 @@ impl GpuDecodeStore {
 
         let mut gqa_smem_limit: u32 = 48 * 1024; // default
 
-        // Load CUDA decode kernels from embedded PTX
+        // Load CUDA decode kernels from embedded PTX.
+        // Prefer native sm_120 on Blackwell, fall back to sm_80 (JITs on all SM >= 80).
         #[cfg(has_decode_kernels)]
         {
             use cudarc::nvrtc::Ptx;
+
+            let sm_major = unsafe {
+                let mut dev: i32 = 0;
+                cuda_sys::lib().cuCtxGetDevice(&mut dev);
+                let mut major: i32 = 0;
+                cuda_sys::lib().cuDeviceGetAttribute(
+                    &mut major,
+                    cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                    dev,
+                );
+                major
+            };
+
+            #[cfg(has_decode_kernels_sm120)]
+            let ptx_src = if sm_major >= 12 {
+                log::info!("GpuDecodeStore: using native sm_120 PTX for Blackwell (SM {}.x)", sm_major);
+                DECODE_KERNELS_PTX_SM120
+            } else {
+                log::info!("GpuDecodeStore: using sm_80 PTX for SM {}.x (JIT to native)", sm_major);
+                DECODE_KERNELS_PTX_SM80
+            };
+            #[cfg(not(has_decode_kernels_sm120))]
+            let ptx_src = {
+                log::info!("GpuDecodeStore: using sm_80 PTX for SM {}.x (sm_120 not compiled)", sm_major);
+                DECODE_KERNELS_PTX_SM80
+            };
+
             device.load_ptx(
-                Ptx::from_src(DECODE_KERNELS_PTX),
+                Ptx::from_src(ptx_src),
                 MODULE_NAME,
                 KERNEL_NAMES,
             ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
