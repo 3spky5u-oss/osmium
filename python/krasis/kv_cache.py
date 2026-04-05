@@ -157,7 +157,9 @@ class PagedKVCache:
                 self.k_data_fp4, self.k_scale_fp4, self.v_data_fp4, self.v_scale_fp4
             ]) / (1024**2)
             layout_str = "gqa-fp4"
-            # FP8 shadow for FlashInfer prefill (same pages, both always allocated)
+            # FP8 shadow always allocated — FlashInfer prefill writes here,
+            # then we quantize to FP4. Freeing the shadow between requests
+            # causes CUDA_ERROR_ILLEGAL_ADDRESS in MoE forward, so keep it.
             self.k_cache = torch.zeros(
                 num_layers, max_pages, page_size, self.num_kv_heads, self.gqa_head_dim,
                 dtype=torch.float8_e4m3fn, device=device,
@@ -212,9 +214,9 @@ class PagedKVCache:
 
     def _bytes_per_page(self) -> int:
         if self.kv_format == "fp4":
-            # FP4 mode needs both FP8 (prefill) and FP4 (decode) per page.
+            # Both FP8 (prefill) and FP4 (decode) stay allocated.
             kv_dim = self.num_kv_heads * self.gqa_head_dim
-            fp8_bytes = self.page_size * kv_dim * 2  # K + V, 1 byte each
+            fp8_bytes = self.page_size * kv_dim * 2  # K + V FP8
             fp4_data = self.page_size * kv_dim // 2 * 2  # K + V packed
             fp4_scale = self.page_size * kv_dim // 16 * 2  # K + V scales
             return (fp8_bytes + fp4_data + fp4_scale) * self.num_layers
@@ -296,7 +298,8 @@ class PagedKVCache:
 
     def free_fp8_shadow(self):
         """Free FP8 shadow caches after FP4 quantization (FP4 mode only).
-        Frees VRAM for HCS/decode.
+        Releases tensors to PyTorch's caching allocator (no empty_cache —
+        that can invalidate HCS expert pointers).
         """
         if self.kv_format != "fp4" or not getattr(self, '_fp8_shadow_allocated', False):
             return
@@ -305,8 +308,7 @@ class PagedKVCache:
         self.k_cache = None
         self.v_cache = None
         self._fp8_shadow_allocated = False
-        torch.cuda.empty_cache()
-        logger.info("FP4: freed FP8 shadow cache (%.0f MB)", mb)
+        logger.info("FP4: freed FP8 shadow cache (%.0f MB) — available for HCS", mb)
 
 
 class SequenceKVState:
