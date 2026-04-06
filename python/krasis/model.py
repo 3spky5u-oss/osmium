@@ -4952,14 +4952,9 @@ class KrasisModel:
                     out_wid = _register_aux_attn(out_src, layer_idx,
                                                   "linear_attention", "out_proj")
 
-                    # AWQ: fold 1/s into input_norm_weight for aux copy
-                    if _layer_awq_scales is not None and (
-                            _qkvz_scales is not None or _ba_scales is not None):
-                        s = _layer_awq_scales.to(inp_norm.device)
-                        inp_norm_folded = (inp_norm.float() / s.float()).to(inp_norm.dtype)
-                        inp_norm_aux = inp_norm_folded.to(aux_device, non_blocking=True)
-                    else:
-                        inp_norm_aux = inp_norm.to(aux_device, non_blocking=True)
+                    # AWQ scales already folded into inp_norm in-place by primary store setup.
+                    # Just copy the already-folded norm to aux GPU (no second fold).
+                    inp_norm_aux = inp_norm.to(aux_device, non_blocking=True)
                     post_norm_aux = post_norm.to(aux_device, non_blocking=True)
                     self._aux_decode_weights.extend([inp_norm_aux, post_norm_aux])
 
@@ -5060,16 +5055,9 @@ class KrasisModel:
                     o_src = _get_bf16_source(attn, "o_proj", layer_idx)
                     o_wid = _register_aux_attn(o_src, layer_idx, "mla", "o_proj")
 
-                    # AWQ: fold 1/s into input_norm_weight for aux copy
-                    if _layer_awq_scales is not None and (
-                        _qa_scales is not None or _qproj_scales is not None
-                        or _kva_scales is not None
-                    ):
-                        s = _layer_awq_scales.to(inp_norm.device)
-                        inp_norm_folded = (inp_norm.float() / s.float()).to(inp_norm.dtype)
-                        inp_norm_aux = inp_norm_folded.to(aux_device, non_blocking=True)
-                    else:
-                        inp_norm_aux = inp_norm.to(aux_device, non_blocking=True)
+                    # AWQ scales already folded into inp_norm in-place by primary store setup.
+                    # Just copy the already-folded norm to aux GPU (no second fold).
+                    inp_norm_aux = inp_norm.to(aux_device, non_blocking=True)
                     post_norm_aux = post_norm.to(aux_device, non_blocking=True)
                     self._aux_decode_weights.extend([inp_norm_aux, post_norm_aux])
 
@@ -5208,16 +5196,9 @@ class KrasisModel:
                                                awq_scales=_v_scales)
                     o_wid = _register_aux_attn(o_src, layer_idx, "gqa", "o_proj")
 
-                    # AWQ: fold 1/s into input_norm_weight for aux copy
-                    if _layer_awq_scales is not None and (
-                        _q_scales is not None or _k_scales is not None
-                        or _v_scales is not None
-                    ):
-                        s = _layer_awq_scales.to(inp_norm.device)
-                        inp_norm_folded = (inp_norm.float() / s.float()).to(inp_norm.dtype)
-                        inp_norm_aux = inp_norm_folded.to(aux_device, non_blocking=True)
-                    else:
-                        inp_norm_aux = inp_norm.to(aux_device, non_blocking=True)
+                    # AWQ scales already folded into inp_norm in-place by primary store setup.
+                    # Just copy the already-folded norm to aux GPU (no second fold).
+                    inp_norm_aux = inp_norm.to(aux_device, non_blocking=True)
                     post_norm_aux = post_norm.to(aux_device, non_blocking=True)
                     self._aux_decode_weights.extend([inp_norm_aux, post_norm_aux])
 

@@ -6313,6 +6313,7 @@ impl GpuDecodeStore {
         if self.single_slot_swaps.is_empty() {
             return Ok(());
         }
+        self.device.bind_to_thread().map_err(|e| format!("bind_to_thread: {:?}", e))?;
         let mut total_bytes: usize = 0;
         for entry in &self.single_slot_swaps {
             unsafe {
@@ -6346,6 +6347,7 @@ impl GpuDecodeStore {
         if self.single_slot_swaps.is_empty() {
             return Ok(());
         }
+        self.device.bind_to_thread().map_err(|e| format!("bind_to_thread: {:?}", e))?;
         let mut total_bytes: usize = 0;
         for entry in &self.single_slot_swaps {
             unsafe {
