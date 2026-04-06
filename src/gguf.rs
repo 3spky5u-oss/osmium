@@ -531,6 +531,39 @@ impl GgufFile {
     }
 }
 
+// ── PyO3 functions for Python-side GGUF weight loading ───────────────
+
+/// List all tensor names + shapes + types in a GGUF file.
+#[pyo3::pyfunction]
+#[pyo3(signature = (path,))]
+pub fn gguf_list_tensors(path: &str) -> pyo3::PyResult<Vec<(String, Vec<u64>, String)>> {
+    let g = GgufFile::open(std::path::Path::new(path))
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let mut result = Vec::with_capacity(g.tensor_names.len());
+    for name in &g.tensor_names {
+        if let Some(info) = g.tensors.get(name) {
+            result.push((name.clone(), info.dims.clone(), info.dtype.name().to_string()));
+        }
+    }
+    Ok(result)
+}
+
+/// Read and dequantize a single tensor from a GGUF file → Vec<f32> + shape.
+/// Returns (flat_data: List[float], dims: List[int]).
+#[pyo3::pyfunction]
+#[pyo3(signature = (path, tensor_name))]
+pub fn gguf_read_tensor(path: &str, tensor_name: &str) -> pyo3::PyResult<(Vec<f32>, Vec<u64>)> {
+    let g = GgufFile::open(std::path::Path::new(path))
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let info = g.tensors.get(tensor_name)
+        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(
+            format!("Tensor '{}' not found in GGUF (have {} tensors)", tensor_name, g.tensors.len())))?;
+    let data = g.dequantize_tensor(info)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let dims = info.dims.clone();
+    Ok((data, dims))
+}
+
 // ── FP16/BF16/F32 dequantization ──────────────────────────────────────
 
 fn dequant_f32(data: &[u8], n: usize) -> Result<Vec<f32>, String> {

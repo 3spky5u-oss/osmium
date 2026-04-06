@@ -510,3 +510,253 @@ class WeightLoader:
     def close(self):
         """Close all safetensors handles."""
         self._handles.clear()
+
+
+class GgufWeightLoader:
+    """Weight loader that reads ALL non-expert weights from a GGUF file.
+
+    Replaces WeightLoader (safetensors) when --gguf-path is provided.
+    Uses the Rust GGUF parser (via gguf_read_tensor) to dequantize tensors
+    to FP32, then converts to BF16 and optionally quantizes to INT8.
+
+    Tensor name mapping: HF safetensors → llama.cpp GGUF convention.
+    """
+
+    # HF name component → GGUF name component
+    _GGUF_NAME_MAP = {
+        "embed_tokens": "token_embd",
+        "self_attn.q_proj": "attn_q",
+        "self_attn.k_proj": "attn_k",
+        "self_attn.v_proj": "attn_v",
+        "self_attn.o_proj": "attn_output",
+        "self_attn.q_norm": "attn_q_norm",
+        "self_attn.k_norm": "attn_k_norm",
+        "input_layernorm": "attn_norm",
+        "post_attention_layernorm": "ffn_norm",
+        "mlp.gate": "ffn_gate_inp",  # MoE router
+        "mlp.shared_experts.gate_proj": "ffn_gate_shexp",
+        "mlp.shared_experts.up_proj": "ffn_up_shexp",
+        "mlp.shared_experts.down_proj": "ffn_down_shexp",
+        "mlp.shared_expert_gate": "ffn_shexp_gate",
+        "mlp.gate_proj": "ffn_gate",  # dense MLP
+        "mlp.up_proj": "ffn_up",
+        "mlp.down_proj": "ffn_down",
+    }
+
+    def __init__(self, cfg: ModelConfig, gguf_path: str, quant_cfg: QuantConfig = None):
+        self.cfg = cfg
+        self.gguf_path = gguf_path
+        self.quant_cfg = quant_cfg or QuantConfig()
+        self.model_path = cfg.model_path
+
+        # Verify GGUF is readable and cache tensor list
+        from krasis import gguf_list_tensors
+        self._tensor_list = gguf_list_tensors(gguf_path)
+        self._tensor_names = {name for name, _, _ in self._tensor_list}
+        logger.info("GgufWeightLoader: %s — %d tensors", gguf_path, len(self._tensor_names))
+
+    def _gguf_name(self, hf_name: str) -> str:
+        """Convert HF tensor name to GGUF tensor name."""
+        # Handle top-level tensors
+        if hf_name == f"{self.cfg.layers_prefix}.embed_tokens.weight":
+            return "token_embd.weight"
+        if hf_name == f"{self.cfg.layers_prefix}.norm.weight":
+            return "output_norm.weight"
+        if hf_name == "lm_head.weight":
+            return "output.weight"
+
+        # Handle per-layer tensors: model.layers.{L}.{component}.weight
+        prefix = f"{self.cfg.layers_prefix}.layers."
+        if hf_name.startswith(prefix):
+            rest = hf_name[len(prefix):]  # "{L}.{component}.weight"
+            parts = rest.split(".", 1)  # ["{L}", "{component}.weight"]
+            layer_idx = parts[0]
+            component_and_suffix = parts[1]  # e.g. "self_attn.q_proj.weight"
+
+            # Try each mapping
+            for hf_comp, gguf_comp in self._GGUF_NAME_MAP.items():
+                hf_pattern = f"{hf_comp}.weight"
+                if component_and_suffix == hf_pattern:
+                    return f"blk.{layer_idx}.{gguf_comp}.weight"
+                # Handle bias
+                hf_bias = f"{hf_comp}.bias"
+                if component_and_suffix == hf_bias:
+                    return f"blk.{layer_idx}.{gguf_comp}.bias"
+
+        # Fallback: return as-is (will fail on lookup, giving a clear error)
+        return hf_name
+
+    def _read_tensor(self, hf_name: str) -> torch.Tensor:
+        """Read tensor from GGUF, dequantize to FP32, return as torch tensor."""
+        gguf_name = self._gguf_name(hf_name)
+        if gguf_name not in self._tensor_names:
+            raise KeyError(f"Tensor '{hf_name}' (GGUF: '{gguf_name}') not found in {self.gguf_path}")
+        from krasis import gguf_read_tensor
+        data, dims = gguf_read_tensor(self.gguf_path, gguf_name)
+        shape = list(reversed(dims))  # GGUF stores dims in reverse (column-major)
+        t = torch.tensor(data, dtype=torch.float32).reshape(shape)
+        return t
+
+    def _has_tensor(self, hf_name: str) -> bool:
+        """Check if a tensor exists in the GGUF file."""
+        return self._gguf_name(hf_name) in self._tensor_names
+
+    def _load_and_quantize(self, name: str, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        w = self._read_tensor(name).to(torch.bfloat16)
+        w_int8, scale = quantize_to_int8(w)
+        del w
+        return w_int8.to(device), scale.to(device)
+
+    def _load_bf16(self, name: str, device: torch.device) -> torch.Tensor:
+        w = self._read_tensor(name).to(torch.bfloat16)
+        return w.to(device)
+
+    # ── Public API (same as WeightLoader) ──
+
+    def load_embedding(self, device: torch.device) -> torch.Tensor:
+        name = f"{self.cfg.layers_prefix}.embed_tokens.weight"
+        logger.info("Loading embedding from GGUF: %s", self._gguf_name(name))
+        return self._load_bf16(name, device)
+
+    def load_final_norm(self, device: torch.device) -> torch.Tensor:
+        name = f"{self.cfg.layers_prefix}.norm.weight"
+        logger.info("Loading final norm from GGUF: %s", self._gguf_name(name))
+        return self._load_bf16(name, device)
+
+    def load_lm_head(self, device: torch.device) -> torch.Tensor:
+        name = "lm_head.weight"
+        logger.info("Loading lm_head from GGUF: %s", self._gguf_name(name))
+        quant = self.quant_cfg.lm_head
+        if quant == "int8":
+            return self._load_and_quantize(name, device)
+        return self._load_bf16(name, device)
+
+    def load_attention_weights(self, layer_idx: int, device: torch.device, on_cpu: bool = False):
+        """Load attention Q/K/V/O weights from GGUF."""
+        prefix = f"{self.cfg.layers_prefix}.layers.{layer_idx}.self_attn"
+        target = "cpu" if on_cpu else device
+
+        result = {}
+        for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+            name = f"{prefix}.{proj}.weight"
+            if self.quant_cfg.attention == "int8" and not on_cpu:
+                w_int8, scale = self._load_and_quantize(name, target)
+                result[proj] = (w_int8, scale)
+            else:
+                result[proj] = self._load_bf16(name, target)
+
+        # Q/K norms (optional, Qwen3 has them)
+        for norm_name in ["q_norm", "k_norm"]:
+            name = f"{prefix}.{norm_name}.weight"
+            if self._has_tensor(name):
+                result[norm_name] = self._load_bf16(name, device)
+
+        return result
+
+    def load_layer_norms(self, layer_idx: int, device: torch.device):
+        prefix = f"{self.cfg.layers_prefix}.layers.{layer_idx}"
+        return {
+            "input_layernorm": self._load_bf16(f"{prefix}.input_layernorm.weight", device),
+            "post_attention_layernorm": self._load_bf16(f"{prefix}.post_attention_layernorm.weight", device),
+        }
+
+    def load_moe_gate(self, layer_idx: int, device: torch.device):
+        prefix = f"{self.cfg.layers_prefix}.layers.{layer_idx}.mlp"
+        name = f"{prefix}.gate.weight"
+        result = {"gate": self._load_bf16(name, device)}
+        # Optional bias
+        bias_name = f"{prefix}.gate.bias"
+        if self._has_tensor(bias_name):
+            result["gate_bias"] = self._load_bf16(bias_name, device)
+        # Optional e_score_correction_bias (DeepSeek V3)
+        corr_name = f"{prefix}.gate.e_score_correction_bias"
+        if self._has_tensor(corr_name):
+            result["e_score_correction_bias"] = self._load_bf16(corr_name, device)
+        return result
+
+    def load_shared_expert(self, layer_idx: int, device: torch.device):
+        prefix = f"{self.cfg.layers_prefix}.layers.{layer_idx}.mlp.shared_experts"
+        quant = self.quant_cfg.shared_expert
+        result = {}
+        for proj in ["gate_proj", "up_proj", "down_proj"]:
+            name = f"{prefix}.{proj}.weight"
+            if not self._has_tensor(name):
+                return None
+            if quant == "int8":
+                result[proj] = self._load_and_quantize(name, device)
+            else:
+                result[proj] = self._load_bf16(name, device)
+
+        # Optional shared expert gate
+        gate_name = f"{self.cfg.layers_prefix}.layers.{layer_idx}.mlp.shared_expert_gate.weight"
+        if self._has_tensor(gate_name):
+            result["shared_expert_gate"] = self._load_bf16(gate_name, device)
+        return result
+
+    def load_dense_mlp(self, layer_idx: int, device: torch.device):
+        prefix = f"{self.cfg.layers_prefix}.layers.{layer_idx}.mlp"
+        quant = self.quant_cfg.dense_mlp
+        result = {}
+        for proj in ["gate_proj", "up_proj", "down_proj"]:
+            name = f"{prefix}.{proj}.weight"
+            if quant == "int8":
+                result[proj] = self._load_and_quantize(name, device)
+            else:
+                result[proj] = self._load_bf16(name, device)
+        return result
+
+    def load_linear_attention_weights(self, layer_idx: int, device: torch.device):
+        """Load linear attention weights (DeltaNet/GDN) from GGUF.
+
+        GGUF naming for linear attention isn't standardized in llama.cpp.
+        Try common naming patterns; return None if not found (fall back to safetensors).
+        """
+        # Linear attention tensors aren't in standard llama.cpp GGUF
+        # This is a Qwen3.5-specific extension — may not be in the GGUF at all
+        prefix = f"blk.{layer_idx}"
+        # Check if any LA tensor exists
+        la_names = [f"{prefix}.ssm_in.weight", f"{prefix}.la_in_proj.weight"]
+        if not any(n in self._tensor_names for n in la_names):
+            return None  # Not in GGUF — caller should fall back
+        # TODO: implement full LA weight loading from GGUF when naming is standardized
+        logger.warning("Linear attention GGUF loading not yet implemented for layer %d", layer_idx)
+        return None
+
+    def load_layer(self, layer_idx: int, device: torch.device,
+                    attn_device: torch.device = None) -> dict:
+        """Load all weights for a single layer."""
+        start = time.perf_counter()
+        layer_type = self.cfg.layer_type(layer_idx)
+        is_moe = self.cfg.is_moe_layer(layer_idx)
+
+        result = {"layer_type": layer_type, "is_moe": is_moe}
+
+        if layer_type == "linear_attention":
+            la = self.load_linear_attention_weights(layer_idx, device)
+            if la is None:
+                return None  # Signal to caller: use safetensors fallback for this layer
+            result["linear_attention"] = la
+        else:
+            on_cpu = attn_device is not None and str(attn_device) == "cpu"
+            if not on_cpu:
+                on_cpu = (self.quant_cfg.attention == "awq")
+            result["attention"] = self.load_attention_weights(layer_idx, device, on_cpu=on_cpu)
+
+        result["norms"] = self.load_layer_norms(layer_idx, device)
+
+        if is_moe:
+            result["moe_gate"] = self.load_moe_gate(layer_idx, device)
+            se = self.load_shared_expert(layer_idx, device)
+            if se:
+                result["shared_expert"] = se
+        elif layer_type != "linear_attention":
+            result["dense_mlp"] = self.load_dense_mlp(layer_idx, device)
+
+        elapsed = time.perf_counter() - start
+        alloc_mb = torch.cuda.memory_allocated(device) / (1024**2)
+        logger.info("Layer %d loaded from GGUF in %.1fs (GPU alloc: %.0f MB, moe=%s, type=%s)",
+                     layer_idx, elapsed, alloc_mb, is_moe, layer_type)
+        return result
+
+    def close(self):
+        pass

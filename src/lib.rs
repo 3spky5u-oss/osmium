@@ -26,5 +26,7 @@ fn krasis(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<vram_monitor::VramMonitor>()?;
     m.add_function(wrap_pyfunction!(syscheck::system_check, m)?)?;
     m.add_function(wrap_pyfunction!(decode::bench_decode_synthetic, m)?)?;
+    m.add_function(wrap_pyfunction!(gguf::gguf_list_tensors, m)?)?;
+    m.add_function(wrap_pyfunction!(gguf::gguf_read_tensor, m)?)?;
     Ok(())
 }

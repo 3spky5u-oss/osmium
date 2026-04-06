@@ -8,6 +8,7 @@ except PackageNotFoundError:
 
 try:
     from krasis.krasis import KrasisEngine, WeightStore, RustServer, system_check, bench_decode_synthetic
+    from krasis.krasis import gguf_list_tensors, gguf_read_tensor
     try:
         from krasis.krasis import GpuDecodeStore
     except ImportError:

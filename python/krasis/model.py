@@ -24,7 +24,7 @@ import torch
 from krasis.timing import TIMING
 
 from krasis.config import ModelConfig, PPRankConfig, QuantConfig, build_pp_ranks, compute_pp_partition, cache_dir_for_model
-from krasis.weight_loader import WeightLoader, int8_linear
+from krasis.weight_loader import WeightLoader, GgufWeightLoader, int8_linear
 from krasis.layer import TransformerLayer
 from krasis.kv_cache import PagedKVCache, SequenceKVState
 from krasis.sampler import sample
@@ -628,10 +628,14 @@ class KrasisModel:
         # Start RAM watchdog BEFORE loading — protects during the entire load
         self._start_ram_watchdog()
 
-        # Phase 1: GPU weights
+        # Phase 1: GPU weights (from GGUF if available, otherwise safetensors)
         print(f"\n\033[1m\033[36m▸ Loading GPU weights\033[0m", flush=True)
-        logger.info("Phase 1: Loading GPU weights (streaming INT8)...")
-        loader = WeightLoader(self.cfg, self.quant_cfg)
+        if self.gguf_path:
+            logger.info("Phase 1: Loading GPU weights from GGUF: %s", self.gguf_path)
+            loader = GgufWeightLoader(self.cfg, self.gguf_path, self.quant_cfg)
+        else:
+            logger.info("Phase 1: Loading GPU weights (streaming INT8 from safetensors)...")
+            loader = WeightLoader(self.cfg, self.quant_cfg)
         self._load_gpu_weights(loader)
         loader.close()
 
@@ -999,6 +1003,7 @@ class KrasisModel:
         # ── Load layers ──
         logger.info("Loading full base model to %s...", primary_dev)
         self.embedding = loader.load_embedding(primary_dev)
+        _sf_fallback = None  # Lazy safetensors fallback for layers GGUF can't load
 
         if self.stream_attention:
             # Incremental load: attention goes directly to CPU (never touches GPU),
@@ -1010,6 +1015,11 @@ class KrasisModel:
             _cpu = _torch.device('cpu')
             for layer_idx in range(L):
                 weights = loader.load_layer(layer_idx, primary_dev, attn_device=_cpu)
+                if weights is None and isinstance(loader, GgufWeightLoader):
+                    if _sf_fallback is None:
+                        logger.info("GGUF missing layer %d — falling back to safetensors", layer_idx)
+                        _sf_fallback = WeightLoader(self.cfg, self.quant_cfg)
+                    weights = _sf_fallback.load_layer(layer_idx, primary_dev, attn_device=_cpu)
                 layer = TransformerLayer(
                     self.cfg, layer_idx, weights, primary_dev,
                     krasis_engine=None,
@@ -1059,8 +1069,15 @@ class KrasisModel:
             # risks OOM on large models (e.g. Q235B: ~12.8 GB BF16 attention).
             awq_active = self.quant_cfg.attention == "awq"
             _attn_dev = torch.device('cpu') if awq_active else None
+            _sf_fallback = None  # Lazy safetensors fallback for layers GGUF can't load
             for layer_idx in range(L):
                 weights = loader.load_layer(layer_idx, primary_dev, attn_device=_attn_dev)
+                if weights is None and isinstance(loader, GgufWeightLoader):
+                    # GGUF doesn't have this layer (e.g. linear attention) — fall back to safetensors
+                    if _sf_fallback is None:
+                        logger.info("GGUF missing layer %d weights — falling back to safetensors", layer_idx)
+                        _sf_fallback = WeightLoader(self.cfg, self.quant_cfg)
+                    weights = _sf_fallback.load_layer(layer_idx, primary_dev, attn_device=_attn_dev)
                 layer = TransformerLayer(
                     self.cfg, layer_idx, weights, primary_dev,
                     krasis_engine=None,
@@ -1070,6 +1087,8 @@ class KrasisModel:
                 )
                 self.layers.append(layer)
 
+        if _sf_fallback is not None:
+            _sf_fallback.close()
         self.final_norm = loader.load_final_norm(primary_dev)
         self.lm_head_data = loader.load_lm_head(primary_dev)
 
