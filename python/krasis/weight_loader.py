@@ -525,22 +525,36 @@ class GgufWeightLoader:
     # HF name component → GGUF name component
     _GGUF_NAME_MAP = {
         "embed_tokens": "token_embd",
+        # Full attention (GQA layers)
         "self_attn.q_proj": "attn_q",
         "self_attn.k_proj": "attn_k",
         "self_attn.v_proj": "attn_v",
         "self_attn.o_proj": "attn_output",
         "self_attn.q_norm": "attn_q_norm",
         "self_attn.k_norm": "attn_k_norm",
+        # Norms
         "input_layernorm": "attn_norm",
-        "post_attention_layernorm": "ffn_norm",
-        "mlp.gate": "ffn_gate_inp",  # MoE router
+        "post_attention_layernorm": "post_attention_norm",
+        # MoE router + shared experts
+        "mlp.gate": "ffn_gate_inp",
         "mlp.shared_experts.gate_proj": "ffn_gate_shexp",
         "mlp.shared_experts.up_proj": "ffn_up_shexp",
         "mlp.shared_experts.down_proj": "ffn_down_shexp",
-        "mlp.shared_expert_gate": "ffn_shexp_gate",
-        "mlp.gate_proj": "ffn_gate",  # dense MLP
+        "mlp.shared_expert_gate": "ffn_gate_inp_shexp",
+        # Dense MLP
+        "mlp.gate_proj": "ffn_gate",
         "mlp.up_proj": "ffn_up",
         "mlp.down_proj": "ffn_down",
+        # Linear attention (DeltaNet/GDN) — fused QKV + SSM
+        "self_attn.qkv_proj": "attn_qkv",
+        "self_attn.gate_proj": "attn_gate",
+        "self_attn.out_proj": "ssm_out",
+        "self_attn.A_log": "ssm_a",
+        "self_attn.dt_bias": "ssm_dt",
+        "self_attn.conv1d": "ssm_conv1d",
+        "self_attn.norm": "ssm_norm",
+        "self_attn.alpha": "ssm_alpha",
+        "self_attn.beta": "ssm_beta",
     }
 
     def __init__(self, cfg: ModelConfig, gguf_path: str, quant_cfg: QuantConfig = None):
@@ -706,21 +720,13 @@ class GgufWeightLoader:
         return result
 
     def load_linear_attention_weights(self, layer_idx: int, device: torch.device):
-        """Load linear attention weights (DeltaNet/GDN) from GGUF.
+        """Load linear attention weights from GGUF.
 
-        GGUF naming for linear attention isn't standardized in llama.cpp.
-        Try common naming patterns; return None if not found (fall back to safetensors).
+        GGUF fused QKV layout may differ from the interleaved format the model
+        expects. Fall back to safetensors for now — LA layers are small and
+        getting the interleave wrong produces silent garbage.
         """
-        # Linear attention tensors aren't in standard llama.cpp GGUF
-        # This is a Qwen3.5-specific extension — may not be in the GGUF at all
-        prefix = f"blk.{layer_idx}"
-        # Check if any LA tensor exists
-        la_names = [f"{prefix}.ssm_in.weight", f"{prefix}.la_in_proj.weight"]
-        if not any(n in self._tensor_names for n in la_names):
-            return None  # Not in GGUF — caller should fall back
-        # TODO: implement full LA weight loading from GGUF when naming is standardized
-        logger.warning("Linear attention GGUF loading not yet implemented for layer %d", layer_idx)
-        return None
+        return None  # Fall back to safetensors for LA layers
 
     def load_layer(self, layer_idx: int, device: torch.device,
                     attn_device: torch.device = None) -> dict:
