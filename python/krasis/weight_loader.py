@@ -677,11 +677,11 @@ class GgufWeightLoader:
     def load_moe_gate(self, layer_idx: int, device: torch.device):
         prefix = f"{self.cfg.layers_prefix}.layers.{layer_idx}.mlp"
         name = f"{prefix}.gate.weight"
-        result = {"gate": self._load_bf16(name, device)}
+        result = {"weight": self._load_bf16(name, device)}
         # Optional bias
         bias_name = f"{prefix}.gate.bias"
         if self._has_tensor(bias_name):
-            result["gate_bias"] = self._load_bf16(bias_name, device)
+            result["bias"] = self._load_bf16(bias_name, device)
         # Optional e_score_correction_bias (DeepSeek V3)
         corr_name = f"{prefix}.gate.e_score_correction_bias"
         if self._has_tensor(corr_name):
@@ -701,10 +701,13 @@ class GgufWeightLoader:
             else:
                 result[proj] = self._load_bf16(name, device)
 
-        # Optional shared expert gate
+        # Optional shared expert gate — GGUF may store as 1D, model expects 2D [1, hidden]
         gate_name = f"{self.cfg.layers_prefix}.layers.{layer_idx}.mlp.shared_expert_gate.weight"
         if self._has_tensor(gate_name):
-            result["shared_expert_gate"] = self._load_bf16(gate_name, device)
+            g = self._load_bf16(gate_name, device)
+            if g.dim() == 1:
+                g = g.unsqueeze(0)
+            result["shared_expert_gate"] = g
         return result
 
     def load_dense_mlp(self, layer_idx: int, device: torch.device):
@@ -732,7 +735,12 @@ class GgufWeightLoader:
                     attn_device: torch.device = None) -> dict:
         """Load all weights for a single layer."""
         start = time.perf_counter()
-        layer_type = self.cfg.layer_type(layer_idx)
+        if self.cfg.is_full_attention_layer(layer_idx):
+            layer_type = "full_attention"
+        elif self.cfg.layer_types and layer_idx < len(self.cfg.layer_types):
+            layer_type = self.cfg.layer_types[layer_idx]
+        else:
+            layer_type = "full_attention"
         is_moe = self.cfg.is_moe_layer(layer_idx)
 
         result = {"layer_type": layer_type, "is_moe": is_moe}
@@ -751,10 +759,11 @@ class GgufWeightLoader:
         result["norms"] = self.load_layer_norms(layer_idx, device)
 
         if is_moe:
-            result["moe_gate"] = self.load_moe_gate(layer_idx, device)
-            se = self.load_shared_expert(layer_idx, device)
-            if se:
-                result["shared_expert"] = se
+            result["gate"] = self.load_moe_gate(layer_idx, device)
+            if self.cfg.n_shared_experts > 0:
+                se = self.load_shared_expert(layer_idx, device)
+                if se:
+                    result["shared_expert"] = se
         elif layer_type != "linear_attention":
             result["dense_mlp"] = self.load_dense_mlp(layer_idx, device)
 
