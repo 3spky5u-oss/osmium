@@ -564,30 +564,40 @@ pub struct FlaKernels {
     pub output: FlaOutputFn,
 }
 
-// FLA kernel function pointer types (matching extern "C" signatures in fla_vendor.cu)
+// FLA kernel function pointer types (matching extern "C" signatures in fla_vendor.cu).
+// The Triton cross-compiler keeps cu_seqlens/chunk_indices as runtime args even when
+// IS_VARLEN=False — we pass 0 (null) for them.  Similarly scale, g_gamma, gk are
+// runtime args that we supply with the correct values.
 type FlaInitFn = unsafe extern "C" fn() -> i32;
 type FlaScalarKernelFn = unsafe extern "C" fn(
-    /*s*/ u64, /*o*/ u64, /*T*/ i32,
+    /*s*/ u64, /*o*/ u64, /*scale*/ f32,
+    /*cu_seqlens*/ u64, /*chunk_indices*/ u64, /*T*/ i32,
     /*grid_x*/ u32, /*grid_y*/ u32, /*grid_z*/ u32, /*stream*/ *mut std::ffi::c_void,
 ) -> u32;
 type FlaKktKernelFn = unsafe extern "C" fn(
-    /*k*/ u64, /*g*/ u64, /*beta*/ u64, /*A*/ u64, /*T*/ i32,
+    /*k*/ u64, /*g*/ u64, /*beta*/ u64, /*A*/ u64,
+    /*cu_seqlens*/ u64, /*chunk_indices*/ u64, /*T*/ i32,
     /*grid_x*/ u32, /*grid_y*/ u32, /*grid_z*/ u32, /*stream*/ *mut std::ffi::c_void,
 ) -> u32;
 type FlaSolveTrilFn = unsafe extern "C" fn(
-    /*A*/ u64, /*Ai*/ u64, /*T*/ i32,
+    /*A*/ u64, /*Ai*/ u64,
+    /*cu_seqlens*/ u64, /*chunk_indices*/ u64, /*T*/ i32,
     /*grid_x*/ u32, /*grid_y*/ u32, /*grid_z*/ u32, /*stream*/ *mut std::ffi::c_void,
 ) -> u32;
 type FlaWyReprFn = unsafe extern "C" fn(
-    /*k*/ u64, /*v*/ u64, /*beta*/ u64, /*w*/ u64, /*u*/ u64, /*A*/ u64, /*g*/ u64, /*T*/ i32,
+    /*k*/ u64, /*v*/ u64, /*beta*/ u64, /*w*/ u64, /*u*/ u64, /*A*/ u64, /*g*/ u64,
+    /*cu_seqlens*/ u64, /*chunk_indices*/ u64, /*T*/ i32,
     /*grid_x*/ u32, /*grid_y*/ u32, /*grid_z*/ u32, /*stream*/ *mut std::ffi::c_void,
 ) -> u32;
 type FlaStateRecurrenceFn = unsafe extern "C" fn(
-    /*k*/ u64, /*v*/ u64, /*w*/ u64, /*v_new*/ u64, /*g*/ u64, /*h*/ u64, /*h0*/ u64, /*ht*/ u64, /*T*/ i32,
+    /*k*/ u64, /*v*/ u64, /*w*/ u64, /*v_new*/ u64, /*g*/ u64, /*gk*/ u64,
+    /*h*/ u64, /*h0*/ u64, /*ht*/ u64,
+    /*cu_seqlens*/ u64, /*chunk_offsets*/ u64, /*T*/ i32,
     /*grid_x*/ u32, /*grid_y*/ u32, /*grid_z*/ u32, /*stream*/ *mut std::ffi::c_void,
 ) -> u32;
 type FlaOutputFn = unsafe extern "C" fn(
-    /*q*/ u64, /*k*/ u64, /*v*/ u64, /*h*/ u64, /*g*/ u64, /*o*/ u64, /*scale*/ f32, /*T*/ i32,
+    /*q*/ u64, /*k*/ u64, /*v*/ u64, /*h*/ u64, /*g*/ u64, /*g_gamma*/ u64,
+    /*o*/ u64, /*cu_seqlens*/ u64, /*chunk_indices*/ u64, /*scale*/ f32, /*T*/ i32,
     /*grid_x*/ u32, /*grid_y*/ u32, /*grid_z*/ u32, /*stream*/ *mut std::ffi::c_void,
 ) -> u32;
 
@@ -3827,7 +3837,8 @@ impl PrefillEngine {
                 // Step 1: cumsum — gate(BF16) → g_cumsum(FP32)
                 // Grid: (NT, B*H) = (fla_nt, nv)
                 let rc = unsafe {
-                    (fla.cumsum)(fla_gate_bf16, g_cum_fla, t_arg,
+                    (fla.cumsum)(fla_gate_bf16, g_cum_fla, 1.0f32,
+                        0, 0, t_arg,
                         fla_nt as u32, nv as u32, 1, stream_ptr)
                 };
                 if rc != 0 { return Err(format!("FLA cumsum failed: {}", rc)); }
@@ -3835,7 +3846,8 @@ impl PrefillEngine {
                 // Step 2: kkt — k, g_cumsum, beta → A
                 // Grid: (NT, B*H) = (fla_nt, nv)
                 let rc = unsafe {
-                    (fla.kkt)(fla_k_bf16, g_cum_fla, fla_beta_bf16, a_fla, t_arg,
+                    (fla.kkt)(fla_k_bf16, g_cum_fla, fla_beta_bf16, a_fla,
+                        0, 0, t_arg,
                         fla_nt as u32, nv as u32, 1, stream_ptr)
                 };
                 if rc != 0 { return Err(format!("FLA kkt failed: {}", rc)); }
@@ -3843,7 +3855,8 @@ impl PrefillEngine {
                 // Step 3: solve_tril — A → Ai
                 // Grid: (NT, B*H) = (fla_nt, nv)
                 let rc = unsafe {
-                    (fla.solve_tril)(a_fla, ai_fla, t_arg,
+                    (fla.solve_tril)(a_fla, ai_fla,
+                        0, 0, t_arg,
                         fla_nt as u32, nv as u32, 1, stream_ptr)
                 };
                 if rc != 0 { return Err(format!("FLA solve_tril failed: {}", rc)); }
@@ -3852,7 +3865,8 @@ impl PrefillEngine {
                 // Grid: (NT, B*H) = (fla_nt, nv)
                 // Note: after step 3, A (la_conv_out) is dead, so u can reuse that space
                 let rc = unsafe {
-                    (fla.wy_repr)(fla_k_bf16, fla_v_bf16, fla_beta_bf16, w_fla, u_fla, ai_fla, g_cum_fla, t_arg,
+                    (fla.wy_repr)(fla_k_bf16, fla_v_bf16, fla_beta_bf16, w_fla, u_fla, ai_fla, g_cum_fla,
+                        0, 0, t_arg,
                         fla_nt as u32, nv as u32, 1, stream_ptr)
                 };
                 if rc != 0 { return Err(format!("FLA wy_repr failed: {}", rc)); }
@@ -3870,9 +3884,11 @@ impl PrefillEngine {
                         w_fla,      // w (kernel param) = Python's w (BF16)
                         v_new_fla,  // v_new output (BF16)
                         g_cum_fla,   // g (cumsum gate, FP32)
+                        0,          // gk (unused — USE_GK=False constexpr)
                         h_fla,      // h output (BF16, per-chunk states)
                         h0_fla,     // h0 (BF16, zeroed initial state)
                         ht_fla,     // ht (FP32, final state output)
+                        0, 0,       // cu_seqlens, chunk_offsets (IS_VARLEN=False)
                         t_arg,
                         sr_grid_x, nv as u32, 1, stream_ptr)
                 };
@@ -3894,7 +3910,9 @@ impl PrefillEngine {
                         v_new_fla,  // v (kernel param) = v_new from step 5
                         h_fla,      // h (per-chunk states from step 5)
                         g_cum_fla,   // g (cumsum gate, FP32)
+                        0,          // g_gamma (unused — USE_G_GAMMA=False constexpr)
                         o_fla,      // o (output, BF16)
+                        0, 0,       // cu_seqlens, chunk_indices (IS_VARLEN=False)
                         1.0f32,     // scale=1.0 since q is already pre-scaled
                         t_arg,
                         o_grid_x, fla_nt as u32, nv as u32, stream_ptr)

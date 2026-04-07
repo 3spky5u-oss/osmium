@@ -75,11 +75,13 @@ KERNEL_SPECS = [
             "scale": "fp32", "T": "i32",
         },
         "constexprs": {
-            "K": 128, "V": 128, "BT": 64, "BK": 64, "BV": 64,
+            "K": 128, "V": 128, "BT": 64, "BK": 128, "BV": 128,
             "USE_G": True, "USE_G_GAMMA": False,
             "TRANSPOSE_STATE": False, "IS_VARLEN": False,
         },
-        "options": {"num_warps": 4, "num_stages": 3},
+        # Autotuner config 1: BK=128, BV=128, num_warps=8
+        # Rust grid uses o_bv=128, so BV must match.
+        "options": {"num_warps": 8, "num_stages": 3},
         "h_dependent": True,
     },
     {
@@ -94,12 +96,14 @@ KERNEL_SPECS = [
             "T": "i32",
         },
         "constexprs": {
-            "K": 128, "V": 128, "BT": 64, "BV": 64,
+            "K": 128, "V": 128, "BT": 64, "BV": 32,
             "USE_G": True, "USE_GK": False,
             "USE_INITIAL_STATE": True, "STORE_FINAL_STATE": True,
             "SAVE_NEW_VALUE": True, "USE_EXP2": True,
             "TRANSPOSE_STATE": False, "IS_VARLEN": False,
         },
+        # Autotuner config 1: BV=32, num_warps=2
+        # Rust grid uses sr_grid_x = ceil(dv/32), so BV must be 32.
         "options": {"num_warps": 2, "num_stages": 2},
         "h_dependent": True,
     },
