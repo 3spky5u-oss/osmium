@@ -399,7 +399,7 @@ do_build() {
     mkdir -p "$WHEEL_DIR"
     rm -f "$WHEEL_DIR"/krasis-*.whl
     PATH="$HOME/.cargo/bin:$(dirname "$PYTHON"):$PATH" \
-        "$MATURIN" build --release --out "$WHEEL_DIR" 2>&1
+        "$MATURIN" build --release --skip-auditwheel --out "$WHEEL_DIR" 2>&1
     local wheel
     wheel=$(ls -t "$WHEEL_DIR"/krasis-*.whl 2>/dev/null | head -1)
     [[ -n "$wheel" ]] || err "Build succeeded but no wheel was produced in $WHEEL_DIR"

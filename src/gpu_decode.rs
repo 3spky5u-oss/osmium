@@ -8536,11 +8536,20 @@ impl GpuDecodeStore {
         let w13_n = 2 * intermediate;
         let w13_k_tiles = hs / 16;
         let w13_max_ksplits = w13_k_tiles / 16;
+        let w13_n_tiles = (w13_n + 15) / 16;
+        // Single-expert ksplits (shared expert path, no z-dim batching)
         let w13_ksplits = if w13_max_ksplits > 1 {
-            let n_tiles = (w13_n + 15) / 16;
             let target = graph.num_sms * 4;
-            let desired = (target + n_tiles - 1) / n_tiles;
-            desired.clamp(1, w13_max_ksplits.min(8))
+            ((target + w13_n_tiles - 1) / w13_n_tiles).clamp(1, w13_max_ksplits.min(8))
+        } else { 1 };
+        // Batched expert ksplits: topk in z-dim provides block parallelism (min 4)
+        let w13_ksplits_batched = if w13_max_ksplits > 1 {
+            let batch_z = graph.max_experts_per_tok.max(1);
+            let target = graph.num_sms * 4;
+            let effective = w13_n_tiles * batch_z;
+            if effective >= target { 4 } else {
+                ((target + effective - 1) / effective).clamp(4, w13_max_ksplits.min(8))
+            }
         } else { 1 };
         let use_v2_w13 = w13_ksplits > 1;
         let partial_ptr = *graph.d_v2_partial.device_ptr();
@@ -8581,7 +8590,7 @@ impl GpuDecodeStore {
                                 *graph.d_hidden.device_ptr(),
                                 *graph.d_batch_partials.device_ptr(),
                                 inv_wp, inv_sp,
-                                hs as i32, w13_n as i32, gs as i32, w13_ksplits as i32,
+                                hs as i32, w13_n as i32, gs as i32, w13_ksplits_batched as i32,
                                 d_wts,
                             ),
                         ).map_err(|e| format!("batched w13 v2[{}]: {:?}", layer_idx, e))?;
@@ -8598,7 +8607,7 @@ impl GpuDecodeStore {
                             (
                                 *graph.d_batch_gate_ups.device_ptr(),
                                 *graph.d_batch_partials.device_ptr(),
-                                w13_n as i32, w13_ksplits as i32,
+                                w13_n as i32, w13_ksplits_batched as i32,
                                 d_wts,
                             ),
                         ).map_err(|e| format!("batched reduce[{}]: {:?}", layer_idx, e))?;
@@ -17040,17 +17049,25 @@ impl GpuDecodeStore {
         let w13_n = if gated { 2 * intermediate } else { intermediate };
         let w13_k_tiles = expert_hs / 16;
         let w13_max_ksplits = w13_k_tiles / 16;
+        let w13_n_tiles = (w13_n + 15) / 16;
+        // Single-expert ksplits (cold expert paths, no z-dim batching)
         let w13_ksplits = if w13_max_ksplits > 1 {
-            let n_tiles = (w13_n + 15) / 16;
             let target = graph.num_sms * 4;
-            let desired = (target + n_tiles - 1) / n_tiles;
-            desired.clamp(1, w13_max_ksplits.min(8))
+            ((target + w13_n_tiles - 1) / w13_n_tiles).clamp(1, w13_max_ksplits.min(8))
         } else {
             1
         };
+        // Batched expert ksplits: topk in z-dim provides block parallelism (min 4)
+        let w13_ksplits_batched = if w13_max_ksplits > 1 {
+            let batch_z = topk.max(1);
+            let target = graph.num_sms * 4;
+            let effective = w13_n_tiles * batch_z;
+            if effective >= target { 4 } else {
+                ((target + effective - 1) / effective).clamp(4, w13_max_ksplits.min(8))
+            }
+        } else { 1 };
         let use_v2_w13 = w13_ksplits > 1;
         let partial_ptr = *graph.d_v2_partial.device_ptr();
-
         #[cfg(feature = "gpu-debug")]
         let t_start = Instant::now();
 
@@ -17684,7 +17701,7 @@ impl GpuDecodeStore {
                         expert_input_ptr,
                         *graph.d_batch_partials.device_ptr(),
                         inv_wp, inv_sp,
-                        expert_hs as i32, w13_n as i32, gs as i32, w13_ksplits as i32,
+                        expert_hs as i32, w13_n as i32, gs as i32, w13_ksplits_batched as i32,
                         d_wts,
                     ),
                 ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
@@ -17702,7 +17719,7 @@ impl GpuDecodeStore {
                     (
                         *graph.d_batch_gate_ups.device_ptr(),
                         *graph.d_batch_partials.device_ptr(),
-                        w13_n as i32, w13_ksplits as i32,
+                        w13_n as i32, w13_ksplits_batched as i32,
                         d_wts,
                     ),
                 ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
