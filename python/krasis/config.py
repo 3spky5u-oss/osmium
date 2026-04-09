@@ -292,7 +292,7 @@ class ModelConfig:
     routed_scaling_factor: float = 1.0
     scoring_func: str = "softmax"         # "sigmoid" or "softmax"
     topk_method: str = "greedy"           # "noaux_tc"
-    norm_topk_prob: bool = False
+    norm_topk_prob: bool = True
 
     # Norm / activation
     rms_norm_eps: float = 1e-6
@@ -495,7 +495,7 @@ class ModelConfig:
             scoring_func=cfg.get("scoring_func",
                                  "sigmoid" if arch == "nemotron_h" else "softmax"),
             topk_method=cfg.get("topk_method", "greedy"),
-            norm_topk_prob=cfg.get("norm_topk_prob", False),
+            norm_topk_prob=cfg.get("norm_topk_prob", True),
             rms_norm_eps=cfg.get("rms_norm_eps", cfg.get("norm_eps", cfg.get("layer_norm_epsilon", 1e-6))),
             hidden_act=cfg.get("hidden_act", "silu"),
             rope_theta=rope_theta,
