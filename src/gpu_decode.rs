@@ -1751,8 +1751,6 @@ struct GpuDecodeGraph {
     dma_call_count: u64,     // number of cuMemcpyHtoDAsync calls
     dma_cold_experts: u64,   // number of cold (DMA'd) experts
     dma_hcs_experts: u64,    // number of HCS-hit experts
-    /// Layer diagnostic: tracks whether first-step dump has been done
-    layer_diag_done: bool,
     validation_decode_steps: u64,
     validation_per_layer_steps: u64,
     validation_ungraphed_steps: u64,
@@ -2693,7 +2691,6 @@ impl GpuDecodeStore {
             dma_call_count: 0,
             dma_cold_experts: 0,
             dma_hcs_experts: 0,
-            layer_diag_done: false,
             validation_decode_steps: 0,
             validation_per_layer_steps: 0,
             validation_ungraphed_steps: 0,
@@ -9601,8 +9598,6 @@ impl GpuDecodeStore {
                             }
                         } else {
                             let norm_flag = if moe.norm_topk_prob { 1i32 } else { 0i32 };
-                            eprintln!("[NORM_DIAG] softmax_topk capture: layer={} ne={} topk={} norm_topk_prob={} (flag={})",
-                                layer_idx, ne, topk, moe.norm_topk_prob, norm_flag);
                             unsafe {
                                 k.softmax_topk.clone().launch(cfg, (
                                     logits_ptr, topk_ids_dptr, topk_wts_dptr,
@@ -9681,28 +9676,6 @@ impl GpuDecodeStore {
                             eps, hs as i32, 0i32,
                         ),
                     ).map_err(|e| format!("final_norm: {:?}", e))?;
-                }
-            }
-
-            // Diagnostic: dump hidden state stats before LM head
-            if std::env::var("KRASIS_LOGIT_DIAG").is_ok() {
-                static HS_DIAG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                let hs_step = HS_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if hs_step < 3 {
-                    let mut h_buf = vec![0u16; hs];
-                    unsafe {
-                        cuda_sys::lib().cuMemcpyDtoH_v2(
-                            h_buf.as_mut_ptr() as *mut std::ffi::c_void,
-                            *graph.d_hidden.device_ptr(),
-                            hs * 2);
-                    }
-                    let vals: Vec<f32> = h_buf.iter().map(|&x| half::bf16::from_bits(x).to_f32()).collect();
-                    let max_v = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    let min_v = vals.iter().cloned().fold(f32::INFINITY, f32::min);
-                    let mean: f32 = vals.iter().sum::<f32>() / vals.len() as f32;
-                    let l2: f32 = vals.iter().map(|x| x * x).sum::<f32>().sqrt();
-                    eprintln!("[HIDDEN_DIAG] step={}: L2={:.3} max={:.3} min={:.3} mean={:.4} dim={}",
-                        hs_step, l2, max_v, min_v, mean, hs);
                 }
             }
 
@@ -10255,26 +10228,6 @@ impl GpuDecodeStore {
                 }
             }
 
-            // Diagnostic: dump logits distribution for first 3 steps
-            if std::env::var("KRASIS_LOGIT_DIAG").is_ok() {
-                static DIAG_STEP2: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                let step = DIAG_STEP2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if step < 3 {
-                    let logits = &graph.h_logits[..graph.vocab_size];
-                    let mut sorted: Vec<(usize, f32)> = logits.iter().enumerate()
-                        .map(|(i, &v)| (i, v)).collect();
-                    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                    let max_l = sorted[0].1;
-                    let mean: f32 = logits.iter().sum::<f32>() / logits.len() as f32;
-                    let var: f32 = logits.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / logits.len() as f32;
-                    let n_above = logits.iter().filter(|&&x| x > max_l - 5.0).count();
-                    eprintln!("[LOGIT_DIAG] step={}: max={:.3}(tok={}) mean={:.3} std={:.3} within5={} | top5: {}({:.2}) {}({:.2}) {}({:.2}) {}({:.2}) {}({:.2})",
-                        step, max_l, sorted[0].0, mean, var.sqrt(), n_above,
-                        sorted[0].0, sorted[0].1, sorted[1].0, sorted[1].1,
-                        sorted[2].0, sorted[2].1, sorted[3].0, sorted[3].1,
-                        sorted[4].0, sorted[4].1);
-                }
-            }
         }
 
         Ok(())
@@ -10363,24 +10316,6 @@ impl GpuDecodeStore {
 
         // Decode NaN diagnostic: check d_hidden for NaN after each component
         let decode_nan_diag = std::env::var("KRASIS_DECODE_DIAG").map(|v| v == "1").unwrap_or(false);
-        // Per-layer diagnostic: dump ALL layer norms on first decode step to localize corruption
-        let layer_diag_active = !graph.layer_diag_done
-            && std::env::var("KRASIS_LAYER_DIAG").map(|v| v == "1").unwrap_or(false);
-        // Hidden state norm diagnostic: dump L2 norm at checkpoints
-        let dump_hidden_norm = |label: &str, ptr: u64, n: usize, device: &std::sync::Arc<cudarc::driver::CudaDevice>| {
-            if !decode_nan_diag { return; }
-            let _ = device.synchronize();
-            let mut buf = vec![0u16; n];
-            unsafe {
-                let _ = cuda_sys::lib().cuMemcpyDtoH_v2(
-                    buf.as_mut_ptr() as *mut std::ffi::c_void, ptr, n * 2);
-            }
-            let vals: Vec<f32> = buf.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
-            let norm: f32 = vals.iter().map(|x| x * x).sum::<f32>().sqrt();
-            let has_nan = vals.iter().any(|x| x.is_nan());
-            eprintln!("[DECODE-NORM] {} norm={:.4} nan={} first4=[{:.6},{:.6},{:.6},{:.6}]",
-                label, norm, has_nan, vals[0], vals[1], vals[2], vals[3]);
-        };
         let check_nan_bf16 = |label: &str, ptr: u64, n: usize, device: &std::sync::Arc<cudarc::driver::CudaDevice>| {
             if !decode_nan_diag { return; }
             let _ = device.synchronize();
@@ -10453,22 +10388,6 @@ impl GpuDecodeStore {
                 debug_peek_bf16("after_embedding d_hidden", *graph.d_hidden.device_ptr(), 4);
             }
             check_nan_bf16("after_embedding", *graph.d_hidden.device_ptr(), hs, &self.device);
-            dump_hidden_norm("after_embedding d_hidden", *graph.d_hidden.device_ptr(), hs, &self.device);
-
-            // Per-layer diagnostic: embedding output
-            if layer_diag_active {
-                let _ = self.device.synchronize();
-                let mut buf = vec![0u16; hs];
-                unsafe {
-                    let _ = cuda_sys::lib().cuMemcpyDtoH_v2(
-                        buf.as_mut_ptr() as *mut std::ffi::c_void,
-                        *graph.d_hidden.device_ptr(), hs * 2);
-                }
-                let vals: Vec<f32> = buf.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
-                let norm: f32 = vals.iter().map(|x| x * x).sum::<f32>().sqrt();
-                eprintln!("[LAYER-DIAG] EMB   pos={} token={} hidden_norm={:.2} first4=[{:.6},{:.6},{:.6},{:.6}]",
-                    position, token_id, norm, vals[0], vals[1], vals[2], vals[3]);
-            }
         }
 
         // first_residual: true only when embedding was done (layer 0 initializes residual stream)
@@ -10485,13 +10404,6 @@ impl GpuDecodeStore {
 
         // ── 2. Layer loop (respects multi-GPU segment bounds) ──
         for layer_idx in seg_start..seg_end.min(num_layers) {
-            // Capture layer type string before any mutable borrows
-            let layer_type_str: &str = match &graph.layers[layer_idx].attn {
-                GpuAttnConfig::LinearAttention { .. } => "LA",
-                GpuAttnConfig::GQA { .. } => "GQA",
-                GpuAttnConfig::MLA { .. } => "MLA",
-                GpuAttnConfig::Mamba2 { .. } => "Mamba2",
-            };
             let layer = &graph.layers[layer_idx];
 
             // ── Pre-attention norm (fused residual add + RMSNorm) ──
@@ -11551,24 +11463,6 @@ impl GpuDecodeStore {
             }
 
             check_nan_bf16(&format!("L{} post_attn", layer_idx), *graph.d_hidden.device_ptr(), hs, &self.device);
-            if layer_idx < 4 {
-                dump_hidden_norm(&format!("L{:02} d_hidden post-attn", layer_idx), *graph.d_hidden.device_ptr(), hs, &self.device);
-            }
-
-            // Per-layer diagnostic: post-attention hidden norm (before MoE)
-            if layer_diag_active {
-                let _ = self.device.synchronize();
-                let mut buf = vec![0u16; hs];
-                unsafe {
-                    let _ = cuda_sys::lib().cuMemcpyDtoH_v2(
-                        buf.as_mut_ptr() as *mut std::ffi::c_void,
-                        *graph.d_hidden.device_ptr(), hs * 2);
-                }
-                let vals: Vec<f32> = buf.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
-                let norm: f32 = vals.iter().map(|x| x * x).sum::<f32>().sqrt();
-                eprintln!("[LAYER-DIAG] L{:02} {:6} post-attn  norm={:.2} first4=[{:.6},{:.6},{:.6},{:.6}]",
-                    layer_idx, layer_type_str, norm, vals[0], vals[1], vals[2], vals[3]);
-            }
 
             // ── Post-attention norm (fused residual add + RMSNorm) ──
             // Nemotron layers: post_attn_norm_size==0 means skip (single-sublayer blocks).
@@ -11735,40 +11629,6 @@ impl GpuDecodeStore {
                 }
             }
 
-            // Decode norm diagnostic: hidden + residual after each layer
-            if layer_idx < 4 || layer_idx % 10 == 9 || layer_idx == num_layers - 1 {
-                dump_hidden_norm(&format!("L{:02} d_hidden post-layer", layer_idx), *graph.d_hidden.device_ptr(), hs, &self.device);
-                dump_hidden_norm(&format!("L{:02} d_residual post-layer", layer_idx), *graph.d_residual.device_ptr(), hs, &self.device);
-            }
-
-            // Per-layer diagnostic: dump norm for EVERY layer on first decode step
-            if layer_diag_active {
-                let _ = self.device.synchronize();
-                let mut buf = vec![0u16; hs];
-                unsafe {
-                    let _ = cuda_sys::lib().cuMemcpyDtoH_v2(
-                        buf.as_mut_ptr() as *mut std::ffi::c_void,
-                        *graph.d_hidden.device_ptr(), hs * 2);
-                }
-                let vals: Vec<f32> = buf.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
-                let norm: f32 = vals.iter().map(|x| x * x).sum::<f32>().sqrt();
-                let has_nan = vals.iter().any(|x| x.is_nan());
-                let max_val = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let min_val = vals.iter().cloned().fold(f32::INFINITY, f32::min);
-                // Also read residual norm
-                let mut rbuf = vec![0u16; hs];
-                unsafe {
-                    let _ = cuda_sys::lib().cuMemcpyDtoH_v2(
-                        rbuf.as_mut_ptr() as *mut std::ffi::c_void,
-                        *graph.d_residual.device_ptr(), hs * 2);
-                }
-                let rvals: Vec<f32> = rbuf.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
-                let rnorm: f32 = rvals.iter().map(|x| x * x).sum::<f32>().sqrt();
-                eprintln!("[LAYER-DIAG] L{:02} {:6} pos={} hidden_norm={:.2} res_norm={:.2} nan={} range=[{:.4},{:.4}] first4=[{:.6},{:.6},{:.6},{:.6}]",
-                    layer_idx, layer_type_str, position, norm, rnorm, has_nan, min_val, max_val,
-                    vals[0], vals[1], vals[2], vals[3]);
-            }
-
             #[cfg(feature = "gpu-debug")]
             {
                 if self.debug_capture_layers {
@@ -11794,12 +11654,6 @@ impl GpuDecodeStore {
             }
         }
 
-        // Mark layer diagnostic as done after first decode step
-        if layer_diag_active {
-            graph.layer_diag_done = true;
-            eprintln!("[LAYER-DIAG] === First decode step complete (pos={}) ===", position);
-        }
-
         // ── 3. Final norm (skip if this segment doesn't produce logits) ──
         if seg_skip_final {
             // Segment ends here — hidden+residual ready for download to next GPU.
@@ -11823,8 +11677,6 @@ impl GpuDecodeStore {
             Instant::now()
         } else { Instant::now() };
 
-        dump_hidden_norm("before_final_norm d_hidden", *graph.d_hidden.device_ptr(), hs, &self.device);
-        dump_hidden_norm("before_final_norm d_residual", *graph.d_residual.device_ptr(), hs, &self.device);
         #[cfg(feature = "gpu-debug")]
         {
             self.device.synchronize().map_err(|e| format!("sync after all layers: {:?}", e))?;
@@ -11850,7 +11702,6 @@ impl GpuDecodeStore {
             }
         }
 
-        dump_hidden_norm("after_final_norm d_hidden", *graph.d_hidden.device_ptr(), hs, &self.device);
         // ── 4. LM head GEMV → logits ──
         {
             let lm_w = &graph.weights[graph.lm_head_wid];
@@ -11900,31 +11751,6 @@ impl GpuDecodeStore {
                 top3[0].0, top3[0].1, top3[1].0, top3[1].1, top3[2].0, top3[2].1);
         }
 
-        // Diagnostic: dump logits distribution for first 3 decode steps
-        if std::env::var("KRASIS_LOGIT_DIAG").is_ok() {
-            static DIAG_STEP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            let step = DIAG_STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if step < 3 {
-                let logits = &graph.h_logits[..graph.vocab_size];
-                let mut sorted: Vec<(usize, f32)> = logits.iter().enumerate()
-                    .map(|(i, &v)| (i, v)).collect();
-                sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                let max_logit = sorted[0].1;
-                let min_logit = sorted.last().unwrap().1;
-                let mean: f32 = logits.iter().sum::<f32>() / logits.len() as f32;
-                let var: f32 = logits.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / logits.len() as f32;
-                log::warn!("LOGIT_DIAG step={}: max={:.3} min={:.3} mean={:.3} std={:.3}",
-                    step, max_logit, min_logit, mean, var.sqrt());
-                log::warn!("  top5: {} ({:.3}), {} ({:.3}), {} ({:.3}), {} ({:.3}), {} ({:.3})",
-                    sorted[0].0, sorted[0].1, sorted[1].0, sorted[1].1,
-                    sorted[2].0, sorted[2].1, sorted[3].0, sorted[3].1,
-                    sorted[4].0, sorted[4].1);
-                // Check: how many logits are very similar (flat distribution?)
-                let threshold = max_logit - 5.0;
-                let n_above = logits.iter().filter(|&&x| x > threshold).count();
-                log::warn!("  tokens within 5 of max: {}", n_above);
-            }
-        }
 
         Ok(())
     }
