@@ -8990,8 +8990,24 @@ impl GpuDecodeStore {
                                 *graph.d_gqa_v.device_ptr())?;
                         }
 
-                        // Split gated Q
+                        // Split gated Q: extract Q and gate from interleaved projection.
+                        // SAFETY: uses d_gqa_out as temp source instead of aliasing d_gqa_q
+                        // as both input and output. With head_dim>128, split_gated_q spans
+                        // multiple CUDA blocks and cross-block read/write aliasing has no
+                        // ordering guarantee, corrupting the gate values.
                         if *gated {
+                            // Copy the gated QKV output to d_gqa_out so split reads from
+                            // a different buffer than it writes Q to (d_gqa_q).
+                            let gated_q_size = nh * hd * 2; // Q + gate interleaved
+                            unsafe {
+                                let err = cuda_sys::lib().cuMemcpyDtoDAsync_v2(
+                                    *graph.d_gqa_out.device_ptr(),
+                                    *graph.d_gqa_q.device_ptr(),
+                                    gated_q_size * 4, cu_stream);
+                                if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                    return Err(format!("D2D gated_q copy[{}]: {:?}", layer_idx, err));
+                                }
+                            }
                             let total = (nh * hd) as u32;
                             let threads = 256u32;
                             let blocks = (total + threads - 1) / threads;
@@ -8999,9 +9015,9 @@ impl GpuDecodeStore {
                                 k.split_gated_q.clone().launch(
                                     LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
                                     (
-                                        *graph.d_gqa_q.device_ptr(),
-                                        *graph.d_la_qkvz.device_ptr(),
-                                        *graph.d_gqa_q.device_ptr(),
+                                        *graph.d_gqa_q.device_ptr(),      // q_out
+                                        *graph.d_la_qkvz.device_ptr(),    // gate_out
+                                        *graph.d_gqa_out.device_ptr(),    // qg_in (separate buffer)
                                         nh as i32, hd as i32,
                                     ),
                                 ).map_err(|e| format!("split_gated_q[{}]: {:?}", layer_idx, e))?;
@@ -9581,10 +9597,12 @@ impl GpuDecodeStore {
                                 )).map_err(|e| format!("sigmoid_topk[{}]: {:?}", layer_idx, e))?;
                             }
                         } else {
+                            let norm_flag = if moe.norm_topk_prob { 1i32 } else { 0i32 };
                             unsafe {
                                 k.softmax_topk.clone().launch(cfg, (
                                     logits_ptr, topk_ids_dptr, topk_wts_dptr,
                                     ne as i32, topk as i32,
+                                    norm_flag,
                                 )).map_err(|e| format!("softmax_topk[{}]: {:?}", layer_idx, e))?;
                             }
                         }
@@ -10209,6 +10227,7 @@ impl GpuDecodeStore {
                     return Err(format!("D2H logits: {:?}", err));
                 }
             }
+
         }
 
         Ok(())
@@ -11732,6 +11751,7 @@ impl GpuDecodeStore {
                 top3[0].0, top3[0].1, top3[1].0, top3[1].1, top3[2].0, top3[2].1);
         }
 
+
         Ok(())
     }
 
@@ -13092,8 +13112,18 @@ impl GpuDecodeStore {
                                     kv_stride * 4);
                             }
 
-                            // Split gated Q
+                            // Split gated Q (use d_gqa_out as temp to avoid aliased read/write)
                             if is_gated {
+                                let gated_q_size = nh * hd * 2;
+                                unsafe {
+                                    let err = cuda_sys::lib().cuMemcpyDtoD_v2(
+                                        *graph.d_gqa_out.device_ptr(),
+                                        *graph.d_gqa_q.device_ptr(),
+                                        gated_q_size * 4);
+                                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                        return Err(format!("D2D batch gated_q copy[{}][{}]: {:?}", layer_idx, t, err));
+                                    }
+                                }
                                 let total = (nh * hd) as u32;
                                 let threads = 256u32;
                                 let blocks = (total + threads - 1) / threads;
@@ -13103,7 +13133,7 @@ impl GpuDecodeStore {
                                     split_fn.launch(
                                         LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
                                         (*graph.d_gqa_q.device_ptr(), *graph.d_la_qkvz.device_ptr(),
-                                         *graph.d_gqa_q.device_ptr(), nh as i32, hd as i32),
+                                         *graph.d_gqa_out.device_ptr(), nh as i32, hd as i32),
                                     ).map_err(|e| format!("batch split_gated_q[{}][{}]: {:?}", layer_idx, t, e))?;
                                 }
                             }
@@ -13263,8 +13293,18 @@ impl GpuDecodeStore {
                             self.gemv_bf16_to_f32(kw, hidden_ptr, *graph.d_gqa_k.device_ptr())?;
                             self.gemv_bf16_to_f32(vw, hidden_ptr, *graph.d_gqa_v.device_ptr())?;
 
-                            // Split gated Q (same as fused path)
+                            // Split gated Q (use d_gqa_out as temp to avoid aliased read/write)
                             if is_gated {
+                                let gated_q_size = nh * hd * 2;
+                                unsafe {
+                                    let err = cuda_sys::lib().cuMemcpyDtoD_v2(
+                                        *graph.d_gqa_out.device_ptr(),
+                                        *graph.d_gqa_q.device_ptr(),
+                                        gated_q_size * 4);
+                                    if err != cuda_sys::CUresult::CUDA_SUCCESS {
+                                        return Err(format!("D2D batch gated_q copy2[{}][{}]: {:?}", layer_idx, t, err));
+                                    }
+                                }
                                 let total = (nh * hd) as u32;
                                 let threads = 256u32;
                                 let blocks = (total + threads - 1) / threads;
@@ -13274,7 +13314,7 @@ impl GpuDecodeStore {
                                     split_fn.launch(
                                         LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 },
                                         (*graph.d_gqa_q.device_ptr(), *graph.d_la_qkvz.device_ptr(),
-                                         *graph.d_gqa_q.device_ptr(), nh as i32, hd as i32),
+                                         *graph.d_gqa_out.device_ptr(), nh as i32, hd as i32),
                                     ).map_err(|e| format!("batch split_gated_q[{}][{}]: {:?}", layer_idx, t, e))?;
                                 }
                             }
@@ -13701,6 +13741,7 @@ impl GpuDecodeStore {
                             logits_ptr,
                             tk_ids_ptr, tk_wts_ptr,
                             ne as i32, topk as i32,
+                            if moe.norm_topk_prob { 1i32 } else { 0i32 },
                         )).map_err(|e| format!("batch softmax_topk[{}][{}]: {:?}", layer_idx, t, e))?;
                     }
                 }
@@ -17134,6 +17175,16 @@ impl GpuDecodeStore {
         // Use pre-allocated events if available, otherwise create on demand
         let pre_ev = &graph.pre_events;
 
+        // ── Step 0: Zero moe_out accumulator ──
+        // Required: fused_silu_accum does read-modify-write. Without zeroing,
+        // stale data from the previous layer's MoE output persists. When all
+        // experts go through the cold path (0 hot experts), the HCS batch's
+        // init_zero never fires, corrupting output with accumulated stale data.
+        unsafe {
+            cuda_sys::lib().cuMemsetD16Async(
+                *graph.d_moe_out.device_ptr(), 0, expert_hs, std::ptr::null_mut());
+        }
+
         // ── Step 1+2: Gate GEMV (BF16 gate × BF16 hidden → FP32 logits) ──
         let t_gate_start = Instant::now();
         let logits_ptr = unsafe {
@@ -17208,6 +17259,7 @@ impl GpuDecodeStore {
                         topk_wts_dptr,
                         ne as i32,
                         topk as i32,
+                        if moe.norm_topk_prob { 1i32 } else { 0i32 },
                     )).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
                         format!("softmax_topk: {:?}", e)))?;
                 }
@@ -17470,12 +17522,14 @@ impl GpuDecodeStore {
                             let mut p2 = *graph.d_topk_weights.device_ptr();
                             let mut p3 = next_ne as i32;
                             let mut p4 = spec_topk as i32;
-                            let mut params: [*mut std::ffi::c_void; 5] = [
+                            let mut p5_norm = if next_moe.norm_topk_prob { 1i32 } else { 0i32 };
+                            let mut params: [*mut std::ffi::c_void; 6] = [
                                 &mut p0 as *mut _ as *mut std::ffi::c_void,
                                 &mut p1 as *mut _ as *mut std::ffi::c_void,
                                 &mut p2 as *mut _ as *mut std::ffi::c_void,
                                 &mut p3 as *mut _ as *mut std::ffi::c_void,
                                 &mut p4 as *mut _ as *mut std::ffi::c_void,
+                                &mut p5_norm as *mut _ as *mut std::ffi::c_void,
                             ];
                             let err = cuda_sys::lib().cuLaunchKernel(
                                 self.raw_softmax_topk.0,
