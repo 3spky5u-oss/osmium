@@ -10,10 +10,22 @@ Runs **Qwen3.5-122B-A10B at 57 tok/s decode on a single RTX 5090** (vs 38 tok/s 
 
 Qwen3.5-122B-A10B (122B params, 234 GB BF16 / 56 GB INT4). Single GPU, AWQ attention, FP8 KV cache, WriteCombined DMA.
 
-| Config | Decode (tok/s) | Improvement |
-|--------|:-:|:-:|
-| Krasis v0.1.66 (baseline) | 38.7 | — |
-| **Osmium (+ `--wc-alloc`)** | **57.0** | **+47%** |
+**Headline:** 38.7 → 57.5 tok/s (+49%) at 42K context vs Krasis baseline.
+
+### Decode throughput across context depths
+
+Single 5090, INT4 experts, AWQ attention, FP8 KV cache, `--wc-alloc`:
+
+| KV Cache | Max Context | HCS Coverage | Decode |
+|---------:|------------:|:------------:|-------:|
+|  200 MB  |  17K tokens |    40.2%     | 53.1 tok/s |
+|  500 MB  |  42K tokens |    39.6%     | **57.5 tok/s** |
+| 1000 MB  |  85K tokens |    38.7%     | 54.8 tok/s |
+| 1500 MB  | 128K tokens |    37.7%     | 50.3 tok/s |
+| 2000 MB  | 170K tokens |    36.6%     | 53.1 tok/s |
+| 3400 MB  | 290K tokens |    34.1%     | 56.8 tok/s |
+
+Decode stays 50-57 tok/s from 17K all the way to 290K context. The 122B model never leaves system RAM — only the top-K experts per layer DMA into VRAM each token, and the WriteCombined buffers feed the PCIe link at near-line-rate.
 
 ### What makes this fast
 
